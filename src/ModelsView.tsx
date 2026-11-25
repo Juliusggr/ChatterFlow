@@ -21,12 +21,14 @@ import {
 
 export function ModelsView({
   models,
+  canManage,
   selectedModelId,
   onChanged,
   onSelect,
   onOpenMessages,
 }: {
   models: Model[];
+  canManage: boolean;
   selectedModelId: number | null;
   onChanged: () => Promise<void>;
   onSelect: (id: number) => void;
@@ -149,7 +151,7 @@ export function ModelsView({
             detectan automáticamente apenas entras.
           </p>
         </div>
-        <button
+        {canManage ? <button
           type="button"
           disabled={isAdding}
           className="cf-btn-primary"
@@ -161,7 +163,7 @@ export function ModelsView({
             <UserPlus size={15} strokeWidth={2} />
           )}
           {isAdding ? "Abriendo login…" : "Agregar modelo"}
-        </button>
+        </button> : null}
       </header>
 
       {/* Notifications */}
@@ -312,7 +314,7 @@ export function ModelsView({
                       {isBusySync ? "Sync…" : "Sincronizar"}
                     </button>
 
-                    {pendingDeleteId === model.id ? (
+                    {canManage && pendingDeleteId === model.id ? (
                       <>
                         <button
                           type="button"
@@ -333,7 +335,7 @@ export function ModelsView({
                           Cancelar
                         </button>
                       </>
-                    ) : (
+                    ) : canManage ? (
                       <button
                         type="button"
                         disabled={rowDisabled}
@@ -344,7 +346,7 @@ export function ModelsView({
                         <Trash2 size={13} strokeWidth={2} />
                         Eliminar
                       </button>
-                    )}
+                    ) : null}
                   </span>
                 </li>
               );

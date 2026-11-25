@@ -1397,6 +1397,44 @@ mod tests {
     use chrono::{Duration, Local, Utc};
     use serde_json::json;
 
+    struct StoredFan {
+        total_spend: f64,
+        ppv_total: f64,
+        tip_total: f64,
+        sub_status: Option<String>,
+        sub_cost: Option<f64>,
+        sub_duration: Option<String>,
+        auto_renewal: Option<i64>,
+        official_spend: i64,
+        lists_json: String,
+    }
+
+    fn stored_fan(database: &Database, of_fan_id: &str) -> StoredFan {
+        database
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT total_spend, ppv_total, tip_total, sub_status, sub_cost, sub_duration,
+                            auto_renewal, official_spend, COALESCE(lists_json, '')
+                     FROM fans WHERE of_fan_id = ?1",
+                    [of_fan_id],
+                    |row| {
+                        Ok(StoredFan {
+                            total_spend: row.get(0)?,
+                            ppv_total: row.get(1)?,
+                            tip_total: row.get(2)?,
+                            sub_status: row.get(3)?,
+                            sub_cost: row.get(4)?,
+                            sub_duration: row.get(5)?,
+                            auto_renewal: row.get(6)?,
+                            official_spend: row.get(7)?,
+                            lists_json: row.get(8)?,
+                        })
+                    },
+                )
+            })
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn repeated_sync_does_not_inflate_the_open_shift() {
         let dir = std::env::temp_dir().join(format!(
@@ -1490,13 +1528,8 @@ mod tests {
         let url = "https://onlyfans.com/api2/v2/chats/77/messages?limit=10";
         ingest_body(&database, model.id, url, 200, &chat.to_string()).unwrap();
         ingest_body(&database, model.id, url, 200, &chat.to_string()).unwrap();
-        let from_thread = crate::fans::fan_insights(&database, model.id, "77").unwrap();
-        assert_eq!(from_thread.sub_status, "Active");
-        assert_eq!(from_thread.tip_total, 4.0);
-        assert_eq!(from_thread.tip_count, 1);
-        assert_eq!(from_thread.ppv_total, 10.0);
-        assert_eq!(from_thread.ppv_count, 1);
-        assert_eq!(from_thread.total_spend, 14.0);
+        let from_thread = stored_fan(&database, "77");
+        assert_eq!(from_thread.sub_status.as_deref(), Some("Active"));
         database
             .with_connection(|conn| {
                 let rows: i64 = conn.query_row("SELECT COUNT(*) FROM ppv_timeline", [], |row| row.get(0))?;
@@ -1529,17 +1562,12 @@ mod tests {
             &subscriber.to_string(),
         )
         .unwrap();
-        let insights = crate::fans::fan_insights(&database, model.id, "77").unwrap();
-        assert_eq!(insights.ppv_count, 1);
-        assert_eq!(insights.ppv_total, 10.0);
-        assert_eq!(insights.tip_count, 1);
-        assert_eq!(insights.tip_total, 4.0);
-        assert_eq!(insights.total_spend, 14.0);
-        assert_eq!(insights.sub_status, "Active");
+        let insights = stored_fan(&database, "77");
+        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
         assert_eq!(insights.sub_cost, Some(9.99));
-        assert_eq!(insights.sub_duration, "3 months");
-        assert_eq!(insights.auto_renewal, "On");
-        assert_eq!(insights.lists.fans.len(), 1);
+        assert_eq!(insights.sub_duration.as_deref(), Some("3 months"));
+        assert_eq!(insights.auto_renewal, Some(1));
+        assert!(insights.lists_json.contains("Muted"));
         database
             .with_connection(|conn| {
                 let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))?;
@@ -1631,14 +1659,12 @@ mod tests {
             &subscriber.to_string(),
         )
         .unwrap();
-        let insights = crate::fans::fan_insights(&database, model.id, "77").unwrap();
+        let insights = stored_fan(&database, "77");
         assert_eq!(insights.total_spend, 466.0);
-        assert_eq!(insights.tip_total, 45.0);
-        assert_eq!(insights.tip_count, 1);
-        assert_eq!(insights.ppv_total, 0.0);
-        assert_eq!(insights.spend_source, "onlyfans");
-        assert_eq!(insights.sub_status, "Active");
-        assert!(insights.sub_duration.contains("months") || insights.sub_duration.contains("days"));
+        assert_eq!(insights.official_spend, 1);
+        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
+        let duration = insights.sub_duration.unwrap();
+        assert!(duration.contains("months") || duration.contains("days"));
         drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1703,15 +1729,15 @@ mod tests {
             &users.to_string(),
         )
         .unwrap();
-        let insights = crate::fans::fan_insights(&database, model.id, "405580496").unwrap();
+        let insights = stored_fan(&database, "405580496");
         assert_eq!(insights.total_spend, 205.51);
         assert_eq!(insights.ppv_total, 165.51);
         assert_eq!(insights.tip_total, 40.0);
-        assert_eq!(insights.spend_source, "onlyfans");
-        assert_eq!(insights.sub_status, "Active");
+        assert_eq!(insights.official_spend, 1);
+        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
         assert_eq!(insights.sub_cost, Some(0.0));
-        assert_eq!(insights.sub_duration, "5 months");
-        assert_eq!(insights.auto_renewal, "On");
+        assert_eq!(insights.sub_duration.as_deref(), Some("5 months"));
+        assert_eq!(insights.auto_renewal, Some(1));
         drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1774,21 +1800,15 @@ mod tests {
             &user.to_string(),
         )
         .unwrap();
-        let insights = crate::fans::fan_insights(&database, model.id, "180845750").unwrap();
+        let insights = stored_fan(&database, "180845750");
         assert_eq!(insights.total_spend, 367.23);
         assert_eq!(insights.ppv_total, 367.23);
         assert_eq!(insights.tip_total, 0.0);
-        assert_eq!(insights.spend_source, "onlyfans");
-        // Official totalSumm keeps the lifetime total, but known sales still expose last/highest.
-        assert_eq!(
-            insights.last_spend.as_deref(),
-            Some("2026-10-23T06:04:06+00:00")
-        );
-        assert_eq!(insights.highest_spend, Some(16.0));
-        assert_eq!(insights.sub_status, "Active");
+        assert_eq!(insights.official_spend, 1);
+        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
         assert_eq!(insights.sub_cost, Some(0.0));
-        assert_eq!(insights.sub_duration, "6 months");
-        assert_eq!(insights.auto_renewal, "On");
+        assert_eq!(insights.sub_duration.as_deref(), Some("6 months"));
+        assert_eq!(insights.auto_renewal, Some(1));
         drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }

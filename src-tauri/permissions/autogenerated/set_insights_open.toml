@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-insights-open"
+description = "Enables the set_insights_open command without any pre-configured scope."
+commands.allow = ["set_insights_open"]
+
+[[permission]]
+identifier = "deny-set-insights-open"
+description = "Denies the set_insights_open command without any pre-configured scope."
+commands.deny = ["set_insights_open"]

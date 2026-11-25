@@ -9,6 +9,7 @@
     "allow-get-models",
     "allow-get-message-tabs",
     "allow-set-message-bar-placement",
+    "allow-set-insights-open",
     "allow-open-messages",
     "allow-select-message-tab",
     "allow-close-message-tab"

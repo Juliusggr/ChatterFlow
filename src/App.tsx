@@ -1,6 +1,5 @@
 import {
   BarChart3,
-  FolderOpen,
   LayoutDashboard,
   MessageSquare,
   Moon,
@@ -16,16 +15,18 @@ import { isPermissionGranted, onAction, requestPermission } from "@tauri-apps/pl
 import { useCallback, useEffect, useState } from "react";
 import {
   errorMessage,
-  getEmployees,
   getMessageTabs,
   getModels,
   openIncomingChat,
   openMessages,
   openModelSession,
   setMessageBarPlacement,
+  type AppNotification,
   type MessageBarPlacement,
   type MessageTabsState,
 } from "./api";
+import { assignedModelKeys, isManager, modelExternalKey, recordSale, signOut, syncAgencyModels, type AgencyProfile } from "./agency";
+import { AuthGate } from "./AuthGate";
 import { AnalyticsView } from "./AnalyticsView";
 import { DashboardView } from "./DashboardView";
 import { FanInsightsPanel } from "./FanInsights";
@@ -37,17 +38,15 @@ import {
   type ToastBanner,
 } from "./Notifications";
 import { TeamsView } from "./TeamsView";
-import { VaultView } from "./VaultView";
-import { avatarColor, initials, modelLabel, type Employee, type Model } from "./types";
+import { avatarColor, initials, modelLabel, type Model } from "./types";
 
-type Section = "dashboard" | "teams" | "models" | "messages" | "vault" | "analytics";
+type Section = "dashboard" | "teams" | "models" | "messages" | "analytics";
 
 const NAV: { id: Section; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "teams", label: "Equipos y Roles", icon: Users },
   { id: "models", label: "Modelos", icon: UserRound },
   { id: "messages", label: "Messages", icon: MessageSquare },
-  { id: "vault", label: "Vault", icon: FolderOpen },
   { id: "analytics", label: "Analytics", icon: BarChart3 },
 ];
 
@@ -69,28 +68,36 @@ function useDarkMode(): [boolean, () => void] {
 
 /* ── Entry point ──────────────────────────────────────────────────── */
 export function App() {
-  if (window.__CF_VIEW__ === "messages-tabs") {
-    return <MessagesTabBar />;
-  }
-  const embeddedModelId = window.__CF_VIEW__ === "insights" ? window.__CF_MODEL_ID__ : undefined;
-  if (embeddedModelId) {
-    return <FanInsightsPanel modelId={embeddedModelId} />;
-  }
-  return <AppShell />;
+  return (
+    <AuthGate>
+      {(profile) => {
+        if (window.__CF_VIEW__ === "messages-tabs") {
+          return <MessagesTabBar />;
+        }
+        const embeddedModelId = window.__CF_VIEW__ === "insights" ? window.__CF_MODEL_ID__ : undefined;
+        if (embeddedModelId) {
+          return <FanInsightsPanel modelId={embeddedModelId} />;
+        }
+        return <AppShell profile={profile} />;
+      }}
+    </AuthGate>
+  );
 }
 
 declare global {
   interface Window {
     __CF_VIEW__?: string;
     __CF_MODEL_ID__?: number;
+    __CF_PARTITION_ID__?: string;
   }
 }
 
 /* ── AppShell ─────────────────────────────────────────────────────── */
-function AppShell() {
+function AppShell({ profile }: { profile: AgencyProfile }) {
+  const canManage = isManager(profile.role);
+  const canOpenMessages = profile.role !== "dropper";
   const [section, setSection] = useState<Section>("dashboard");
   const [navOpen, setNavOpen] = useState(() => window.innerWidth >= 1100);
-  const [employees, setEmployees] = useState<Employee[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -102,32 +109,69 @@ function AppShell() {
 
   const reload = useCallback(async () => {
     try {
-      const [nextEmployees, nextModels, tabsState] = await Promise.all([
-        getEmployees(),
-        getModels(),
-        getMessageTabs(),
-      ]);
-      setEmployees(nextEmployees);
-      setModels(nextModels);
+      const [nextModels, tabsState] = await Promise.all([getModels(), getMessageTabs()]);
+      let visible = nextModels;
+      if (canManage) {
+        await syncAgencyModels(nextModels);
+      } else {
+        const keys = await assignedModelKeys();
+        visible = nextModels.filter((model) => keys.has(modelExternalKey(model)));
+      }
+      setModels(visible);
       setBarPlacement(tabsState.barPlacement ?? "top");
       setUnreadCounts(tabsState.unreadCounts ?? {});
       setSelectedModelId((current) =>
-        current != null && nextModels.some((model) => model.id === current) ? current : null,
+        current != null && visible.some((model) => model.id === current) ? current : null,
       );
       setError(null);
       setLoaded(true);
     } catch (caught) {
       setError(errorMessage(caught));
     }
-  }, []);
+  }, [canManage]);
 
   useEffect(() => { void reload(); }, [reload]);
 
   useEffect(() => {
-    if (section === "messages" && selectedModelId) {
+    if (canOpenMessages && section === "messages" && selectedModelId) {
       void openMessages(selectedModelId).catch((caught) => setError(errorMessage(caught)));
     }
-  }, [section, selectedModelId]);
+  }, [canOpenMessages, section, selectedModelId]);
+
+  useEffect(() => {
+    if ((!canManage && section === "teams") || (!canOpenMessages && section === "messages")) {
+      setSection("dashboard");
+    }
+  }, [canManage, canOpenMessages, section]);
+
+  useEffect(() => {
+    let alive = true;
+    let stop = () => {};
+    void listen<AppNotification>("cf-notification", (event) => {
+      const item = event.payload;
+      if (!item || (item.kind !== "ppv" && item.kind !== "tip") || item.amount == null) return;
+      const model = models.find((candidate) => candidate.id === item.modelId);
+      if (!model) return;
+      const gross = item.amount;
+      const net = item.netAmount ?? gross * 0.8;
+      void recordSale({
+        externalKey: modelExternalKey(model),
+        fanPlatformId: item.ofFanId,
+        amountGross: gross,
+        amountNet: net,
+        category: item.kind,
+        recordedAt: item.createdAt,
+        sourceId: item.id,
+      }).catch(() => undefined);
+    }).then((unlisten) => {
+      if (alive) stop = unlisten;
+      else unlisten();
+    });
+    return () => {
+      alive = false;
+      stop();
+    };
+  }, [models]);
 
   useEffect(() => {
     let alive = true;
@@ -202,14 +246,18 @@ function AppShell() {
   }, [reload]);
 
   const handleOpenModelChat = useCallback((modelId: number) => {
+    if (!canOpenMessages) return;
     setSelectedModelId(modelId);
+    setSection("messages");
     void openMessages(modelId).catch((caught) => setError(errorMessage(caught)));
-  }, []);
+  }, [canOpenMessages]);
 
   const handleOpenChat = useCallback((modelId: number, ofFanId: string) => {
+    if (!canOpenMessages) return;
     setSelectedModelId(modelId);
+    setSection("messages");
     void openIncomingChat(modelId, ofFanId).catch((caught) => setError(errorMessage(caught)));
-  }, []);
+  }, [canOpenMessages]);
 
   useEffect(() => {
     let alive = true;
@@ -227,7 +275,9 @@ function AppShell() {
           const extra = event.notification?.extra ?? {};
           const modelId = Number(extra.modelId);
           const ofFanId = typeof extra.ofFanId === "string" ? extra.ofFanId : "";
-          if (Number.isFinite(modelId) && modelId > 0) {
+          if (canOpenMessages && Number.isFinite(modelId) && modelId > 0) {
+            setSelectedModelId(modelId);
+            setSection("messages");
             void openIncomingChat(modelId, ofFanId);
           }
         });
@@ -241,7 +291,7 @@ function AppShell() {
       alive = false;
       void stop?.unregister();
     };
-  }, []);
+  }, [canOpenMessages]);
 
   const handleChangeBarPlacement = useCallback((next: MessageBarPlacement) => {
     setBarPlacement(next);
@@ -275,7 +325,8 @@ function AppShell() {
         onOpenModels={() => setSection("models")}
         onSelect={(id) => {
           setSelectedModelId(id);
-          const open = section === "messages" ? openMessages(id) : openModelSession(id);
+          const open =
+            canOpenMessages && section === "messages" ? openMessages(id) : openModelSession(id);
           void open.catch((caught) => setError(errorMessage(caught)));
         }}
       />
@@ -324,7 +375,7 @@ function AppShell() {
 
         {/* Nav items */}
         <nav id="app-nav" aria-label="Secciones" className="flex flex-col gap-0.5 p-2 flex-1">
-          {NAV.map((item) => {
+          {NAV.filter((item) => (canManage || item.id !== "teams") && (canOpenMessages || item.id !== "messages")).map((item) => {
             const Icon = item.icon;
             const active = section === item.id;
             return (
@@ -366,6 +417,15 @@ function AppShell() {
           className={`flex flex-col gap-1.5 p-2 pb-4 ${navOpen ? "px-3" : "items-center"}`}
           style={{ borderTop: "1px solid var(--border-muted)" }}
         >
+          <button
+            type="button"
+            className={`flex items-center gap-3 rounded-lg px-3 py-2 text-left text-sm ${navOpen ? "" : "justify-center px-0"}`}
+            style={{ color: "var(--text-secondary)" }}
+            onClick={() => void signOut()}
+          >
+            {navOpen ? <span className="truncate">{profile.username}</span> : null}
+            <span className="text-xs">Salir</span>
+          </button>
           <NotificationBellPopover navOpen={navOpen} onOpenChat={handleOpenChat} />
           <div className={`flex items-center ${navOpen ? "px-1" : "justify-center"}`}>
             <button
@@ -431,19 +491,18 @@ function AppShell() {
           ) : null}
 
           {loaded && section === "dashboard" ? <DashboardView /> : null}
-          {loaded && section === "teams" ? (
-            <TeamsView employees={employees} onChanged={reload} />
-          ) : null}
+          {loaded && section === "teams" && canManage ? <TeamsView models={models} /> : null}
           {loaded && section === "models" ? (
             <ModelsView
               models={models}
+              canManage={canManage}
               selectedModelId={selectedModelId}
               onChanged={reload}
               onSelect={setSelectedModelId}
-              onOpenMessages={handleOpenModelChat}
+              onOpenMessages={canOpenMessages ? handleOpenModelChat : undefined}
             />
           ) : null}
-          {loaded && section === "messages" ? (
+          {loaded && canOpenMessages && section === "messages" ? (
             <MessagesSection
               models={models}
               barPlacement={barPlacement}
@@ -453,7 +512,6 @@ function AppShell() {
             />
           ) : null}
           {loaded && section === "analytics" ? <AnalyticsView models={models} /> : null}
-          {loaded && section === "vault" ? <VaultView models={models} /> : null}
         </div>
       </main>
     </div>

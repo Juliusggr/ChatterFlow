@@ -3,8 +3,8 @@ use tauri::{AppHandle, Emitter, State, WebviewWindow};
 
 use crate::analytics::{self, AnalyticsRange, AnalyticsReport, ExportResult, TrendBucket};
 use crate::dashboard::{self, ClockedInEmployee, EarningsBasis, EarningsOverview, EmployeeSale, ShiftRow};
-use crate::fans::{self, FanInsights, FanLists};
-use crate::messages::{self, ChatMessage, InboxChat, OutboundDraft, PpvTimelineState, ScriptPage};
+use crate::fans;
+use crate::messages::{self, ChatMessage, InboxChat, OutboundDraft};
 use crate::db::{Database, Employee, EmployeeRole};
 use crate::notifications::{AppNotification, NotificationBus};
 use crate::sessions::{self, MessageBarPlacement, ModelAccount, SyncBus, SyncReport};
@@ -184,6 +184,11 @@ pub fn set_message_bar_placement(
 }
 
 #[tauri::command]
+pub fn set_insights_open(app: AppHandle, open: bool) -> Result<sessions::MessageTabsState, String> {
+    sessions::set_insights_open(&app, open)
+}
+
+#[tauri::command]
 pub fn get_recent_notifications(
     database: State<'_, Database>,
     notifications: State<'_, NotificationBus>,
@@ -263,37 +268,6 @@ pub async fn sync_model_data(
 }
 
 #[tauri::command]
-pub fn get_fan_insights(
-    database: State<'_, Database>,
-    model_id: i64,
-    of_fan_id: String,
-) -> Result<FanInsights, String> {
-    fans::fan_insights(&database, model_id, &of_fan_id).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-pub fn update_fan_profile(
-    database: State<'_, Database>,
-    model_id: i64,
-    of_fan_id: String,
-    nickname: Option<String>,
-    birthday: Option<String>,
-    location: Option<String>,
-    country: Option<String>,
-) -> Result<(), String> {
-    fans::update_fan_profile(
-        &database,
-        model_id,
-        &of_fan_id,
-        nickname.as_deref(),
-        birthday.as_deref(),
-        location.as_deref(),
-        country.as_deref(),
-    )
-    .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
 pub fn list_inbox(database: State<'_, Database>, model_id: i64) -> Result<Vec<InboxChat>, String> {
     messages::list_inbox(&database, model_id).map_err(|err| err.to_string())
 }
@@ -305,27 +279,6 @@ pub fn list_thread(
     of_fan_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
     messages::list_thread(&database, model_id, &of_fan_id).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-pub fn list_scripts(
-    database: State<'_, Database>,
-    model_id: i64,
-    page: i64,
-    text: String,
-    tag_id: String,
-) -> Result<ScriptPage, String> {
-    messages::list_scripts(&database, model_id, page, &text, &tag_id).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-pub fn get_ppv_timeline(
-    database: State<'_, Database>,
-    model_id: i64,
-    of_fan_id: String,
-    page: i64,
-) -> Result<PpvTimelineState, String> {
-    messages::ppv_timeline(&database, model_id, &of_fan_id, page).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -346,21 +299,6 @@ pub fn save_fan_notes(
     notes_text: String,
 ) -> Result<(), String> {
     fans::save_fan_notes(&database, model_id, &of_fan_id, &notes_text).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-pub fn update_fan_lists(
-    database: State<'_, Database>,
-    model_id: i64,
-    of_fan_id: String,
-    lists: FanLists,
-) -> Result<(), String> {
-    fans::update_fan_lists(&database, model_id, &of_fan_id, lists).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-pub async fn insert_chat_text(app: AppHandle, model_id: i64, text: String) -> Result<String, String> {
-    sessions::insert_chat_text(&app, model_id, &text).await
 }
 
 #[tauri::command]

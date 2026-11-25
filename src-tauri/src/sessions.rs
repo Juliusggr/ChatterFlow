@@ -29,25 +29,46 @@ pub enum MessageBarPlacement {
     Sidebar,
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageTabsState {
     pub open_model_ids: Vec<i64>,
     pub active_model_id: Option<i64>,
     pub bar_placement: MessageBarPlacement,
+    pub insights_open: bool,
     pub unread_counts: std::collections::HashMap<i64, u32>,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+impl Default for MessageTabsState {
+    fn default() -> Self {
+        Self {
+            open_model_ids: Vec::new(),
+            active_model_id: None,
+            bar_placement: MessageBarPlacement::default(),
+            insights_open: true,
+            unread_counts: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UiPreferencesFile {
+    #[serde(default)]
     bar_placement: MessageBarPlacement,
+    #[serde(default = "default_insights_open")]
+    insights_open: bool,
+}
+
+fn default_insights_open() -> bool {
+    true
 }
 
 const MESSAGES_WINDOW_LABEL: &str = "messages-hub";
 const MESSAGES_TABS_LABEL: &str = "messages-tabs";
 const TAB_BAR_HEIGHT: f64 = 44.0;
-const SIDEBAR_WIDTH: f64 = 196.0;
+const SIDEBAR_WIDTH: f64 = 72.0;
+const INSIGHTS_WIDTH: f64 = 360.0;
 const UI_PREFS_FILE: &str = "ui_preferences.json";
 static HUB_VISIBLE: AtomicBool = AtomicBool::new(false);
 static HUB_GATE: Mutex<()> = Mutex::new(());
@@ -200,18 +221,23 @@ pub fn warm_session_environment(app: &AppHandle) {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
                 state.bar_placement = parsed.bar_placement;
+                state.insights_open = parsed.insights_open;
             }
         }
     }
 }
 
-fn persist_bar_placement(app: &AppHandle, placement: MessageBarPlacement) {
+fn persist_ui_preferences(app: &AppHandle) {
     let Ok(app_dir) = app.path().app_data_dir() else {
         return;
     };
     let _ = std::fs::create_dir_all(&app_dir);
+    let state = messages_hub_state()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let payload = UiPreferencesFile {
-        bar_placement: placement,
+        bar_placement: state.bar_placement,
+        insights_open: state.insights_open,
     };
     if let Ok(json) = serde_json::to_string_pretty(&payload) {
         let _ = std::fs::write(app_dir.join(UI_PREFS_FILE), json);
@@ -228,7 +254,20 @@ pub fn set_message_bar_placement(
             .unwrap_or_else(|poison| poison.into_inner());
         state.bar_placement = placement;
     }
-    persist_bar_placement(app, placement);
+    persist_ui_preferences(app);
+    layout_messages_hub(app);
+    emit_tabs_changed(app);
+    Ok(get_message_tabs(app))
+}
+
+pub fn set_insights_open(app: &AppHandle, open: bool) -> Result<MessageTabsState, String> {
+    {
+        let mut state = messages_hub_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.insights_open = open;
+    }
+    persist_ui_preferences(app);
     layout_messages_hub(app);
     emit_tabs_changed(app);
     Ok(get_message_tabs(app))
@@ -902,7 +941,7 @@ fn finish_removing_tab(
 }
 
 fn default_message_panes(placement: MessageBarPlacement) -> MessagePanes {
-    message_panes(1280.0, 800.0, placement).unwrap_or(MessagePanes {
+    message_panes(1280.0, 800.0, placement, true).unwrap_or(MessagePanes {
         tabs_x: 0.0,
         tabs_y: 0.0,
         tabs_width: 1280.0,
@@ -1014,7 +1053,13 @@ fn ensure_hub_window(
 pub fn open_messages(app: &AppHandle, database: &Database, model_id: i64) -> Result<(), String> {
     let _gate = HUB_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let model = database.get_model(model_id).map_err(|err| err.to_string())?;
-    close_label(app, &window_label(model_id));
+    let standalone = window_label(model_id);
+    let closed_standalone = app.get_webview_window(&standalone).is_some();
+    close_label(app, &standalone);
+    if closed_standalone {
+        // WebView2 keeps the partition directory locked until the destroyed window finishes closing.
+        std::thread::sleep(Duration::from_millis(450));
+    }
 
     let placement = messages_hub_state()
         .lock()
@@ -1030,25 +1075,45 @@ pub fn open_messages(app: &AppHandle, database: &Database, model_id: i64) -> Res
     if app.get_webview(&of_label).is_none() {
         let directory = partition_dir(app, &model.partition_id)?;
         std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
-        let builder = tauri::webview::WebviewBuilder::new(
-            of_label.clone(),
-            WebviewUrl::External(chats_url()?),
-        )
-        .background_color(tauri::window::Color(15, 23, 42, 255))
-        .data_directory(directory)
-        .initialization_script(capture_script(model.id, true))
-        .on_navigation(move |url| navigation_allowed(model.id, url))
-        .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
-        .focused(true);
-        #[cfg(target_os = "windows")]
-        let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
-        window
-            .add_child(
+        let mut last_err = String::new();
+        let mut attached = false;
+        for attempt in 0..8 {
+            let builder = tauri::webview::WebviewBuilder::new(
+                of_label.clone(),
+                WebviewUrl::External(chats_url()?),
+            )
+            .background_color(tauri::window::Color(15, 23, 42, 255))
+            .data_directory(directory.clone())
+            .initialization_script(capture_script(model.id, true))
+            .on_navigation(move |url| navigation_allowed(model.id, url))
+            .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+            .focused(true);
+            #[cfg(target_os = "windows")]
+            let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
+            match window.add_child(
                 builder,
                 tauri::LogicalPosition::new(initial_panes.chat_x, initial_panes.chat_y),
                 tauri::LogicalSize::new(initial_panes.chat_width, initial_panes.chat_height),
-            )
-            .map_err(|err| err.to_string())?;
+            ) {
+                Ok(_) => {
+                    attached = true;
+                    break;
+                }
+                Err(err) => {
+                    last_err = err.to_string();
+                    let retry = last_err.contains("8007139F")
+                        || last_err.contains("estado correcto")
+                        || last_err.contains("correct state");
+                    if !retry || attempt == 7 {
+                        return Err(last_err);
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        if !attached {
+            return Err(last_err);
+        }
     }
     if app.get_webview(&insights_label).is_none() {
         window
@@ -1057,7 +1122,7 @@ pub fn open_messages(app: &AppHandle, database: &Database, model_id: i64) -> Res
                     insights_label,
                     WebviewUrl::App("index.html".into()),
                 )
-                .initialization_script(insights_script(model.id)),
+                .initialization_script(insights_script(model.id, &model.partition_id)),
                 tauri::LogicalPosition::new(initial_panes.insights_x, initial_panes.insights_y),
                 tauri::LogicalSize::new(initial_panes.insights_width, initial_panes.insights_height),
             )
@@ -1238,6 +1303,7 @@ fn message_panes(
     width: f64,
     height: f64,
     placement: MessageBarPlacement,
+    insights_open: bool,
 ) -> Option<MessagePanes> {
     if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
         return None;
@@ -1246,7 +1312,11 @@ fn message_panes(
         MessageBarPlacement::Top => {
             let tab_bar_height = TAB_BAR_HEIGHT.min(height);
             let content_height = (height - tab_bar_height).max(0.0);
-            let insights_width = 380.0_f64.min(width * 0.42);
+            let insights_width = if insights_open {
+                INSIGHTS_WIDTH.min(width * 0.42)
+            } else {
+                0.0
+            };
             let chat_width = (width - insights_width).max(0.0);
             Some(MessagePanes {
                 tabs_x: 0.0,
@@ -1264,9 +1334,13 @@ fn message_panes(
             })
         }
         MessageBarPlacement::Sidebar => {
-            let sidebar_width = SIDEBAR_WIDTH.min((width * 0.22).max(140.0)).min(width);
+            let sidebar_width = SIDEBAR_WIDTH.min(width);
             let remaining_width = (width - sidebar_width).max(0.0);
-            let insights_width = 370.0_f64.min(remaining_width * 0.40);
+            let insights_width = if insights_open {
+                INSIGHTS_WIDTH.min(remaining_width * 0.40)
+            } else {
+                0.0
+            };
             let chat_width = (remaining_width - insights_width).max(0.0);
             Some(MessagePanes {
                 tabs_x: 0.0,
@@ -1306,7 +1380,12 @@ fn layout_messages_hub(app: &AppHandle) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
-    let Some(panes) = message_panes(logical_width, logical_height, state.bar_placement) else {
+    let Some(panes) = message_panes(
+        logical_width,
+        logical_height,
+        state.bar_placement,
+        state.insights_open,
+    ) else {
         return;
     };
     if let Some(tabs) = app.get_webview(MESSAGES_TABS_LABEL) {
@@ -1339,7 +1418,7 @@ fn layout_messages_hub(app: &AppHandle) {
             }
         }
         if let Some(insights) = app.get_webview(&messages_insights_label(*id)) {
-            if is_active {
+            if is_active && panes.insights_width >= 8.0 {
                 place_webview(
                     &insights,
                     panes.insights_x,
@@ -1404,41 +1483,6 @@ fn chats_url() -> Result<Url, String> {
     "https://onlyfans.com/my/chats"
         .parse::<Url>()
         .map_err(|err| err.to_string())
-}
-
-pub async fn insert_chat_text(app: &AppHandle, model_id: i64, text: &str) -> Result<String, String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("el script no tiene texto para insertar".to_owned());
-    }
-    if text.chars().count() > 10_000 {
-        return Err("el mensaje supera los 10000 caracteres".to_owned());
-    }
-    let label = format!("messages-{model_id}-of");
-    let webview = app.get_webview(&label).ok_or_else(|| {
-        "la ventana de OnlyFans de esta modelo no está abierta".to_owned()
-    })?;
-    let literal = serde_json::to_string(text).map_err(|err| err.to_string())?;
-    let script = INSERT_CHAT_JS.replace("__CF_TEXT__", &literal);
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let slot = Mutex::new(Some(sender));
-    webview
-        .eval_with_callback(&script, move |value| {
-            if let Some(sender) = slot.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
-                let _ = sender.send(value);
-            }
-        })
-        .map_err(|err| err.to_string())?;
-    let value = tokio::time::timeout(Duration::from_secs(3), receiver)
-        .await
-        .map_err(|_| "el chat de OnlyFans no respondió".to_owned())?
-        .map_err(|_| "el chat de OnlyFans se cerró antes de insertar el texto".to_owned())?;
-    let status = value.trim().trim_matches('"');
-    Ok(if status == "inserted" {
-        "inserted".to_owned()
-    } else {
-        "missing".to_owned()
-    })
 }
 
 pub fn onlyfans_webview(app: &AppHandle, model_id: i64) -> Result<tauri::Webview, String> {
@@ -1604,62 +1648,10 @@ fn vault_fetch_body(text: &str) -> Result<String, String> {
         .ok_or_else(|| "OnlyFans devolvió un vault vacío.".to_owned())
 }
 
-const INSERT_CHAT_JS: &str = r#"(() => {
-  const text = __CF_TEXT__;
-  function visible(node) {
-    const rect = node.getBoundingClientRect();
-    return rect.width > 40 && rect.height > 8;
-  }
-  const preferred = [
-    ".b-chat__footer [contenteditable='true']",
-    ".b-chat__input [contenteditable='true']",
-    ".b-chat__message-input [contenteditable='true']",
-    ".b-chat__input-message [contenteditable='true']",
-    ".b-text-editor[contenteditable='true']",
-    ".ProseMirror",
-    "textarea.b-chat__message-input",
-    ".b-make-post [contenteditable='true']"
-  ];
-  let node = null;
-  for (const selector of preferred) {
-    const found = document.querySelector(selector);
-    if (found && visible(found)) {
-      node = found;
-      break;
-    }
-  }
-  if (!node) {
-    const nodes = Array.from(document.querySelectorAll("[contenteditable='true'], textarea"));
-    node = nodes.find((item) => visible(item) && item.getBoundingClientRect().top > window.innerHeight * 0.45) || null;
-  }
-  if (!node) return "missing";
-  node.focus();
-  if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-    const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-    if (setter) setter.call(node, text);
-    else node.value = text;
-    node.dispatchEvent(new Event("input", { bubbles: true }));
-    return "inserted";
-  }
-  const selection = window.getSelection();
-  if (selection) {
-    const range = document.createRange();
-    range.selectNodeContents(node);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-  const inserted = document.execCommand("insertText", false, text);
-  if (!inserted) {
-    node.textContent = text;
-    node.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
-  }
-  return "inserted";
-})()"#;
-
-fn insights_script(model_id: i64) -> String {
+fn insights_script(model_id: i64, partition_id: &str) -> String {
+    let partition = serde_json::to_string(partition_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {model_id};"
+        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {model_id}; window.__CF_PARTITION_ID__ = {partition};"
     )
 }
 
@@ -1850,111 +1842,6 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
       const joined = data && (data.joinDate || data.createdAt || data.joinDateTime);
       if (joined) window.__CF_JOIN = String(joined).slice(0, 10);
     }} catch (error) {{}}
-  }}
-  const spendCache = window.__CF_SPEND || (window.__CF_SPEND = {{}});
-  let spendRaf = 0;
-  function schedulePaintSpendBadges() {{
-    if (spendRaf || isLoginOrAuthSurface()) return;
-    spendRaf = requestAnimationFrame(() => {{
-      spendRaf = 0;
-      paintSpendBadges();
-    }});
-  }}
-  function moneyOf(value) {{
-    if (value == null || value === "") return null;
-    const amount = Number(value);
-    return Number.isFinite(amount) ? amount : null;
-  }}
-  function spendOf(user) {{
-    if (!user || typeof user !== "object") return null;
-    const blobs = [];
-    if (user.subscribedByData && typeof user.subscribedByData === "object") blobs.push(user.subscribedByData);
-    if (user.subscribedOnData && typeof user.subscribedOnData === "object") blobs.push(user.subscribedOnData);
-    if (user.subscribedOn && typeof user.subscribedOn === "object") blobs.push(user.subscribedOn);
-    blobs.push(user);
-    let best = null;
-    for (const data of blobs) {{
-      let amount = moneyOf(data.totalSumm);
-      if (amount == null) {{
-        const keys = ["tipsSumm", "messagesSumm", "subscribesSumm", "postsSumm", "streamsSumm"];
-        let any = false;
-        let sum = 0;
-        for (const key of keys) {{
-          const part = moneyOf(data[key]);
-          if (part != null) {{
-            any = true;
-            sum += part;
-          }}
-        }}
-        if (any) amount = sum;
-      }}
-      if (amount != null && (best == null || amount > best)) best = amount;
-    }}
-    return best;
-  }}
-  function paintSpendBadges() {{
-    const ids = Object.keys(spendCache);
-    if (!ids.length || isLoginOrAuthSurface()) return;
-    for (const id of ids) {{
-      const amount = spendCache[id];
-      if (!(amount > 0)) continue;
-      const root = document.getElementById(String(id));
-      if (!root) continue;
-      const avatar = root.querySelector(".g-avatar") || root.querySelector("[class*='avatar']");
-      if (!avatar) continue;
-      if (window.getComputedStyle(avatar).position === "static") avatar.style.position = "relative";
-      let badge = avatar.querySelector(".cf-spend-badge");
-      if (!badge) {{
-        badge = document.createElement("span");
-        badge.className = "cf-spend-badge";
-        badge.style.cssText = "position:absolute;left:50%;bottom:0;transform:translate(-50%,35%);background:#f97316;color:#fff;font-size:10px;line-height:1;font-weight:700;padding:2px 4px;border-radius:999px;white-space:nowrap;z-index:3;pointer-events:none;";
-        avatar.appendChild(badge);
-      }}
-      const label = "$" + Number(amount).toFixed(2);
-      if (badge.textContent !== label) badge.textContent = label;
-    }}
-  }}
-  function rememberUser(user) {{
-    if (!user || user.id == null) return;
-    const amount = spendOf(user);
-    if (amount == null) return;
-    spendCache[String(user.id)] = amount;
-  }}
-  function rememberFans(url, body) {{
-    let data = null;
-    try {{
-      data = JSON.parse(body);
-    }} catch (error) {{
-      return;
-    }}
-    let path = "";
-    try {{
-      path = new URL(url, location.href).pathname;
-    }} catch (error) {{
-      return;
-    }}
-    if (path.endsWith("/users/list") && data && typeof data === "object") {{
-      const values = Array.isArray(data) ? data : (Array.isArray(data.list) ? data.list : Object.values(data));
-      values.forEach(rememberUser);
-    }} else if (path === "/api2/v2/chats" && data && Array.isArray(data.list)) {{
-      data.list.forEach((chat) => rememberUser(chat && chat.withUser));
-    }} else if (/^\/api2\/v2\/users\/\d+$/.test(path)) {{
-      rememberUser(data);
-    }} else if (data && data.withUser) {{
-      rememberUser(data.withUser);
-    }}
-    schedulePaintSpendBadges();
-  }}
-  if (!window.__CF_SPEND_STYLE) {{
-    window.__CF_SPEND_STYLE = true;
-    const startWatch = () => {{
-      if (!document.body || window.__CF_SPEND_WATCH) return;
-      window.__CF_SPEND_WATCH = true;
-      const observer = new MutationObserver(() => schedulePaintSpendBadges());
-      observer.observe(document.body, {{ childList: true, subtree: true }});
-    }};
-    if (document.body) startWatch();
-    else document.addEventListener("DOMContentLoaded", startWatch);
   }}
   const vaultItems = window.__CF_VAULT_ITEMS || (window.__CF_VAULT_ITEMS = {{}});
   function mediaUrl(value) {{
@@ -2235,65 +2122,11 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
   }}
   function installVaultButton() {{
     const existing = document.getElementById("cf-vault-download");
-    if (!onVaultPage()) {{
-      if (existing) existing.remove();
-      return;
-    }}
-    if (!document.body) return;
-    const loaded = Object.keys(vaultItems).length;
-    if (existing) {{
-      const count = document.getElementById("cf-vault-count");
-      if (count && existing.dataset.busy !== "1") count.textContent = "Descargar cargadas (" + loaded + ")";
-      return;
-    }}
-    const bar = document.createElement("div");
-    bar.id = "cf-vault-download";
-    bar.dataset.busy = "0";
-    bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483646;display:flex;gap:8px;align-items:center;padding:8px;border-radius:16px;background:rgba(15,23,42,.92);box-shadow:0 10px 30px rgba(0,0,0,.35);";
-    const one = document.createElement("button");
-    one.type = "button";
-    one.textContent = "Descargar";
-    one.style.cssText = "background:#1d4ed8;color:#fff;border:0;border-radius:999px;padding:10px 16px;font:600 14px/1 sans-serif;cursor:pointer;";
-    one.addEventListener("click", () => {{
-      if (bar.dataset.busy === "1") return;
-      const items = selectedVaultItems();
-      if (items.length) {{
-        downloadVaultItems(items);
-        return;
-      }}
-      const visible = visibleVaultFile();
-      if (!visible) {{
-        vaultNotice(loaded ? "Abre la foto o el video y pulsa Descargar" : "Espera a que cargue la bóveda");
-        return;
-      }}
-      downloadVaultItems([{{ id: "vista", type: visible.kind, files: {{ full: {{ url: visible.url }} }} }}]);
-    }});
-    const all = document.createElement("button");
-    all.id = "cf-vault-count";
-    all.type = "button";
-    all.textContent = "Descargar cargadas (" + loaded + ")";
-    all.style.cssText = "background:#0f172a;color:#fff;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:10px 16px;font:600 14px/1 sans-serif;cursor:pointer;";
-    all.addEventListener("click", () => {{
-      if (bar.dataset.busy === "1") return;
-      const items = Object.keys(vaultItems).map((id) => vaultItems[id]);
-      if (!items.length) {{
-        vaultNotice("Espera a que cargue la bóveda");
-        return;
-      }}
-      downloadVaultItems(items);
-    }});
-    const notice = document.createElement("span");
-    notice.id = "cf-vault-notice";
-    notice.style.cssText = "color:#e2e8f0;font:500 12px/1.3 sans-serif;max-width:220px;";
-    bar.appendChild(one);
-    bar.appendChild(all);
-    bar.appendChild(notice);
-    document.body.appendChild(bar);
+    if (existing) existing.remove();
   }}
   function deliver(url, status, body) {{
     const text = String(body || "");
     rememberCreator(url, text);
-    rememberFans(url, text);
     rememberVault(url, text);
     try {{
       if (new URL(url, location.href).pathname.indexOf("/api2/v2/vault/") === 0) return;
@@ -2327,7 +2160,6 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
       internals.invoke("ingest_of_response", payload).catch(() => {{}});
     }};
     send();
-    observeMessages(url, text);
   }}
   let emitFan = (id) => {{
     if (!id) return;
@@ -2551,46 +2383,9 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     }});
     return originalSend.apply(this, arguments);
   }};
-  const fanPattern = /\/(?:chats\/chat|chats|users)\/u?(\d+)/i;
   function fanFromLocation() {{
     const match = location.pathname.match(/\/my\/chats\/chat\/u?(\d+)/i);
     return usableFan(match && match[1]);
-  }}
-  function moneyFromText(text) {{
-    if (!text) return null;
-    const match = String(text).replace(/\s+/g, " ").match(/(?:USD\s*)?\$?\s*([0-9]{{1,3}}(?:,[0-9]{{3}})*(?:\.[0-9]{{1,2}})?|[0-9]+(?:\.[0-9]{{1,2}})?)/i);
-    if (!match) return null;
-    const amount = Number(match[1].replace(/,/g, ""));
-    return Number.isFinite(amount) ? amount : null;
-  }}
-  function stampFromText(text) {{
-    if (!text) return null;
-    const iso = String(text).match(/(\d{{4}}-\d{{2}}-\d{{2}}(?:[T\s]\d{{2}}:\d{{2}}(?::\d{{2}})?(?:Z|[+-]\d{{2}}:?\d{{2}})?)?)/);
-    if (iso) return iso[1].replace(" ", "T");
-    return null;
-  }}
-  function readChat() {{
-    let profile = null;
-    const panels = [...document.querySelectorAll("aside, section, div")].filter((node) => {{
-      const text = node.innerText || "";
-      return text.length > 20 && text.length < 2500 && /ESTAD[IÃ]STICAS DE FANS|FAN STATISTICS|Gastado|Spent|Last paid|Último pago|Ultimo pago/i.test(text);
-    }}).sort((left, right) => left.innerText.length - right.innerText.length);
-    if (panels[0]) {{
-      const text = panels[0].innerText;
-      const duration = text.match(/suscrito para\s+([^\n]{{1,40}})/i) || text.match(/subscribed for\s+([^\n]{{1,40}})/i);
-      const spentLine = text.match(/(?:Gastado|Spent|Total spent)\s*[:\n]?\s*([^\n]{{1,40}})/i);
-      const lastLine = text.match(/(?:Último pago|Ultimo pago|Last paid|Last purchase)\s*[:\n]?\s*([^\n]{{1,60}})/i);
-      const highLine = text.match(/(?:Gasto m[aá]s alto|Highest purchase|Highest spend)\s*[:\n]?\s*([^\n]{{1,40}})/i);
-      profile = {{
-        status: /SUSCRITO|SUBSCRIBED/i.test(text) ? "Active" : (/caduc|expir/i.test(text) ? "Inactive" : null),
-        duration: duration ? duration[1].trim() : null,
-        cost: /GRATIS|\bFREE\b/i.test(text) ? 0 : null,
-        totalSpend: spentLine ? moneyFromText(spentLine[1]) : null,
-        lastSpendAt: lastLine ? stampFromText(lastLine[1]) : null,
-        highestSpend: highLine ? moneyFromText(highLine[1]) : null
-      }};
-    }}
-    return {{ profile: profile }};
   }}
   function findStatsTab() {{
     const tabs = [...document.querySelectorAll("a, button, [role='tab'], .b-tabs__nav__item, .b-tabs__nav a")];
@@ -2748,91 +2543,13 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     if (best) window.__CF_HTTP = best;
     return best;
   }}
-  function purchaseSlot(fanId) {{
-    const state = window.__CF_PURCHASE_SYNC || (window.__CF_PURCHASE_SYNC = {{}});
-    if (!state[fanId]) state[fanId] = {{ seen: {{}}, before: "", running: false, done: false, triedMax: false, retries: 0, error: "" }};
-    return state[fanId];
-  }}
-  function notePurchases(fanId) {{
-    const slot = fanId && window.__CF_PURCHASE_SYNC && window.__CF_PURCHASE_SYNC[fanId];
-    const node = document.getElementById("cf-msg-note");
-    if (!node || !slot) return;
-    if (slot.error) node.textContent = slot.error;
-    else if (slot.done) node.textContent = "Ventas cargadas";
-    else if (slot.running) node.textContent = "Cargando ventas…";
-  }}
-  function observeMessages(url, body) {{
-    if (String(url).indexOf("/messages") === -1) return;
-    let data = null;
-    try {{ data = JSON.parse(body); }} catch (error) {{ return; }}
-    const list = data && Array.isArray(data.list) ? data.list : null;
-    if (!list || !list.length) return;
-    const match = String(url).match(/\/api2\/v2\/chats\/u?(\d+)\/messages/i);
-    const fanId = usableFan(match && match[1]);
-    if (!fanId) return;
-    const slot = purchaseSlot(fanId);
-    list.forEach((item) => {{
-      if (item && item.id != null) slot.seen[String(item.id)] = true;
-    }});
-    const oldest = list[list.length - 1];
-    if (oldest && oldest.id != null) slot.before = String(oldest.id);
-    if (data.hasMore === false || (list.length < 10 && data.hasMore !== true)) {{
-      slot.done = true;
-      slot.running = false;
-      notePurchases(fanId);
-      return;
-    }}
-    if (!slot.running && !slot.done) pullPurchases(fanId);
-  }}
-  async function pullPurchases(fanId) {{
-    const slot = purchaseSlot(fanId);
-    if (!fanId || slot.running || slot.done) return;
-    const client = findSignedClient();
-    if (!client) return;
-    slot.running = true;
-    slot.error = "";
-    notePurchases(fanId);
-    let pages = 0;
-    while (pages < 300 && !slot.done) {{
-      pages += 1;
-      const param = slot.triedMax ? "maxId" : "id";
-      let path = "/api2/v2/chats/" + fanId + "/messages?limit=10&order=desc&skip_users=all";
-      if (slot.before) path += "&" + param + "=" + encodeURIComponent(slot.before);
-      try {{
-        const response = await client.get("https://onlyfans.com" + path);
-        const data = response && response.data ? response.data : {{}};
-        const list = Array.isArray(data.list) ? data.list : [];
-        const fresh = list.filter((item) => item && item.id != null && !slot.seen[String(item.id)]);
-        if (!fresh.length) {{
-          if (!slot.triedMax && slot.before) {{
-            slot.triedMax = true;
-            continue;
-          }}
-          slot.done = true;
-          break;
-        }}
-        fresh.forEach((item) => {{ slot.seen[String(item.id)] = true; }});
-        const oldest = list[list.length - 1];
-        if (oldest && oldest.id != null) slot.before = String(oldest.id);
-        deliver("https://onlyfans.com" + path + "&_cf_backfill=1", (response && response.status) || 200, JSON.stringify(data));
-        if (data.hasMore === false || (list.length < 10 && data.hasMore !== true)) {{
-          slot.done = true;
-          break;
-        }}
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }} catch (error) {{
-        const status = error && error.response ? error.response.status : 0;
-        slot.retries += 1;
-        slot.error = status ? "OnlyFans respondió " + status + " al cargar ventas" : "No se pudo cargar el historial";
-        slot.running = false;
-        notePurchases(fanId);
-        if (slot.retries < 4) setTimeout(() => pullPurchases(fanId), 800);
-        else slot.done = true;
-        return;
-      }}
-    }}
-    slot.running = false;
-    notePurchases(fanId);
+  function installChatLayoutStyles() {{
+    if (document.getElementById("cf-chat-layout")) return;
+    const style = document.createElement("style");
+    style.id = "cf-chat-layout";
+    style.textContent = ".b-chats__header .b-tabs__nav,.b-chats__header .b-tabs__nav__list,.b-chats .b-separate-filter{{display:flex!important;flex-wrap:nowrap!important;overflow-x:auto!important;overflow-y:hidden!important;max-width:100%!important;scrollbar-width:thin}}.b-chats__header .b-tabs__nav__item,.b-chats__header .b-tabs__nav__text{{flex:0 0 auto!important;max-width:none!important;white-space:nowrap!important;overflow:visible!important;text-overflow:clip!important}}";
+    const target = document.head || document.documentElement;
+    if (target) target.appendChild(style);
   }}
   window.__CF_TICK = () => {{
     const api = queue.splice(0, queue.length);
@@ -2845,19 +2562,14 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     }}
     const onChat = location.pathname.indexOf("/my/chats/chat/") === 0;
     const onEarnings = (!stayInChats || earningsAllowed()) && /statements|statistics/i.test(location.pathname);
-    const chat = onChat ? readChat() : {{ profile: null }};
-    if (onChat && fanId) {{
-      const slot = purchaseSlot(fanId);
-      if (!slot.running && !slot.done) pullPurchases(fanId);
-      notePurchases(fanId);
-    }}
+    installChatLayoutStyles();
     const widened = onEarnings ? collectEarnings() : false;
     const authReady = !!window.__CF_CREATOR_ID;
     if (authReady && !onChat) cleanComposerButtons();
     if (!onEarnings) {{
       void runBgPoll(false);
     }}
-    return {{ fanId: onChat ? fanId : null, widened: widened, active: (onChat || onEarnings), creator: !!window.__CF_CREATOR_ID, ready: !!window.__CF_CREATOR_ID && !!window.__CF_HTTP, api: api, profile: onChat ? chat.profile : null }};
+    return {{ fanId: onChat ? fanId : null, widened: widened, active: (onChat || onEarnings), creator: !!window.__CF_CREATOR_ID, ready: !!window.__CF_CREATOR_ID && !!window.__CF_HTTP, api: api, profile: null }};
   }};
 
   function injectPostStyles() {{
@@ -3532,10 +3244,10 @@ mod tests {
 
     #[test]
     fn minimized_panes_are_left_alone_and_a_normal_window_splits() {
-        assert!(message_panes(0.0, 0.0, MessageBarPlacement::Top).is_none());
-        assert!(message_panes(1280.0, 0.0, MessageBarPlacement::Sidebar).is_none());
+        assert!(message_panes(0.0, 0.0, MessageBarPlacement::Top, true).is_none());
+        assert!(message_panes(1280.0, 0.0, MessageBarPlacement::Sidebar, true).is_none());
 
-        let top = message_panes(1280.0, 800.0, MessageBarPlacement::Top).unwrap();
+        let top = message_panes(1280.0, 800.0, MessageBarPlacement::Top, true).unwrap();
         assert_eq!(top.tabs_x, 0.0);
         assert_eq!(top.tabs_y, 0.0);
         assert_eq!(top.tabs_width, 1280.0);
@@ -3543,16 +3255,19 @@ mod tests {
         assert_eq!(top.chat_x, 0.0);
         assert_eq!(top.chat_y, 44.0);
         assert_eq!(top.chat_height, 756.0);
-        assert_eq!(top.chat_width, 900.0);
-        assert_eq!(top.insights_x, 900.0);
-        assert_eq!(top.insights_width, 380.0);
+        assert_eq!(top.chat_width, 920.0);
+        assert_eq!(top.insights_x, 920.0);
+        assert_eq!(top.insights_width, 360.0);
+        let collapsed = message_panes(1280.0, 800.0, MessageBarPlacement::Top, false).unwrap();
+        assert_eq!(collapsed.insights_width, 0.0);
+        assert_eq!(collapsed.chat_width, 1280.0);
 
-        let side = message_panes(1280.0, 800.0, MessageBarPlacement::Sidebar).unwrap();
+        let side = message_panes(1280.0, 800.0, MessageBarPlacement::Sidebar, true).unwrap();
         assert_eq!(side.tabs_x, 0.0);
         assert_eq!(side.tabs_y, 0.0);
-        assert_eq!(side.tabs_width, 196.0);
+        assert_eq!(side.tabs_width, 72.0);
         assert_eq!(side.tabs_height, 800.0);
-        assert_eq!(side.chat_x, 196.0);
+        assert_eq!(side.chat_x, 72.0);
         assert_eq!(side.chat_y, 0.0);
         assert_eq!(side.chat_height, 800.0);
         assert!(side.chat_width > 600.0);
@@ -3565,8 +3280,9 @@ mod tests {
         let script = super::capture_script(42, false);
         assert!(script.contains("cleanComposerButtons"));
         assert!(!script.contains("mountChatComposer"));
-        assert!(script.contains("pullPurchases"));
-        assert!(script.contains("observeMessages"));
+        assert!(!script.contains("pullPurchases"));
+        assert!(!script.contains("pullFanStats"));
+        assert!(!script.contains("observeMessages"));
         assert!(!script.contains("cf-msg-tools"));
         assert!(script.contains("/api2/v2/chats/"));
         assert!(script.contains("isHourglassButton"));

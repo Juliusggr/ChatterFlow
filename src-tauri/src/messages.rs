@@ -5,8 +5,6 @@ use serde_json::{json, Value};
 use crate::db::{utc_now, Database, DbError};
 use crate::fans::require_fan_id;
 
-pub const SCRIPT_PAGE_SIZE: i64 = 10;
-pub const PPV_PAGE_SIZE: i64 = 10;
 /// Observed composer bounds from the packaged messages overlay: `{ min: 3, max: 200 }`.
 pub const MEDIA_PRICE_MIN: f64 = 3.0;
 pub const MEDIA_PRICE_MAX: f64 = 200.0;
@@ -40,60 +38,6 @@ pub struct ChatMessage {
     pub media: Vec<Value>,
     pub release_forms: Vec<Value>,
     pub script_infos: Vec<ScriptInfo>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScriptRecord {
-    pub id: i64,
-    pub script_name: String,
-    pub script_content: String,
-    pub script_text_content: String,
-    pub media_price: Option<f64>,
-    pub locked_text: bool,
-    pub media: Vec<Value>,
-    pub release_forms: Vec<Value>,
-    pub tag_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScriptPage {
-    pub script_list: Vec<ScriptRecord>,
-    pub tab_list: Vec<String>,
-    pub page: i64,
-    pub size: i64,
-    pub has_next: bool,
-    pub items_empty: bool,
-    pub media_price_min: f64,
-    pub media_price_max: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PpvPoint {
-    pub id: i64,
-    pub price: Option<f64>,
-    pub purchased: bool,
-    pub created_at: String,
-    pub message_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PpvTimelineState {
-    pub ppv_data: Vec<PpvPoint>,
-    pub ppv_price: Option<f64>,
-    pub ppv_avg_price: Option<f64>,
-    pub page: i64,
-    pub size: i64,
-    pub has_next: bool,
-    pub ppv_loading: bool,
-    pub first_loading: bool,
-    pub items_empty: bool,
-    pub pay_count: i64,
-    pub all_pay_count: i64,
-    pub pay_percent: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,156 +108,6 @@ pub fn list_thread(
         )?;
         let rows = stmt.query_map(params![model_id, of_fan_id], read_message)?;
         rows.collect::<Result<Vec<_>, _>>()
-    })
-}
-
-pub fn list_scripts(
-    database: &Database,
-    model_id: i64,
-    page: i64,
-    text: &str,
-    tag_id: &str,
-) -> Result<ScriptPage, DbError> {
-    database.get_model(model_id)?;
-    let page = page.max(1);
-    let text = text.trim();
-    let tag_id = tag_id.trim();
-    let like = if text.is_empty() {
-        None
-    } else {
-        Some(format!("%{}%", escape_like(text)))
-    };
-    database.with_connection(|conn| {
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM scripts
-             WHERE model_id = ?1
-               AND (?2 = '' OR tag_id = ?2)
-               AND (
-                    ?3 IS NULL
-                    OR script_name LIKE ?3 ESCAPE '\\'
-                    OR script_text_content LIKE ?3 ESCAPE '\\'
-                    OR script_content LIKE ?3 ESCAPE '\\'
-               )",
-            params![model_id, tag_id, like],
-            |row| row.get(0),
-        )?;
-        let mut stmt = conn.prepare(
-            "SELECT id, script_name, script_content, script_text_content, media_price,
-                    locked_text, media_json, release_forms_json, tag_id
-             FROM scripts
-             WHERE model_id = ?1
-               AND (?2 = '' OR tag_id = ?2)
-               AND (
-                    ?3 IS NULL
-                    OR script_name LIKE ?3 ESCAPE '\\'
-                    OR script_text_content LIKE ?3 ESCAPE '\\'
-                    OR script_content LIKE ?3 ESCAPE '\\'
-               )
-             ORDER BY id ASC
-             LIMIT ?4 OFFSET ?5",
-        )?;
-        let offset = (page - 1) * SCRIPT_PAGE_SIZE;
-        let rows = stmt.query_map(
-            params![model_id, tag_id, like, SCRIPT_PAGE_SIZE, offset],
-            |row| {
-                Ok(ScriptRecord {
-                    id: row.get(0)?,
-                    script_name: row.get(1)?,
-                    script_content: row.get(2)?,
-                    script_text_content: row.get(3)?,
-                    media_price: row.get(4)?,
-                    locked_text: row.get::<_, i64>(5)? != 0,
-                    media: parse_json_array(&row.get::<_, String>(6)?),
-                    release_forms: parse_json_array(&row.get::<_, String>(7)?),
-                    tag_id: row.get(8)?,
-                })
-            },
-        )?;
-        let script_list = rows.collect::<Result<Vec<_>, _>>()?;
-        let mut tags = conn.prepare(
-            "SELECT DISTINCT tag_id FROM scripts
-             WHERE model_id = ?1 AND tag_id <> ''
-             ORDER BY tag_id COLLATE NOCASE",
-        )?;
-        let tab_list = tags
-            .query_map([model_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ScriptPage {
-            script_list,
-            tab_list,
-            page,
-            size: SCRIPT_PAGE_SIZE,
-            has_next: page * SCRIPT_PAGE_SIZE < total,
-            items_empty: total == 0,
-            media_price_min: MEDIA_PRICE_MIN,
-            media_price_max: MEDIA_PRICE_MAX,
-        })
-    })
-}
-
-pub fn ppv_timeline(
-    database: &Database,
-    model_id: i64,
-    of_fan_id: &str,
-    page: i64,
-) -> Result<PpvTimelineState, DbError> {
-    let of_fan_id = require_fan_id(of_fan_id)?;
-    database.get_model(model_id)?;
-    let page = page.max(1);
-    database.with_connection(|conn| {
-        let (pay_count, all_pay_count, avg_price, latest_price): (i64, i64, Option<f64>, Option<f64>) =
-            conn.query_row(
-                "SELECT
-                    COALESCE(SUM(CASE WHEN purchased = 1 THEN 1 ELSE 0 END), 0),
-                    COUNT(*),
-                    AVG(price),
-                    (
-                        SELECT price FROM ppv_timeline
-                        WHERE model_id = ?1 AND of_fan_id = ?2
-                        ORDER BY created_at DESC, id DESC
-                        LIMIT 1
-                    )
-                 FROM ppv_timeline
-                 WHERE model_id = ?1 AND of_fan_id = ?2",
-                params![model_id, of_fan_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
-        let offset = (page - 1) * PPV_PAGE_SIZE;
-        let mut stmt = conn.prepare(
-            "SELECT id, price, purchased, created_at, message_id
-             FROM ppv_timeline
-             WHERE model_id = ?1 AND of_fan_id = ?2
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?3 OFFSET ?4",
-        )?;
-        let rows = stmt.query_map(params![model_id, of_fan_id, PPV_PAGE_SIZE, offset], |row| {
-            Ok(PpvPoint {
-                id: row.get(0)?,
-                price: row.get(1)?,
-                purchased: row.get::<_, i64>(2)? != 0,
-                created_at: row.get(3)?,
-                message_id: row.get(4)?,
-            })
-        })?;
-        let ppv_data = rows.collect::<Result<Vec<_>, _>>()?;
-        Ok(PpvTimelineState {
-            ppv_data,
-            ppv_price: latest_price,
-            ppv_avg_price: avg_price,
-            page,
-            size: PPV_PAGE_SIZE,
-            has_next: page * PPV_PAGE_SIZE < all_pay_count,
-            ppv_loading: false,
-            first_loading: false,
-            items_empty: all_pay_count == 0,
-            pay_count,
-            all_pay_count,
-            pay_percent: if all_pay_count == 0 {
-                0.0
-            } else {
-                pay_count as f64 / all_pay_count as f64
-            },
-        })
     })
 }
 
@@ -439,13 +233,6 @@ fn normalize_price(price: Option<f64>) -> Result<Option<f64>, DbError> {
     Ok(Some((price * 100.0).round() / 100.0))
 }
 
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn parse_json_array(raw: &str) -> Vec<Value> {
     serde_json::from_str::<Vec<Value>>(raw).unwrap_or_default()
 }
@@ -478,10 +265,6 @@ mod tests {
         let model = database.create_model_partition().unwrap();
 
         assert!(list_inbox(&database, model.id).unwrap().is_empty());
-        let scripts = list_scripts(&database, model.id, 1, "", "").unwrap();
-        assert!(scripts.items_empty);
-        assert!(scripts.script_list.is_empty());
-        assert!(!scripts.has_next);
 
         database
             .with_connection(|conn| {
@@ -489,18 +272,6 @@ mod tests {
                     "INSERT INTO fans (of_fan_id, model_id, username, nickname) VALUES ('fan-1', ?1, 'fan', 'Nico')",
                     [model.id],
                 )?;
-                for index in 0..12 {
-                    conn.execute(
-                        "INSERT INTO scripts (model_id, script_name, script_text_content, tag_id)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            model.id,
-                            format!("script {index}"),
-                            format!("hola {{name}} {index}"),
-                            if index < 2 { "vip" } else { "" }
-                        ],
-                    )?;
-                }
                 Ok(())
             })
             .unwrap();
@@ -508,16 +279,6 @@ mod tests {
         let inbox = list_inbox(&database, model.id).unwrap();
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].last_body.is_none());
-
-        let first = list_scripts(&database, model.id, 1, "", "").unwrap();
-        let second = list_scripts(&database, model.id, 2, "", "").unwrap();
-        assert_eq!(first.script_list.len(), 10);
-        assert!(first.has_next);
-        assert!(!first.items_empty);
-        assert_eq!(second.script_list.len(), 2);
-        assert!(!second.has_next);
-        let tagged = list_scripts(&database, model.id, 1, "script 1", "vip").unwrap();
-        assert_eq!(tagged.script_list.len(), 1);
 
         let sent = send_message(
             &database,
@@ -529,23 +290,13 @@ mod tests {
                 media: Vec::new(),
                 release_forms: Vec::new(),
                 locked_text: true,
-                script_id: Some(first.script_list[0].id),
+                script_id: None,
             },
         )
         .unwrap();
         assert_eq!(sent.body, "hola Nico");
-        assert_eq!(sent.script_infos.len(), 1);
+        assert!(sent.script_infos.is_empty());
         assert!(sent.locked_text);
-
-        let rate = ppv_timeline(&database, model.id, "fan-1", 1).unwrap();
-        assert_eq!(rate.pay_count, 0);
-        assert_eq!(rate.all_pay_count, 1);
-        assert_eq!(rate.pay_percent, 0.0);
-        assert!(!rate.items_empty);
-
-        let empty_rate = ppv_timeline(&database, model.id, "missing", 1).unwrap();
-        assert!(empty_rate.items_empty);
-        assert_eq!(empty_rate.all_pay_count, 0);
 
         drop(database);
         let _ = std::fs::remove_dir_all(dir);

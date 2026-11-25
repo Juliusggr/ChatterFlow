@@ -312,6 +312,13 @@ impl NotificationBus {
         let Ok(model) = database.get_model(model_id) else {
             return Vec::new();
         };
+        let session_started = model
+            .of_user_id
+            .as_ref()
+            .is_some_and(|id| !id.trim().is_empty());
+        if !session_started {
+            return Vec::new();
+        }
         let model_name = if !model.display_name.trim().is_empty() {
             model.display_name.trim().to_owned()
         } else if !model.username.trim().is_empty() {

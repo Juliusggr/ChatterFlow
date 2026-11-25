@@ -3,17 +3,23 @@ import { CalendarDays, CircleDollarSign, TrendingUp, Users, type LucideIcon } fr
 import { useEffect, useState, type ReactNode } from "react";
 import {
   errorMessage,
-  getClockedInEmployees,
   getEarningsOverview,
-  getEmployeeSales,
-  getMyShifts,
-  type ClockedInEmployee,
   type EarningsBasis,
   type EarningsOverview,
-  type EmployeeSale,
-  type ShiftRow,
   type TimeRange,
 } from "./api";
+import {
+  clockIn,
+  clockOut,
+  listActiveShifts,
+  listMyShifts,
+  myShiftOpen,
+  salesByEmployee,
+  subscribeActiveShifts,
+  type ActiveShift,
+  type EmployeeSaleTotal,
+  type ShiftSummary,
+} from "./agency";
 import { formatMoney, formatStamp } from "./types";
 
 const RANGES: { id: TimeRange; label: string }[] = [
@@ -36,9 +42,11 @@ export function DashboardView() {
   const [range, setRange] = useState<TimeRange>("today");
   const [basis, setBasis] = useState<EarningsBasis>("net");
   const [overview, setOverview] = useState<EarningsOverview | null>(null);
-  const [shifts, setShifts] = useState<ShiftRow[]>([]);
-  const [clockedIn, setClockedIn] = useState<ClockedInEmployee[]>([]);
-  const [sales, setSales] = useState<EmployeeSale[]>([]);
+  const [shifts, setShifts] = useState<ShiftSummary[]>([]);
+  const [clockedIn, setClockedIn] = useState<ActiveShift[]>([]);
+  const [sales, setSales] = useState<EmployeeSaleTotal[]>([]);
+  const [onShift, setOnShift] = useState(false);
+  const [clockBusy, setClockBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -50,7 +58,8 @@ export function DashboardView() {
       if (alive) stop = unlisten;
       else unlisten();
     });
-    return () => { alive = false; stop(); };
+    const stopShifts = subscribeActiveShifts(() => setRefresh((current) => current + 1));
+    return () => { alive = false; stop(); stopShifts(); };
   }, []);
 
   useEffect(() => {
@@ -58,16 +67,18 @@ export function DashboardView() {
     setLoading(true);
     Promise.all([
       getEarningsOverview(range, basis),
-      getMyShifts(range, basis),
-      getClockedInEmployees(),
-      getEmployeeSales(range, basis),
+      listMyShifts(range, basis),
+      listActiveShifts(),
+      salesByEmployee(range, basis),
+      myShiftOpen(),
     ])
-      .then(([nextOverview, nextShifts, nextClocked, nextSales]) => {
+      .then(([nextOverview, nextShifts, nextClocked, nextSales, nextOnShift]) => {
         if (!alive) return;
         setOverview(nextOverview);
         setShifts(nextShifts);
         setClockedIn(nextClocked);
         setSales(nextSales);
+        setOnShift(nextOnShift);
         setError(null);
       })
       .catch((caught) => {
@@ -96,6 +107,34 @@ export function DashboardView() {
         {/* Controls row */}
         <div className="flex flex-wrap items-center gap-3">
           {/* Basis toggle */}
+          <button
+            type="button"
+            disabled={clockBusy || onShift}
+            className="cf-btn-live"
+            onClick={() => {
+              setClockBusy(true);
+              void clockIn()
+                .then(() => setRefresh((current) => current + 1))
+                .catch((caught) => setError(errorMessage(caught)))
+                .finally(() => setClockBusy(false));
+            }}
+          >
+            Check In
+          </button>
+          <button
+            type="button"
+            disabled={clockBusy || !onShift}
+            className="cf-btn-secondary"
+            onClick={() => {
+              setClockBusy(true);
+              void clockOut()
+                .then(() => setRefresh((current) => current + 1))
+                .catch((caught) => setError(errorMessage(caught)))
+                .finally(() => setClockBusy(false));
+            }}
+          >
+            Check Out
+          </button>
           <div
             className="inline-flex rounded-lg p-1 gap-0.5"
             style={{ background: "var(--bg-subtle)" }}

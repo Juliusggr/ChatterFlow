@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { DollarSign, PanelLeft, PanelTop, Plus, X } from "lucide-react";
+import { DollarSign, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Plus, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   closeMessageTab,
@@ -7,6 +7,7 @@ import {
   getModels,
   openMessages,
   selectMessageTab,
+  setInsightsOpen,
   setMessageBarPlacement,
   type AppNotification,
   type MessageBarPlacement,
@@ -18,6 +19,7 @@ const EMPTY_TABS: MessageTabsState = {
   openModelIds: [],
   activeModelId: null,
   barPlacement: "top",
+  insightsOpen: true,
   unreadCounts: {},
 };
 
@@ -53,6 +55,7 @@ export function MessagesTabBar() {
           openModelIds: event.payload.openModelIds,
           activeModelId: event.payload.activeModelId ?? null,
           barPlacement: event.payload.barPlacement ?? "top",
+          insightsOpen: event.payload.insightsOpen ?? true,
           unreadCounts: event.payload.unreadCounts ?? {},
         });
       } else {
@@ -132,163 +135,116 @@ export function MessagesTabBar() {
     }
   }, [pickerOpen, availableModels.length]);
 
-  const togglePlacement = () => {
-    const next: MessageBarPlacement = tabs.barPlacement === "sidebar" ? "top" : "sidebar";
+  const changePlacement = (next: MessageBarPlacement) => {
+    if (next === tabs.barPlacement) return;
     setTabs((prev) => ({ ...prev, barPlacement: next }));
     void setMessageBarPlacement(next).then((updated) => setTabs(updated)).catch(() => reload());
+  };
+
+  const toggleInsights = () => {
+    const next = !tabs.insightsOpen;
+    setTabs((prev) => ({ ...prev, insightsOpen: next }));
+    void setInsightsOpen(next).then((updated) => setTabs(updated)).catch(() => reload());
   };
 
   if (tabs.barPlacement === "sidebar") {
     return (
       <aside
-        className="flex h-screen w-screen select-none flex-col overflow-hidden"
+        className="flex h-screen min-h-0 w-screen min-w-0 select-none flex-col items-center overflow-hidden"
         style={{
           background: "#0f172a",
           borderRight: "1px solid #1e293b",
           color: "#e2e8f0",
         }}
       >
-        {/* Sidebar Header + Toggle to Top Bar */}
-        <div
-          className="flex h-11 shrink-0 items-center justify-between gap-2 px-2.5"
-          style={{ borderBottom: "1px solid #1e293b" }}
-        >
-          <span className="truncate text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-            Cuentas ({tabs.openModelIds.length})
-          </span>
-          <button
-            type="button"
-            onClick={togglePlacement}
-            title="Cambiar a barra de arriba"
-            aria-label="Cambiar a barra de arriba"
-            className="inline-flex shrink-0 items-center gap-1 rounded-md bg-slate-800/90 px-2 py-1 text-[11px] font-medium text-slate-200 transition-colors hover:bg-blue-600 hover:text-white"
-          >
-            <PanelTop size={13} strokeWidth={2} />
-            <span>Arriba</span>
-          </button>
+        <div className="flex w-full shrink-0 justify-center py-2" style={{ borderBottom: "1px solid #1e293b" }}>
+          <HubChrome
+            stacked
+            placement={tabs.barPlacement}
+            insightsOpen={tabs.insightsOpen}
+            onPlacement={changePlacement}
+            onToggleInsights={toggleInsights}
+          />
         </div>
-
-        {/* Open Model Accounts List */}
-        <div className="min-h-0 flex-1 overflow-y-auto p-2">
-          <div className="flex flex-col gap-1">
-            {tabs.openModelIds.map((id) => {
-              const model = modelById.get(id);
-              const label = model ? modelLabel(model) : `Modelo #${id}`;
-              const active = tabs.activeModelId === id;
-              const unread = tabs.unreadCounts?.[id] ?? 0;
-              const saleFlash = recentSales[id];
-
-              return (
-                <div
-                  key={id}
+        <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden py-2">
+          {tabs.openModelIds.map((id) => {
+            const model = modelById.get(id);
+            const label = model ? modelLabel(model) : `Modelo #${id}`;
+            const active = tabs.activeModelId === id;
+            const unread = tabs.unreadCounts?.[id] ?? 0;
+            const saleFlash = recentSales[id];
+            const tip = model?.username ? `${label} (@${model.username})` : label;
+            return (
+              <div key={id} className="group relative">
+                <button
+                  type="button"
                   role="tab"
-                  tabIndex={0}
                   aria-selected={active}
-                  title={model?.username ? `${label} (@${model.username})` : label}
+                  title={tip}
                   onClick={() => void selectMessageTab(id)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      void selectMessageTab(id);
-                    }
-                  }}
-                  className="group flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-xs font-medium transition-colors"
+                  className="relative flex h-11 w-11 items-center justify-center rounded-full"
                   style={{
-                    background: active ? "#1e293b" : "transparent",
-                    color: active ? "#f8fafc" : "#94a3b8",
-                    borderLeft: active ? "3px solid #3b82f6" : "3px solid transparent",
+                    boxShadow: active ? "0 0 0 2px #3b82f6" : "none",
                   }}
                 >
-                  <TabAvatar model={model} id={id} label={label} size={26} />
-                  <div className="min-w-0 flex-1">
-                    <span className="block truncate font-semibold">{label}</span>
-                    {model?.username ? (
-                      <span className="block truncate text-[10px] text-slate-400">
-                        @{model.username}
-                      </span>
-                    ) : null}
-                  </div>
-
+                  <TabAvatar model={model} id={id} label={label} size={40} />
                   {saleFlash != null ? (
                     <span
-                      className="inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-bold"
+                      className="absolute -bottom-1 left-1/2 -translate-x-1/2 rounded-full px-1 text-[9px] font-bold"
                       style={{ background: "#059669", color: "#ecfdf5" }}
                     >
-                      <DollarSign size={10} strokeWidth={2.5} />
+                      <DollarSign size={8} className="inline" />
                       {formatMoney(saleFlash).replace("$", "")}
                     </span>
                   ) : unread > 0 ? (
-                    <span className="flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-600 px-1 text-[10px] font-bold text-white">
+                    <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-600 px-1 text-[9px] font-bold text-white">
                       {unread > 99 ? "99+" : unread}
                     </span>
                   ) : null}
-
-                  <button
-                    type="button"
-                    aria-label={`Cerrar ${label}`}
-                    title={`Cerrar ${label}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void closeMessageTab(id);
-                    }}
-                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 opacity-60 transition-colors hover:bg-slate-700 hover:text-white group-hover:opacity-100"
-                  >
-                    <X size={12} strokeWidth={2.25} />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Add model picker inside sidebar */}
-          {availableModels.length > 0 ? (
-            <div className="mt-2 pt-2" style={{ borderTop: "1px solid #1e293b" }}>
-              {pickerOpen ? (
-                <div className="flex flex-col gap-1 rounded-lg bg-slate-800/80 p-1.5">
-                  <div className="flex items-center justify-between px-1 py-0.5">
-                    <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                      Añadir cuenta
-                    </span>
-                    <button
-                      type="button"
-                      aria-label="Cancelar"
-                      onClick={() => setPickerOpen(false)}
-                      className="rounded p-0.5 text-slate-400 hover:bg-slate-700 hover:text-white"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                  {availableModels.map((model) => {
-                    const label = modelLabel(model);
-                    return (
-                      <button
-                        key={model.id}
-                        type="button"
-                        onClick={() => {
-                          setPickerOpen(false);
-                          void openMessages(model.id);
-                        }}
-                        className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs font-medium text-slate-200 transition-colors hover:bg-blue-600 hover:text-white"
-                      >
-                        <TabAvatar model={model} id={model.id} label={label} size={20} />
-                        <span className="truncate">{label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : (
+                </button>
                 <button
                   type="button"
-                  onClick={() => setPickerOpen(true)}
-                  className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-700 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-blue-500 hover:bg-slate-800/70 hover:text-white"
+                  aria-label={`Cerrar ${label}`}
+                  title={`Cerrar ${label}`}
+                  onClick={() => void closeMessageTab(id)}
+                  className="absolute -left-0.5 -top-0.5 hidden h-4 w-4 items-center justify-center rounded-full bg-slate-900 text-slate-200 group-hover:flex"
                 >
-                  <Plus size={14} strokeWidth={2.25} />
-                  Añadir modelo
+                  <X size={10} />
                 </button>
-              )}
-            </div>
-          ) : null}
+              </div>
+            );
+          })}
+          {pickerOpen
+            ? availableModels.map((model) => {
+                const label = modelLabel(model);
+                return (
+                  <button
+                    key={model.id}
+                    type="button"
+                    title={label}
+                    onClick={() => {
+                      setPickerOpen(false);
+                      void openMessages(model.id);
+                    }}
+                    className="rounded-full opacity-70 hover:opacity-100"
+                  >
+                    <TabAvatar model={model} id={model.id} label={label} size={36} />
+                  </button>
+                );
+              })
+            : null}
         </div>
+        {availableModels.length > 0 ? (
+          <button
+            type="button"
+            title={pickerOpen ? "Cancelar" : "Añadir modelo"}
+            aria-label={pickerOpen ? "Cancelar" : "Añadir modelo"}
+            onClick={() => setPickerOpen((open) => !open)}
+            className="mb-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-300 hover:bg-slate-800 hover:text-white"
+          >
+            {pickerOpen ? <X size={16} /> : <Plus size={16} />}
+          </button>
+        ) : null}
       </aside>
     );
   }
@@ -296,24 +252,21 @@ export function MessagesTabBar() {
   /* ── Top Bar Mode (Barra de arriba) ─────────────────────────────── */
   return (
     <div
-      className="flex h-screen w-screen select-none items-end gap-1 overflow-x-auto overflow-y-hidden px-2 pt-1.5"
+      className="flex h-screen min-h-0 w-screen min-w-0 select-none items-end gap-1 overflow-x-auto overflow-y-hidden px-2 pt-1.5"
       style={{
         background: "#0f172a",
         borderBottom: "1px solid #1e293b",
         color: "#e2e8f0",
       }}
     >
-      {/* Toggle button: Top Bar <-> Left Sidebar */}
-      <button
-        type="button"
-        onClick={togglePlacement}
-        title="Cambiar a barra lateral"
-        aria-label="Cambiar a barra lateral"
-        className="mb-1 mr-1 inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-slate-800/90 px-2 text-[11px] font-medium text-slate-200 transition-colors hover:bg-blue-600 hover:text-white"
-      >
-        <PanelLeft size={13} strokeWidth={2} />
-        <span>Lateral</span>
-      </button>
+      <div className="mb-1 mr-1 shrink-0">
+        <HubChrome
+          placement={tabs.barPlacement}
+          insightsOpen={tabs.insightsOpen}
+          onPlacement={changePlacement}
+          onToggleInsights={toggleInsights}
+        />
+      </div>
 
       {tabs.openModelIds.map((id) => {
         const model = modelById.get(id);
@@ -424,6 +377,63 @@ export function MessagesTabBar() {
           </button>
         )
       ) : null}
+    </div>
+  );
+}
+
+function HubChrome({
+  placement,
+  insightsOpen,
+  stacked = false,
+  onPlacement,
+  onToggleInsights,
+}: {
+  placement: MessageBarPlacement;
+  insightsOpen: boolean;
+  stacked?: boolean;
+  onPlacement: (next: MessageBarPlacement) => void;
+  onToggleInsights: () => void;
+}) {
+  const item = (active: boolean) =>
+    `inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+      active ? "bg-blue-600 text-white" : "bg-slate-800/90 text-slate-300 hover:bg-slate-700 hover:text-white"
+    }`;
+  return (
+    <div
+      className={`inline-flex gap-1 ${stacked ? "flex-col items-center" : "items-center"}`}
+      role="group"
+      aria-label="Distribución de Messages"
+    >
+      <button
+        type="button"
+        className={item(placement === "top")}
+        aria-pressed={placement === "top"}
+        title="Barra de arriba"
+        aria-label="Barra de arriba"
+        onClick={() => onPlacement("top")}
+      >
+        <PanelTop size={14} strokeWidth={2} />
+      </button>
+      <button
+        type="button"
+        className={item(placement === "sidebar")}
+        aria-pressed={placement === "sidebar"}
+        title="Barra lateral"
+        aria-label="Barra lateral"
+        onClick={() => onPlacement("sidebar")}
+      >
+        <PanelLeft size={14} strokeWidth={2} />
+      </button>
+      <button
+        type="button"
+        className={item(insightsOpen)}
+        aria-pressed={insightsOpen}
+        title={insightsOpen ? "Ocultar Fan Insights" : "Mostrar Fan Insights"}
+        aria-label={insightsOpen ? "Ocultar Fan Insights" : "Mostrar Fan Insights"}
+        onClick={onToggleInsights}
+      >
+        {insightsOpen ? <PanelRightClose size={14} strokeWidth={2} /> : <PanelRightOpen size={14} strokeWidth={2} />}
+      </button>
     </div>
   );
 }

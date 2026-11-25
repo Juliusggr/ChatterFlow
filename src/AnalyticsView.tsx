@@ -35,6 +35,7 @@ import {
   type AnalyticsReport,
   type TrendBucket,
 } from "./api";
+import { salesByEmployee, type EmployeeSaleTotal } from "./agency";
 import { avatarColor, formatMoney, formatStamp, initials, modelLabel, type Model } from "./types";
 
 const QUICK_RANGES: { id: AnalyticsRange; label: string; defaultBucket?: TrendBucket }[] = [
@@ -103,6 +104,7 @@ export function AnalyticsView({ models }: { models: Model[] }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [agencySales, setAgencySales] = useState<EmployeeSaleTotal[]>([]);
 
   useEffect(() => {
     let alive = true;
@@ -119,6 +121,20 @@ export function AnalyticsView({ models }: { models: Model[] }) {
       alive = false;
     };
   }, [range, creatorFilter, selected, net, bucket, reload]);
+
+  useEffect(() => {
+    let alive = true;
+    void salesByEmployee("thisWeek", net ? "net" : "gross")
+      .then((rows) => {
+        if (alive) setAgencySales(rows);
+      })
+      .catch(() => {
+        if (alive) setAgencySales([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [net, reload]);
 
   useEffect(() => {
     let alive = true;
@@ -273,6 +289,28 @@ export function AnalyticsView({ models }: { models: Model[] }) {
           Comparativa de creadoras
         </button>
       </div>
+
+      <section className="cf-card" style={{ padding: "1.25rem" }}>
+        <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Ventas por empleado esta semana
+        </h2>
+        {agencySales.length === 0 ? (
+          <p className="mt-3 text-sm" style={{ color: "var(--text-tertiary)" }}>
+            Las ventas se registran en Supabase cuando hay un turno activo.
+          </p>
+        ) : (
+          <ul className="mt-3 flex flex-col gap-2">
+            {agencySales.map((sale) => (
+              <li key={sale.employeeId} className="flex items-center justify-between text-sm">
+                <span style={{ color: "var(--text-primary)" }}>{sale.name}</span>
+                <span className="tabular-nums font-semibold" style={{ color: "var(--text-primary)" }}>
+                  {formatMoney(sale.amount)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {/* Filter Toolbar Card */}
       <div
