@@ -124,6 +124,35 @@ export function formatStamp(value: string | null): string {
   }).format(date);
 }
 
+export function formatShiftDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("es", { dateStyle: "medium" }).format(date);
+}
+
+export function formatShiftTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("es", { timeStyle: "short" }).format(date);
+}
+
+export function sameLocalDay(a: string, b: string): boolean {
+  const left = new Date(a);
+  const right = new Date(b);
+  if (Number.isNaN(left.getTime()) || Number.isNaN(right.getTime())) return false;
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+}
+
+export function formatCheckout(start: string, end: string | null): string {
+  if (!end) return "Abierto";
+  const time = formatShiftTime(end);
+  return sameLocalDay(start, end) ? time : `${formatShiftDate(end)} · ${time}`;
+}
+
 export function formatMoney(value: number): string {
   return new Intl.NumberFormat("en-US", {
     style: "currency",

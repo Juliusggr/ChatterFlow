@@ -145,6 +145,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
   }, [canManage, canOpenMessages, section]);
 
   useEffect(() => {
+    if (profile.role === "dropper") return;
     let alive = true;
     let stop = () => {};
     void listen<AppNotification>("cf-notification", (event) => {
@@ -171,7 +172,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       alive = false;
       stop();
     };
-  }, [models]);
+  }, [models, profile.role]);
 
   useEffect(() => {
     let alive = true;
@@ -490,7 +491,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
             </div>
           ) : null}
 
-          {loaded && section === "dashboard" ? <DashboardView /> : null}
+          {loaded && section === "dashboard" ? <DashboardView canDeleteShifts={profile.role === "owner"} /> : null}
           {loaded && section === "teams" && canManage ? <TeamsView models={models} /> : null}
           {loaded && section === "models" ? (
             <ModelsView
@@ -511,7 +512,9 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
               onOpen={handleOpenModelChat}
             />
           ) : null}
-          {loaded && section === "analytics" ? <AnalyticsView models={models} /> : null}
+          {loaded && section === "analytics" ? (
+            <AnalyticsView models={models} canDeleteShifts={profile.role === "owner"} />
+          ) : null}
         </div>
       </main>
     </div>

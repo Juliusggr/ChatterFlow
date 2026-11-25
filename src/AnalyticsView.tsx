@@ -7,6 +7,7 @@ import {
   Filter,
   RefreshCw,
   Search,
+  Trash2,
   TrendingUp,
   Users,
 } from "lucide-react";
@@ -35,8 +36,26 @@ import {
   type AnalyticsReport,
   type TrendBucket,
 } from "./api";
-import { salesByEmployee, type EmployeeSaleTotal } from "./agency";
-import { avatarColor, formatMoney, formatStamp, initials, modelLabel, type Model } from "./types";
+import {
+  analyticsBounds,
+  chatterSales,
+  deleteShift,
+  listCompletedShifts,
+  roleLabel,
+  type CompletedShift,
+  type EmployeeSaleTotal,
+} from "./agency";
+import {
+  avatarColor,
+  formatCheckout,
+  formatMoney,
+  formatShiftDate,
+  formatShiftTime,
+  formatStamp,
+  initials,
+  modelLabel,
+  type Model,
+} from "./types";
 
 const QUICK_RANGES: { id: AnalyticsRange; label: string; defaultBucket?: TrendBucket }[] = [
   { id: "24h", label: "24 horas", defaultBucket: "hour" },
@@ -91,8 +110,23 @@ const BUCKETS: { id: TrendBucket; label: string }[] = [
 
 const COLORS = ["#4f72f0", "#ea580c", "#0f766e", "#8b5cf6", "#ec4899", "#3b82f6"];
 
-export function AnalyticsView({ models }: { models: Model[] }) {
-  const [tab, setTab] = useState<"overview" | "creators">("overview");
+type AnalyticsTab = "overview" | "creators" | "shifts" | "chatters";
+
+const ANALYTICS_TABS: { id: AnalyticsTab; label: string }[] = [
+  { id: "overview", label: "Overview general" },
+  { id: "creators", label: "Comparativa de creadoras" },
+  { id: "shifts", label: "Turnos" },
+  { id: "chatters", label: "Comparativa de chatters" },
+];
+
+export function AnalyticsView({
+  models,
+  canDeleteShifts = false,
+}: {
+  models: Model[];
+  canDeleteShifts?: boolean;
+}) {
+  const [tab, setTab] = useState<AnalyticsTab>("overview");
   const [range, setRange] = useState<AnalyticsRange>("7");
   const [bucket, setBucket] = useState<TrendBucket>("day");
   const [net, setNet] = useState(true);
@@ -104,7 +138,10 @@ export function AnalyticsView({ models }: { models: Model[] }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
-  const [agencySales, setAgencySales] = useState<EmployeeSaleTotal[]>([]);
+  const [completedShifts, setCompletedShifts] = useState<CompletedShift[]>([]);
+  const [chatterRank, setChatterRank] = useState<EmployeeSaleTotal[]>([]);
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [teamError, setTeamError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -123,18 +160,35 @@ export function AnalyticsView({ models }: { models: Model[] }) {
   }, [range, creatorFilter, selected, net, bucket, reload]);
 
   useEffect(() => {
+    if (tab !== "shifts" && tab !== "chatters") return;
     let alive = true;
-    void salesByEmployee("thisWeek", net ? "net" : "gross")
-      .then((rows) => {
-        if (alive) setAgencySales(rows);
+    setTeamLoading(true);
+    const { from, to } = analyticsBounds(range);
+    const basis = net ? "net" : "gross";
+    const apply = tab === "shifts"
+      ? listCompletedShifts(from, to, basis).then((rows) => {
+          if (alive) setCompletedShifts(rows);
+        })
+      : chatterSales(from, to, basis).then((rows) => {
+          if (alive) setChatterRank(rows);
+        });
+    void apply
+      .then(() => {
+        if (alive) setTeamError(null);
       })
-      .catch(() => {
-        if (alive) setAgencySales([]);
+      .catch((caught) => {
+        if (!alive) return;
+        if (tab === "shifts") setCompletedShifts([]);
+        else setChatterRank([]);
+        setTeamError(errorMessage(caught));
+      })
+      .finally(() => {
+        if (alive) setTeamLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [net, reload]);
+  }, [tab, range, net, reload]);
 
   useEffect(() => {
     let alive = true;
@@ -251,66 +305,30 @@ export function AnalyticsView({ models }: { models: Model[] }) {
 
       {/* Segmented Control Navigation Tabs */}
       <div
-        className="inline-flex w-fit rounded-xl p-1 gap-1"
+        className="inline-flex w-fit max-w-full flex-wrap rounded-xl p-1 gap-1"
         style={{ background: "var(--bg-subtle)", border: "1px solid var(--border)" }}
       >
-        <button
-          type="button"
-          aria-pressed={tab === "overview"}
-          className="rounded-lg px-4 py-2 text-sm font-semibold transition-all"
-          style={
-            tab === "overview"
-              ? {
-                  background: "var(--bg-elevated)",
-                  color: "var(--text-primary)",
-                  boxShadow: "var(--shadow-sm)",
-                }
-              : { color: "var(--text-tertiary)" }
-          }
-          onClick={() => setTab("overview")}
-        >
-          Overview general
-        </button>
-        <button
-          type="button"
-          aria-pressed={tab === "creators"}
-          className="rounded-lg px-4 py-2 text-sm font-semibold transition-all"
-          style={
-            tab === "creators"
-              ? {
-                  background: "var(--bg-elevated)",
-                  color: "var(--text-primary)",
-                  boxShadow: "var(--shadow-sm)",
-                }
-              : { color: "var(--text-tertiary)" }
-          }
-          onClick={() => setTab("creators")}
-        >
-          Comparativa de creadoras
-        </button>
+        {ANALYTICS_TABS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            aria-pressed={tab === item.id}
+            className="rounded-lg px-4 py-2 text-sm font-semibold transition-all"
+            style={
+              tab === item.id
+                ? {
+                    background: "var(--bg-elevated)",
+                    color: "var(--text-primary)",
+                    boxShadow: "var(--shadow-sm)",
+                  }
+                : { color: "var(--text-tertiary)" }
+            }
+            onClick={() => setTab(item.id)}
+          >
+            {item.label}
+          </button>
+        ))}
       </div>
-
-      <section className="cf-card" style={{ padding: "1.25rem" }}>
-        <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
-          Ventas por empleado esta semana
-        </h2>
-        {agencySales.length === 0 ? (
-          <p className="mt-3 text-sm" style={{ color: "var(--text-tertiary)" }}>
-            Las ventas se registran en Supabase cuando hay un turno activo.
-          </p>
-        ) : (
-          <ul className="mt-3 flex flex-col gap-2">
-            {agencySales.map((sale) => (
-              <li key={sale.employeeId} className="flex items-center justify-between text-sm">
-                <span style={{ color: "var(--text-primary)" }}>{sale.name}</span>
-                <span className="tabular-nums font-semibold" style={{ color: "var(--text-primary)" }}>
-                  {formatMoney(sale.amount)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
 
       {/* Filter Toolbar Card */}
       <div
@@ -401,6 +419,8 @@ export function AnalyticsView({ models }: { models: Model[] }) {
           </select>
         </div>
 
+        {tab === "overview" || tab === "creators" ? (
+        <>
         <div className="h-4 w-px" style={{ background: "var(--border)" }} />
 
         {/* Creators filter pills */}
@@ -463,6 +483,8 @@ export function AnalyticsView({ models }: { models: Model[] }) {
             );
           })}
         </div>
+        </>
+        ) : null}
 
         {/* Net / Gross toggle */}
         <label
@@ -806,20 +828,10 @@ export function AnalyticsView({ models }: { models: Model[] }) {
               <BreakdownLegend slices={report?.breakdown ?? []} showEmpty />
             </article>
           </div>
-
-          {/* Comparison section */}
-          <CompareCreators
-            models={filteredModels}
-            query={query}
-            selected={selected}
-            report={report}
-            compareChart={compareChart}
-            onQuery={setQuery}
-            onSelected={setSelected}
-          />
         </>
-      ) : (
-        /* CREATORS COMPARISON TAB ONLY */
+      ) : null}
+
+      {tab === "creators" ? (
         <CompareCreators
           models={filteredModels}
           query={query}
@@ -829,7 +841,262 @@ export function AnalyticsView({ models }: { models: Model[] }) {
           onQuery={setQuery}
           onSelected={setSelected}
         />
+      ) : null}
+
+      {tab === "shifts" ? (
+        <CompletedShiftsPanel
+          shifts={completedShifts}
+          loading={teamLoading}
+          error={teamError}
+          canDelete={canDeleteShifts}
+          onDeleted={() => setReload((current) => current + 1)}
+        />
+      ) : null}
+
+      {tab === "chatters" ? (
+        <ChatterComparison rank={chatterRank} loading={teamLoading} error={teamError} />
+      ) : null}
+    </section>
+  );
+}
+
+function CompletedShiftsPanel({
+  shifts,
+  loading,
+  error,
+  canDelete,
+  onDeleted,
+}: {
+  shifts: CompletedShift[];
+  loading: boolean;
+  error: string | null;
+  canDelete: boolean;
+  onDeleted: () => void;
+}) {
+  const [pendingId, setPendingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const columns = canDelete
+    ? ["Usuario", "Rol", "Fecha", "Hora de entrada", "Hora de salida", "Venta", "Acciones"]
+    : ["Usuario", "Rol", "Fecha", "Hora de entrada", "Hora de salida", "Venta"];
+
+  async function remove(id: string) {
+    setDeletingId(id);
+    setDeleteError(null);
+    try {
+      await deleteShift(id);
+      setPendingId(null);
+      onDeleted();
+    } catch (caught) {
+      setDeleteError(errorMessage(caught));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  return (
+    <section className="cf-card overflow-hidden">
+      <div className="px-5 py-4" style={{ borderBottom: "1px solid var(--border)" }}>
+        <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Turnos cerrados
+        </h2>
+        <p className="mt-1 text-xs" style={{ color: "var(--text-tertiary)" }}>
+          Check-in y check-out del período. La venta solo se suma en turnos de chatters.
+        </p>
+      </div>
+      {deleteError ? (
+        <p className="px-5 pt-3 text-sm" role="alert" style={{ color: "var(--danger, #dc2626)" }}>{deleteError}</p>
+      ) : null}
+      {error ? (
+        <p className="px-5 py-4 text-sm" style={{ color: "var(--danger, #dc2626)" }}>{error}</p>
+      ) : loading ? (
+        <p className="px-5 py-8 text-sm" style={{ color: "var(--text-tertiary)" }}>Cargando turnos…</p>
+      ) : shifts.length === 0 ? (
+        <p className="px-5 py-8 text-sm" style={{ color: "var(--text-tertiary)" }}>
+          No hay turnos cerrados en este período.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[44rem] text-left text-sm">
+            <caption className="sr-only">Turnos con check-in y check-out</caption>
+            <thead style={{ borderBottom: "1px solid var(--border)" }}>
+              <tr>
+                {columns.map((heading) => (
+                  <th
+                    key={heading}
+                    className="px-5 py-3 text-xs font-semibold uppercase tracking-wide"
+                    style={{ color: "var(--text-tertiary)" }}
+                  >
+                    {heading}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {shifts.map((shift) => (
+                <tr key={shift.id} style={{ borderBottom: "1px solid var(--border-muted)" }}>
+                  <th scope="row" className="px-5 py-3 text-left font-semibold" style={{ color: "var(--text-primary)" }}>
+                    {shift.employeeName}
+                  </th>
+                  <td className="px-5 py-3" style={{ color: "var(--text-secondary)" }}>
+                    {shift.role ? roleLabel(shift.role) : "—"}
+                  </td>
+                  <td className="px-5 py-3" style={{ color: "var(--text-secondary)" }}>
+                    {formatShiftDate(shift.startTime)}
+                  </td>
+                  <td className="px-5 py-3 tabular-nums" style={{ color: "var(--text-secondary)" }}>
+                    {formatShiftTime(shift.startTime)}
+                  </td>
+                  <td className="px-5 py-3 tabular-nums" style={{ color: "var(--text-secondary)" }}>
+                    {formatCheckout(shift.startTime, shift.endTime)}
+                  </td>
+                  <td className="px-5 py-3 tabular-nums font-semibold" style={{ color: "var(--text-primary)" }}>
+                    {shift.amount == null ? "—" : formatMoney(shift.amount)}
+                  </td>
+                  {canDelete ? (
+                    <td className="px-5 py-3">
+                      {pendingId === shift.id ? (
+                        <span className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className="cf-btn-danger"
+                            style={{ padding: "0.3rem 0.65rem" }}
+                            disabled={deletingId === shift.id}
+                            onClick={() => void remove(shift.id)}
+                          >
+                            {deletingId === shift.id ? "Eliminando…" : "Confirmar"}
+                          </button>
+                          <button
+                            type="button"
+                            className="cf-btn-secondary"
+                            style={{ padding: "0.3rem 0.65rem" }}
+                            disabled={deletingId === shift.id}
+                            onClick={() => setPendingId(null)}
+                          >
+                            Cancelar
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="cf-btn-secondary"
+                          style={{ padding: "0.3rem 0.65rem", color: "var(--text-tertiary)" }}
+                          onClick={() => setPendingId(shift.id)}
+                        >
+                          <Trash2 size={13} strokeWidth={2} />
+                          Eliminar
+                        </button>
+                      )}
+                    </td>
+                  ) : null}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
+    </section>
+  );
+}
+
+function ChatterComparison({
+  rank,
+  loading,
+  error,
+}: {
+  rank: EmployeeSaleTotal[];
+  loading: boolean;
+  error: string | null;
+}) {
+  const total = rank.reduce((sum, row) => sum + row.amount, 0);
+  const chart = rank.map((row) => ({ name: row.name, amount: row.amount }));
+  return (
+    <section className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]">
+      <article className="cf-card p-5">
+        <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Quién vende más
+        </h2>
+        <p className="mt-1 text-xs" style={{ color: "var(--text-tertiary)" }}>
+          Chatters activos en el período seleccionado. Los droppers no entran.
+        </p>
+        {error ? (
+          <p className="mt-6 text-sm" style={{ color: "var(--danger, #dc2626)" }}>{error}</p>
+        ) : loading ? (
+          <p className="mt-6 text-sm" style={{ color: "var(--text-tertiary)" }}>Cargando comparativa…</p>
+        ) : rank.length === 0 ? (
+          <p className="mt-6 text-sm" style={{ color: "var(--text-tertiary)" }}>No hay chatters activos.</p>
+        ) : (
+          <div className="mt-4" style={{ height: Math.max(220, rank.length * 48) }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chart} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 0 }}>
+                <CartesianGrid horizontal={false} stroke="var(--border-muted)" strokeDasharray="3 3" />
+                <XAxis
+                  type="number"
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: "var(--text-tertiary)", fontSize: 11 }}
+                  tickFormatter={(value) => formatMoney(Number(value))}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  width={120}
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: "var(--text-secondary)", fontSize: 12 }}
+                />
+                <Tooltip
+                  cursor={{ fill: "var(--bg-subtle)" }}
+                  contentStyle={{
+                    backgroundColor: "var(--bg-elevated)",
+                    borderColor: "var(--border)",
+                    borderRadius: "0.75rem",
+                    color: "var(--text-primary)",
+                  }}
+                  formatter={(value) => formatMoney(Number(value))}
+                />
+                <Bar dataKey="amount" name="Ventas" fill="#7c3aed" radius={[0, 6, 6, 0]} maxBarSize={22} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </article>
+      <article className="cf-card p-5">
+        <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          Ranking
+        </h2>
+        {loading || error || rank.length === 0 ? (
+          <p className="mt-4 text-sm" style={{ color: "var(--text-tertiary)" }}>
+            {error ? "No se pudo cargar el ranking." : loading ? "Cargando…" : "Sin chatters para comparar."}
+          </p>
+        ) : (
+          <ol className="mt-3 flex flex-col">
+            {rank.map((row, index) => {
+              const share = total > 0 ? (row.amount / total) * 100 : 0;
+              return (
+                <li
+                  key={row.employeeId}
+                  className="flex items-center gap-3 py-2.5 text-sm"
+                  style={index < rank.length - 1 ? { borderBottom: "1px solid var(--border-muted)" } : undefined}
+                >
+                  <span className="w-5 tabular-nums text-xs font-semibold" style={{ color: "var(--text-tertiary)" }}>
+                    {index + 1}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate font-medium" style={{ color: "var(--text-primary)" }}>
+                    {row.name}
+                  </span>
+                  <span className="tabular-nums text-xs" style={{ color: "var(--text-tertiary)" }}>
+                    {share.toFixed(1)}%
+                  </span>
+                  <span className="tabular-nums font-semibold" style={{ color: "var(--text-primary)" }}>
+                    {formatMoney(row.amount)}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </article>
     </section>
   );
 }

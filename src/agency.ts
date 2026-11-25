@@ -300,6 +300,12 @@ export async function clockOut(): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
+export async function deleteShift(id: string): Promise<void> {
+  const { data, error } = await supabase.from("shifts").delete().eq("id", id).select("id");
+  if (error) throw new Error(error.message);
+  if (!data?.length) throw new Error("No se pudo eliminar el turno");
+}
+
 export async function listActiveShifts(): Promise<ActiveShift[]> {
   const { data, error } = await supabase
     .from("shifts")
@@ -344,42 +350,38 @@ export async function myShiftOpen(): Promise<boolean> {
 export type ShiftSummary = {
   id: string;
   employeeName: string;
-  role: string;
   startTime: string;
   endTime: string | null;
-  amount: number;
 };
 
-export async function listMyShifts(range: DashboardRange, basis: "net" | "gross"): Promise<ShiftSummary[]> {
+export type CompletedShift = {
+  id: string;
+  employeeName: string;
+  role: AgencyRole | null;
+  startTime: string;
+  endTime: string;
+  amount: number | null;
+};
+
+export async function listMyShifts(range: DashboardRange): Promise<ShiftSummary[]> {
   const profile = await loadMyProfile();
   if (!profile) return [];
   const { from, to } = rangeBounds(range);
-  const [{ data: shifts, error }, sales] = await Promise.all([
-    supabase
-      .from("shifts")
-      .select("id,clock_in,clock_out")
-      .eq("user_id", profile.id)
-      .gte("clock_in", from)
-      .lt("clock_in", to)
-      .order("clock_in", { ascending: false }),
-    listSales(from, to),
-  ]);
+  const { data: shifts, error } = await supabase
+    .from("shifts")
+    .select("id,clock_in,clock_out")
+    .eq("user_id", profile.id)
+    .gte("clock_in", from)
+    .lt("clock_in", to)
+    .order("clock_in", { ascending: false });
   if (error) throw error;
-  return (shifts ?? []).map((shift) => {
-    const start = new Date(shift.clock_in as string).getTime();
-    const end = shift.clock_out ? new Date(shift.clock_out as string).getTime() : Date.now();
-    const amount = sales
-      .filter((sale) => sale.employeeId === profile.id && sale.at >= start && sale.at <= end)
-      .reduce((sum, sale) => sum + (basis === "net" ? sale.net : sale.gross), 0);
-    return {
-      id: shift.id as string,
-      employeeName: profile.full_name || profile.username,
-      role: roleLabel(profile.role),
-      startTime: shift.clock_in as string,
-      endTime: (shift.clock_out as string | null) ?? null,
-      amount,
-    };
-  });
+  const name = profile.full_name || profile.username;
+  return (shifts ?? []).map((shift) => ({
+    id: shift.id as string,
+    employeeName: name,
+    startTime: shift.clock_in as string,
+    endTime: (shift.clock_out as string | null) ?? null,
+  }));
 }
 
 export async function salesByEmployee(range: DashboardRange, basis: "net" | "gross"): Promise<EmployeeSaleTotal[]> {
@@ -387,6 +389,7 @@ export async function salesByEmployee(range: DashboardRange, basis: "net" | "gro
   const sales = await listSales(from, to);
   const totals = new Map<string, EmployeeSaleTotal>();
   for (const sale of sales) {
+    if (sale.role !== "chatter") continue;
     const current = totals.get(sale.employeeId) ?? { employeeId: sale.employeeId, name: sale.name, amount: 0 };
     current.amount += basis === "net" ? sale.net : sale.gross;
     totals.set(sale.employeeId, current);
@@ -394,12 +397,129 @@ export async function salesByEmployee(range: DashboardRange, basis: "net" | "gro
   return [...totals.values()].sort((a, b) => b.amount - a.amount);
 }
 
-type SaleRow = { employeeId: string; name: string; gross: number; net: number; at: number };
+export function analyticsBounds(range: string): { from: string | null; to: string } {
+  const now = new Date();
+  const clean = range.trim().toLowerCase();
+  const tomorrow = nextLocalMidnight(now);
+  if (clean === "24h" || clean === "24" || clean === "1" || clean === "day" || clean === "today") {
+    return { from: new Date(now.getTime() - 86_400_000).toISOString(), to: now.toISOString() };
+  }
+  const span = daySpan(clean);
+  if (span != null) {
+    const start = localMidnight(now);
+    start.setDate(start.getDate() - (span - 1));
+    return { from: start.toISOString(), to: tomorrow.toISOString() };
+  }
+  if (clean === "all" || clean === "historic" || clean === "historico" || clean === "all_time" || clean === "todo") {
+    return { from: null, to: tomorrow.toISOString() };
+  }
+  const yearMatch = /^(?:year:)?(\d{4})$/.exec(clean);
+  if (yearMatch && (clean.startsWith("year:") || clean.length === 4)) {
+    const year = Number(yearMatch[1]);
+    return {
+      from: localDate(year, 1, 1).toISOString(),
+      to: localDate(year + 1, 1, 1).toISOString(),
+    };
+  }
+  const monthMatch = /^(?:month:)?(\d{4})-(\d{2})$/.exec(clean);
+  if (monthMatch) {
+    const year = Number(monthMatch[1]);
+    const month = Number(monthMatch[2]);
+    if (month >= 1 && month <= 12) {
+      const nextYear = month === 12 ? year + 1 : year;
+      const nextMonth = month === 12 ? 1 : month + 1;
+      return {
+        from: localDate(year, month, 1).toISOString(),
+        to: localDate(nextYear, nextMonth, 1).toISOString(),
+      };
+    }
+  }
+  const start = localMidnight(now);
+  start.setDate(start.getDate() - 6);
+  return { from: start.toISOString(), to: tomorrow.toISOString() };
+}
+
+export async function listCompletedShifts(
+  from: string | null,
+  to: string,
+  basis: "net" | "gross",
+): Promise<CompletedShift[]> {
+  let query = supabase
+    .from("shifts")
+    .select("id,user_id,clock_in,clock_out,profiles(full_name,username,role)")
+    .not("clock_out", "is", null)
+    .lt("clock_in", to)
+    .order("clock_in", { ascending: false });
+  if (from) query = query.gte("clock_in", from);
+  const { data, error } = await query;
+  if (error) throw error;
+  const shifts = data ?? [];
+  if (shifts.length === 0) return [];
+
+  let fromMs = Number.POSITIVE_INFINITY;
+  let toMs = new Date(to).getTime();
+  for (const shift of shifts) {
+    fromMs = Math.min(fromMs, new Date(shift.clock_in as string).getTime());
+    toMs = Math.max(toMs, new Date(shift.clock_out as string).getTime());
+  }
+  const sales = await listSales(new Date(fromMs).toISOString(), new Date(toMs + 1).toISOString());
+
+  return shifts.map((shift) => {
+    const profile = firstRelation(shift.profiles);
+    const rawRole = profile?.role;
+    const role = isAgencyRole(rawRole) ? rawRole : null;
+    const start = new Date(shift.clock_in as string).getTime();
+    const end = new Date(shift.clock_out as string).getTime();
+    const amount =
+      role === "chatter"
+        ? sales
+            .filter((sale) => sale.employeeId === shift.user_id && sale.at >= start && sale.at <= end)
+            .reduce((sum, sale) => sum + (basis === "net" ? sale.net : sale.gross), 0)
+        : null;
+    return {
+      id: shift.id as string,
+      employeeName: profile?.full_name || profile?.username || "Empleado",
+      role,
+      startTime: shift.clock_in as string,
+      endTime: shift.clock_out as string,
+      amount,
+    };
+  });
+}
+
+export async function chatterSales(
+  from: string | null,
+  to: string,
+  basis: "net" | "gross",
+): Promise<EmployeeSaleTotal[]> {
+  const salesFrom = from ?? "1970-01-01T00:00:00.000Z";
+  const [{ data: profiles, error }, sales] = await Promise.all([
+    supabase.from("profiles").select("id,full_name,username").eq("role", "chatter").eq("is_active", true),
+    listSales(salesFrom, to),
+  ]);
+  if (error) throw error;
+  const totals = new Map<string, EmployeeSaleTotal>();
+  for (const profile of profiles ?? []) {
+    totals.set(profile.id as string, {
+      employeeId: profile.id as string,
+      name: (profile.full_name as string) || (profile.username as string) || "Empleado",
+      amount: 0,
+    });
+  }
+  for (const sale of sales) {
+    const current = totals.get(sale.employeeId);
+    if (!current || sale.role !== "chatter") continue;
+    current.amount += basis === "net" ? sale.net : sale.gross;
+  }
+  return [...totals.values()].sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name, "es"));
+}
+
+type SaleRow = { employeeId: string; name: string; role: string | null; gross: number; net: number; at: number };
 
 async function listSales(from: string, to: string): Promise<SaleRow[]> {
   const { data, error } = await supabase
     .from("sales")
-    .select("employee_id,amount_gross,amount_net,recorded_at,profiles(full_name,username)")
+    .select("employee_id,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
     .gte("recorded_at", from)
     .lt("recorded_at", to);
   if (error) throw error;
@@ -408,11 +528,48 @@ async function listSales(from: string, to: string): Promise<SaleRow[]> {
     return {
       employeeId: row.employee_id as string,
       name: profile?.full_name || profile?.username || "Empleado",
+      role: typeof profile?.role === "string" ? profile.role : null,
       gross: Number(row.amount_gross),
       net: Number(row.amount_net),
       at: new Date(row.recorded_at as string).getTime(),
     };
   });
+}
+
+function isAgencyRole(value: unknown): value is AgencyRole {
+  return value === "owner" || value === "admin" || value === "chatter" || value === "dropper";
+}
+
+function daySpan(clean: string): number | null {
+  const spans: Record<string, number> = {
+    "7": 7,
+    "7d": 7,
+    "14": 14,
+    "14d": 14,
+    "30": 30,
+    "30d": 30,
+    "90": 90,
+    "90d": 90,
+    "180": 180,
+    "180d": 180,
+  };
+  return spans[clean] ?? null;
+}
+
+function localMidnight(date: Date): Date {
+  const copy = new Date(date);
+  copy.setHours(0, 0, 0, 0);
+  return copy;
+}
+
+function nextLocalMidnight(date: Date): Date {
+  const start = localMidnight(date);
+  start.setDate(start.getDate() + 1);
+  return start;
+}
+
+function localDate(year: number, month: number, day: number): Date {
+  return new Date(year, month - 1, day, 0, 0, 0, 0);
 }
 
 export async function recordSale(input: {

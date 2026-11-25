@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { CalendarDays, CircleDollarSign, TrendingUp, Users, type LucideIcon } from "lucide-react";
+import { CalendarDays, CircleDollarSign, Trash2, TrendingUp, Users, type LucideIcon } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import {
   errorMessage,
@@ -11,6 +11,7 @@ import {
 import {
   clockIn,
   clockOut,
+  deleteShift,
   listActiveShifts,
   listMyShifts,
   myShiftOpen,
@@ -20,7 +21,7 @@ import {
   type EmployeeSaleTotal,
   type ShiftSummary,
 } from "./agency";
-import { formatMoney, formatStamp } from "./types";
+import { formatCheckout, formatMoney, formatShiftDate, formatShiftTime } from "./types";
 
 const RANGES: { id: TimeRange; label: string }[] = [
   { id: "yesterday", label: "Ayer" },
@@ -38,7 +39,7 @@ const CHANNELS_META: Record<string, { color: string; bg: string }> = {
   streams:       { color: "#be185d", bg: "#fce7f3" },
 };
 
-export function DashboardView() {
+export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: boolean }) {
   const [range, setRange] = useState<TimeRange>("today");
   const [basis, setBasis] = useState<EarningsBasis>("net");
   const [overview, setOverview] = useState<EarningsOverview | null>(null);
@@ -50,6 +51,8 @@ export function DashboardView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -67,7 +70,7 @@ export function DashboardView() {
     setLoading(true);
     Promise.all([
       getEarningsOverview(range, basis),
-      listMyShifts(range, basis),
+      listMyShifts(range),
       listActiveShifts(),
       salesByEmployee(range, basis),
       myShiftOpen(),
@@ -88,6 +91,19 @@ export function DashboardView() {
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, [range, basis, refresh]);
+
+  async function removeShift(id: string) {
+    setDeletingId(id);
+    try {
+      await deleteShift(id);
+      setPendingDeleteId(null);
+      setRefresh((current) => current + 1);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   const total = overview?.total ?? 0;
 
@@ -238,21 +254,26 @@ export function DashboardView() {
           {shifts.length === 0 ? (
             <EmptyState icon={CalendarDays} label="Sin turnos en este período" />
           ) : (
-            <ul className="flex flex-col divide-y" style={{ "--divide-color": "var(--border-muted)" } as React.CSSProperties}>
-              {shifts.map((shift) => (
-                <li key={shift.id} className="flex items-start justify-between gap-3 py-3 text-sm">
-                  <span>
-                    <span className="block font-medium" style={{ color: "var(--text-primary)" }}>
-                      {shift.employeeName}
-                    </span>
-                    <span className="block text-xs mt-0.5" style={{ color: "var(--text-tertiary)" }}>
-                      {shift.role} · {formatStamp(shift.startTime)}
-                      {shift.endTime ? ` – ${formatStamp(shift.endTime)}` : " · Abierto"}
-                    </span>
-                  </span>
-                  <span className="tabular-nums font-semibold text-sm shrink-0" style={{ color: "var(--text-primary)" }}>
-                    {formatMoney(shift.amount)}
-                  </span>
+            <ul className="flex flex-col" style={{ "--divide-color": "var(--border-muted)" } as React.CSSProperties}>
+              {shifts.map((shift, index) => (
+                <li
+                  key={shift.id}
+                  className="grid grid-cols-2 gap-x-4 gap-y-2 py-3 text-sm"
+                  style={index > 0 ? { borderTop: "1px solid var(--border-muted)" } : undefined}
+                >
+                  <ShiftField label="Usuario" value={shift.employeeName} />
+                  <ShiftField label="Fecha" value={formatShiftDate(shift.startTime)} />
+                  <ShiftField label="Hora del check-in" value={formatShiftTime(shift.startTime)} />
+                  <ShiftField label="Hora del check-out" value={formatCheckout(shift.startTime, shift.endTime)} />
+                  {canDeleteShifts ? (
+                    <ShiftDelete
+                      pending={pendingDeleteId === shift.id}
+                      busy={deletingId === shift.id}
+                      onAsk={() => setPendingDeleteId(shift.id)}
+                      onCancel={() => setPendingDeleteId(null)}
+                      onConfirm={() => void removeShift(shift.id)}
+                    />
+                  ) : null}
                 </li>
               ))}
             </ul>
@@ -284,6 +305,15 @@ export function DashboardView() {
                   >
                     {employee.role}
                   </span>
+                  {canDeleteShifts ? (
+                    <ShiftDelete
+                      pending={pendingDeleteId === employee.id}
+                      busy={deletingId === employee.id}
+                      onAsk={() => setPendingDeleteId(employee.id)}
+                      onCancel={() => setPendingDeleteId(null)}
+                      onConfirm={() => void removeShift(employee.id)}
+                    />
+                  ) : null}
                 </li>
               ))}
             </ul>
@@ -361,6 +391,69 @@ function BasisButton({
     >
       {children}
     </button>
+  );
+}
+
+function ShiftDelete({
+  pending,
+  busy,
+  onAsk,
+  onCancel,
+  onConfirm,
+}: {
+  pending: boolean;
+  busy: boolean;
+  onAsk: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (!pending) {
+    return (
+      <button
+        type="button"
+        className="cf-btn-secondary col-span-2 w-fit"
+        style={{ padding: "0.3rem 0.65rem", color: "var(--text-tertiary)" }}
+        onClick={onAsk}
+      >
+        <Trash2 size={13} strokeWidth={2} />
+        Eliminar
+      </button>
+    );
+  }
+  return (
+    <span className="col-span-2 flex flex-wrap gap-2">
+      <button
+        type="button"
+        className="cf-btn-danger"
+        style={{ padding: "0.3rem 0.65rem" }}
+        disabled={busy}
+        onClick={onConfirm}
+      >
+        {busy ? "Eliminando…" : "Confirmar"}
+      </button>
+      <button
+        type="button"
+        className="cf-btn-secondary"
+        style={{ padding: "0.3rem 0.65rem" }}
+        disabled={busy}
+        onClick={onCancel}
+      >
+        Cancelar
+      </button>
+    </span>
+  );
+}
+
+function ShiftField({ label, value }: { label: string; value: string }) {
+  return (
+    <span>
+      <span className="block text-[11px] font-medium" style={{ color: "var(--text-tertiary)" }}>
+        {label}
+      </span>
+      <span className="block font-medium" style={{ color: "var(--text-primary)" }}>
+        {value}
+      </span>
+    </span>
   );
 }
 

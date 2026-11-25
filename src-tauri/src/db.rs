@@ -967,7 +967,7 @@ fn active_shift_employee(conn: &Connection, created_at: &str) -> Result<Option<i
         "SELECT e.id, s.start_time
          FROM shifts s
          JOIN employees e ON e.id = s.employee_id
-         WHERE e.is_clocked_in = 1 AND s.end_time IS NULL
+         WHERE e.is_clocked_in = 1 AND s.end_time IS NULL AND e.role != 'Dropper'
          ORDER BY s.start_time DESC",
     )?;
     let rows = stmt.query_map([], |row| {
