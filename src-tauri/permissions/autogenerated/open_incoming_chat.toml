@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-incoming-chat"
+description = "Enables the open_incoming_chat command without any pre-configured scope."
+commands.allow = ["open_incoming_chat"]
+
+[[permission]]
+identifier = "deny-open-incoming-chat"
+description = "Denies the open_incoming_chat command without any pre-configured scope."
+commands.deny = ["open_incoming_chat"]

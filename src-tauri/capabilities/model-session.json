@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "model-session",
+  "description": "OnlyFans webviews may report authenticated API responses for their own model.",
+  "windows": ["model-*", "messages-*"],
+  "webviews": ["model-*", "messages-*-of"],
+  "remote": {
+    "urls": ["https://onlyfans.com/*", "https://*.onlyfans.com/*"]
+  },
+  "permissions": ["allow-ingest-of-response", "allow-fan-selected", "allow-download-vault-media"]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-employee-role-schedule"
+description = "Enables the update_employee_role_schedule command without any pre-configured scope."
+commands.allow = ["update_employee_role_schedule"]
+
+[[permission]]
+identifier = "deny-update-employee-role-schedule"
+description = "Denies the update_employee_role_schedule command without any pre-configured scope."
+commands.deny = ["update_employee_role_schedule"]

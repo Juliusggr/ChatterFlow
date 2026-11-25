@@ -1,0 +1,29 @@
+[package]
+name = "creatorfloww"
+version = "0.1.0"
+description = "CreatorFloww desktop CRM"
+edition = "2021"
+rust-version = "1.95"
+
+[lib]
+name = "creatorfloww_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rfd = "0.15"
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
+rust_xlsxwriter = "0.79"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.12", features = ["unstable"] }
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

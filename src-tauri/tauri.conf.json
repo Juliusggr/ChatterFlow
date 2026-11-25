@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CreatorFloww",
+  "version": "0.1.0",
+  "identifier": "com.creatorfloww.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CreatorFloww",
+        "width": 1280,
+        "height": 800,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "category": "Business",
+    "shortDescription": "Creator CRM and chat insights for OnlyFans agencies",
+    "longDescription": "CreatorFloww helps agencies manage models, fan insights, notes, and messaging workflows in one desktop app.",
+    "copyright": "CreatorFloww",
+    "publisher": "CreatorFloww",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico",
+        "languages": ["English", "Spanish"],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "CreatorFloww",
+        "installerHooks": "nsis/hooks.nsh",
+        "compression": "lzma"
+      }
+    }
+  }
+}

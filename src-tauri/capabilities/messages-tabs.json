@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "messages-tabs",
+  "description": "Top model tab bar for the shared messages window.",
+  "webviews": ["messages-tabs"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "allow-get-models",
+    "allow-get-message-tabs",
+    "allow-set-message-bar-placement",
+    "allow-open-messages",
+    "allow-select-message-tab",
+    "allow-close-message-tab"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fan-insights",
+  "description": "Fan insights panel for the messages workspace.",
+  "webviews": ["messages-*-insights"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "allow-get-fan-insights",
+    "allow-update-fan-profile",
+    "allow-save-fan-notes",
+    "allow-get-ppv-timeline",
+    "allow-list-scripts",
+    "allow-insert-chat-text",
+    "allow-update-fan-lists",
+    "allow-open-messages",
+    "allow-select-message-tab",
+    "allow-get-recent-notifications",
+    "allow-clear-notifications",
+    "allow-dismiss-notification",
+    "allow-open-incoming-chat"
+  ]
+}

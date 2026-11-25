@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fan-selected"
+description = "Enables the fan_selected command without any pre-configured scope."
+commands.allow = ["fan_selected"]
+
+[[permission]]
+identifier = "deny-fan-selected"
+description = "Denies the fan_selected command without any pre-configured scope."
+commands.deny = ["fan_selected"]
