@@ -29,13 +29,13 @@ export function ModelsView({
 }: {
   models: Model[];
   canManage: boolean;
-  selectedModelId: number | null;
+  selectedModelId: string | null;
   onChanged: () => Promise<void>;
-  onSelect: (id: number) => void;
-  onOpenMessages?: (id: number) => void;
+  onSelect: (id: string) => void;
+  onOpenMessages?: (id: string) => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeTone, setNoticeTone] = useState<"neutral" | "green">("neutral");
   const [formError, setFormError] = useState<string | null>(null);
@@ -88,7 +88,7 @@ export function ModelsView({
     }
   }
 
-  async function openSession(id: number) {
+  async function openSession(id: string) {
     setBusy(`open:${id}`);
     setFormError(null);
     try {
@@ -102,7 +102,7 @@ export function ModelsView({
     }
   }
 
-  async function sync(id: number) {
+  async function sync(id: string) {
     setBusy(`sync:${id}`);
     setFormError(null);
     setNotice(null);
@@ -122,7 +122,7 @@ export function ModelsView({
     }
   }
 
-  async function remove(id: number) {
+  async function remove(id: string) {
     setBusy(`delete:${id}`);
     setFormError(null);
     try {
@@ -171,7 +171,7 @@ export function ModelsView({
         <div
           role="alert"
           className="rounded-xl px-4 py-3 text-sm"
-          style={{ background: "#fef2f2", border: "1px solid #fecaca", color: "#b91c1c" }}
+          style={{ background: "var(--danger-bg)", border: "1px solid var(--danger-border)", color: "var(--danger)" }}
         >
           {formError}
         </div>
@@ -182,8 +182,8 @@ export function ModelsView({
           style={
             noticeTone === "green"
               ? {
-                  background: "rgba(16, 185, 129, 0.12)",
-                  border: "1px solid #34d399",
+                  background: "var(--success-bg)",
+                  border: "1px solid var(--success)",
                   color: "var(--text-primary)",
                 }
               : {
@@ -194,7 +194,7 @@ export function ModelsView({
           }
         >
           {noticeTone === "green" ? (
-            <CheckCircle2 size={16} strokeWidth={2.25} style={{ color: "#059669" }} className="shrink-0" />
+            <CheckCircle2 size={16} strokeWidth={2.25} style={{ color: "var(--success)" }} className="shrink-0" />
           ) : null}
           <span>{notice}</span>
         </div>
@@ -370,7 +370,7 @@ function SessionBadge({ model }: { model: Model }) {
   if (model.window_open) {
     return (
       <span className="cf-badge cf-badge-brand">
-        <span className="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" aria-hidden="true" />
+        <span className="h-1.5 w-1.5 rounded-full animate-pulse" style={{ background: "var(--brand-500)" }} aria-hidden="true" />
         Esperando login
       </span>
     );

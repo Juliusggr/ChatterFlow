@@ -27,7 +27,7 @@ export function MessagesTabBar() {
   const [models, setModels] = useState<Model[]>([]);
   const [tabs, setTabs] = useState<MessageTabsState>(EMPTY_TABS);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [recentSales, setRecentSales] = useState<Record<number, number>>({});
+  const [recentSales, setRecentSales] = useState<Record<string, number>>({});
 
   const reload = useCallback(async () => {
     try {
@@ -46,7 +46,7 @@ export function MessagesTabBar() {
   useEffect(() => {
     let alive = true;
     const stops: Array<() => void> = [];
-    const saleTimers = new Map<number, number>();
+    const saleTimers = new Map<string, number>();
 
     void listen<MessageTabsState>("message-tabs-changed", (event) => {
       if (!alive) return;
@@ -66,7 +66,7 @@ export function MessagesTabBar() {
       else stop();
     });
 
-    void listen<Record<number, number>>("unread-counts-changed", (event) => {
+    void listen<Record<string, number>>("unread-counts-changed", (event) => {
       if (!alive || !event.payload) return;
       setTabs((prev) => ({ ...prev, unreadCounts: event.payload }));
     }).then((stop) => {
@@ -116,7 +116,7 @@ export function MessagesTabBar() {
   }, [reload]);
 
   const modelById = useMemo(() => {
-    const map = new Map<number, Model>();
+    const map = new Map<string, Model>();
     for (const model of models) {
       map.set(model.id, model);
     }
@@ -152,12 +152,12 @@ export function MessagesTabBar() {
       <aside
         className="flex h-screen min-h-0 w-screen min-w-0 select-none flex-col items-center overflow-hidden"
         style={{
-          background: "#0f172a",
-          borderRight: "1px solid #1e293b",
-          color: "#e2e8f0",
+          background: "var(--nav-bg)",
+          borderRight: "1px solid var(--nav-border)",
+          color: "var(--nav-text)",
         }}
       >
-        <div className="flex w-full shrink-0 justify-center py-2" style={{ borderBottom: "1px solid #1e293b" }}>
+        <div className="flex w-full shrink-0 justify-center py-2" style={{ borderBottom: "1px solid var(--nav-border)" }}>
           <HubChrome
             stacked
             placement={tabs.barPlacement}
@@ -184,20 +184,20 @@ export function MessagesTabBar() {
                   onClick={() => void selectMessageTab(id)}
                   className="relative flex h-11 w-11 items-center justify-center rounded-full"
                   style={{
-                    boxShadow: active ? "0 0 0 2px #3b82f6" : "none",
+                    boxShadow: active ? "0 0 0 2px var(--brand-500)" : "none",
                   }}
                 >
                   <TabAvatar model={model} id={id} label={label} size={40} />
                   {saleFlash != null ? (
                     <span
                       className="absolute -bottom-1 left-1/2 -translate-x-1/2 rounded-full px-1 text-[9px] font-bold"
-                      style={{ background: "#059669", color: "#ecfdf5" }}
+                      style={{ background: "var(--success)", color: "#fff" }}
                     >
                       <DollarSign size={8} className="inline" />
                       {formatMoney(saleFlash).replace("$", "")}
                     </span>
                   ) : unread > 0 ? (
-                    <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-600 px-1 text-[9px] font-bold text-white">
+                    <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] font-bold text-white" style={{ background: "var(--brand-500)" }}>
                       {unread > 99 ? "99+" : unread}
                     </span>
                   ) : null}
@@ -207,7 +207,7 @@ export function MessagesTabBar() {
                   aria-label={`Cerrar ${label}`}
                   title={`Cerrar ${label}`}
                   onClick={() => void closeMessageTab(id)}
-                  className="absolute -left-0.5 -top-0.5 hidden h-4 w-4 items-center justify-center rounded-full bg-slate-900 text-slate-200 group-hover:flex"
+                  className="cf-chrome-chip absolute -left-0.5 -top-0.5 hidden h-4 w-4 items-center justify-center rounded-full group-hover:flex"
                 >
                   <X size={10} />
                 </button>
@@ -240,7 +240,7 @@ export function MessagesTabBar() {
             title={pickerOpen ? "Cancelar" : "Añadir modelo"}
             aria-label={pickerOpen ? "Cancelar" : "Añadir modelo"}
             onClick={() => setPickerOpen((open) => !open)}
-            className="mb-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-300 hover:bg-slate-800 hover:text-white"
+            className="cf-chrome-icon mb-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
           >
             {pickerOpen ? <X size={16} /> : <Plus size={16} />}
           </button>
@@ -254,9 +254,9 @@ export function MessagesTabBar() {
     <div
       className="flex h-screen min-h-0 w-screen min-w-0 select-none items-end gap-1 overflow-x-auto overflow-y-hidden px-2 pt-1.5"
       style={{
-        background: "#0f172a",
-        borderBottom: "1px solid #1e293b",
-        color: "#e2e8f0",
+        background: "var(--nav-bg)",
+        borderBottom: "1px solid var(--nav-border)",
+        color: "var(--nav-text)",
       }}
     >
       <div className="mb-1 mr-1 shrink-0">
@@ -291,15 +291,15 @@ export function MessagesTabBar() {
             }}
             className="group relative flex h-9 max-w-[220px] shrink-0 cursor-pointer items-center gap-2 rounded-t-lg px-2.5 text-xs font-medium transition-colors"
             style={{
-              background: active ? "#1e293b" : "transparent",
-              color: active ? "#f8fafc" : "#94a3b8",
+              background: active ? "var(--nav-active-bg)" : "transparent",
+              color: active ? "#fff" : "var(--nav-muted)",
               borderTop: saleFlash != null
-                ? "2px solid #10b981"
+                ? "2px solid var(--success)"
                 : active
-                ? "2px solid #3b82f6"
+                ? "2px solid var(--brand-500)"
                 : "2px solid transparent",
-              borderLeft: active ? "1px solid #334155" : "1px solid transparent",
-              borderRight: active ? "1px solid #334155" : "1px solid transparent",
+              borderLeft: active ? "1px solid var(--nav-border)" : "1px solid transparent",
+              borderRight: active ? "1px solid var(--nav-border)" : "1px solid transparent",
             }}
           >
             <TabAvatar model={model} id={id} label={label} />
@@ -308,12 +308,12 @@ export function MessagesTabBar() {
             {saleFlash != null ? (
               <span
                 className="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-bold"
-                style={{ background: "#059669", color: "#ecfdf5" }}
+                style={{ background: "var(--success)", color: "#fff" }}
               >
                 +{formatMoney(saleFlash)}
               </span>
             ) : unread > 0 ? (
-              <span className="flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-600 px-1 text-[10px] font-bold text-white">
+              <span className="flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full px-1 text-[10px] font-bold text-white" style={{ background: "var(--brand-500)" }}>
                 {unread > 99 ? "99+" : unread}
               </span>
             ) : null}
@@ -326,7 +326,7 @@ export function MessagesTabBar() {
                 e.stopPropagation();
                 void closeMessageTab(id);
               }}
-              className="ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded text-slate-400 opacity-75 transition-colors hover:bg-slate-700 hover:text-white hover:opacity-100"
+              className="cf-chrome-icon ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded opacity-75"
             >
               <X size={12} strokeWidth={2.25} />
             </button>
@@ -336,8 +336,8 @@ export function MessagesTabBar() {
 
       {availableModels.length > 0 ? (
         pickerOpen ? (
-          <div className="mb-1 ml-1 flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-800/90 px-2 py-1">
-            <span className="text-[11px] font-medium text-slate-400">Abrir:</span>
+          <div className="mb-1 ml-1 flex shrink-0 items-center gap-1.5 rounded px-2 py-1" style={{ background: "var(--nav-active-bg)" }}>
+            <span className="text-[11px] font-medium" style={{ color: "var(--nav-muted)" }}>Abrir:</span>
             {availableModels.map((model) => {
               const label = modelLabel(model);
               return (
@@ -348,7 +348,7 @@ export function MessagesTabBar() {
                     setPickerOpen(false);
                     void openMessages(model.id);
                   }}
-                  className="flex shrink-0 items-center gap-1.5 rounded-md bg-slate-700/80 px-2 py-1 text-xs font-medium text-slate-100 transition-colors hover:bg-blue-600"
+                  className="cf-chrome-chip flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs font-medium"
                 >
                   <TabAvatar model={model} id={model.id} label={label} size={18} />
                   <span className="max-w-[110px] truncate">{label}</span>
@@ -360,7 +360,7 @@ export function MessagesTabBar() {
               aria-label="Cancelar"
               title="Cancelar"
               onClick={() => setPickerOpen(false)}
-              className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 hover:bg-slate-700 hover:text-white"
+              className="cf-chrome-icon flex h-5 w-5 shrink-0 items-center justify-center rounded"
             >
               <X size={12} strokeWidth={2.25} />
             </button>
@@ -371,7 +371,7 @@ export function MessagesTabBar() {
             aria-label="Añadir cuenta a las pestañas"
             title="Añadir otra modelo"
             onClick={() => setPickerOpen(true)}
-            className="mb-1 ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
+            className="cf-chrome-icon mb-1 ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded"
           >
             <Plus size={15} strokeWidth={2.25} />
           </button>
@@ -395,8 +395,8 @@ function HubChrome({
   onToggleInsights: () => void;
 }) {
   const item = (active: boolean) =>
-    `inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
-      active ? "bg-blue-600 text-white" : "bg-slate-800/90 text-slate-300 hover:bg-slate-700 hover:text-white"
+    `inline-flex h-7 w-7 items-center justify-center rounded transition-colors ${
+      active ? "cf-chrome-active" : "cf-chrome-chip"
     }`;
   return (
     <div
@@ -445,7 +445,7 @@ function TabAvatar({
   size = 20,
 }: {
   model: Model | undefined;
-  id: number;
+  id: string;
   label: string;
   size?: number;
 }) {

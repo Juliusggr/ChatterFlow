@@ -1,10 +1,12 @@
 use chrono::TimeZone;
-use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
-use crate::db::{Database, DbError, EarningDraft, EarningStats, TransactionType};
 use crate::notifications::{
     extract_user_ref, parse_numeric_id, BatchSource, CandidateEvent, NotificationBatch, SaleKind,
+};
+use crate::supabase::{
+    normalize_timestamp_rfc3339, DbError, EarningDraft, EarningStats, FanListItem, FanUpsertOwned,
+    SupabaseStore, TransactionType, ONLYFANS_NET_RATIO,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +17,8 @@ pub enum CaptureKind {
     Chat,
     Subscriber,
     LiveEvent,
+    Publication,
+    CreatorPosts,
 }
 
 #[derive(Debug)]
@@ -24,6 +28,8 @@ pub struct IngestOutcome {
     pub earnings: Option<EarningStats>,
     pub fan_id: Option<String>,
     pub notifications: NotificationBatch,
+    pub dropper_activity_changed: bool,
+    pub model_data_changed: bool,
 }
 
 pub fn classify_url(url: &str) -> Option<CaptureKind> {
@@ -70,16 +76,33 @@ pub fn classify_url(url: &str) -> Option<CaptureKind> {
     if path.starts_with("/api2/v2/subscriptions") {
         return Some(CaptureKind::Subscriber);
     }
+    if (path == "/api2/v2/posts" || path.starts_with("/api2/v2/posts/"))
+        && parsed.query().unwrap_or("").contains("_cf_publish=1")
+    {
+        return Some(CaptureKind::Publication);
+    }
+    if segments.len() == 5
+        && segments[0] == "api2"
+        && segments[1] == "v2"
+        && segments[2] == "users"
+        && segments[3].chars().all(|c| c.is_ascii_digit())
+        && segments[4] == "posts"
+    {
+        return Some(CaptureKind::CreatorPosts);
+    }
     let user_id = path.trim_start_matches("/api2/v2/users/");
-    if path.starts_with("/api2/v2/users/") && !user_id.is_empty() && user_id.chars().all(|c| c.is_ascii_digit()) {
+    if path.starts_with("/api2/v2/users/")
+        && !user_id.is_empty()
+        && user_id.chars().all(|c| c.is_ascii_digit())
+    {
         return Some(CaptureKind::Subscriber);
     }
     None
 }
 
-pub fn ingest_body(
-    database: &Database,
-    model_id: i64,
+pub async fn ingest_body(
+    store: &SupabaseStore,
+    model_id: &str,
     url: &str,
     status: u16,
     body: &str,
@@ -94,14 +117,49 @@ pub fn ingest_body(
             earnings: None,
             fan_id: None,
             notifications: NotificationBatch::empty(),
+            dropper_activity_changed: false,
+            model_data_changed: false,
+        }));
+    }
+    if kind == CaptureKind::Publication {
+        if !(200..300).contains(&status) {
+            return Ok(None);
+        }
+        let value: Value =
+            serde_json::from_str(body).map_err(|err| DbError::Invalid(err.to_string()))?;
+        let changed =
+            save_publication(store, model_id, &value, store.active_dropper_id()).await?;
+        return Ok(Some(IngestOutcome {
+            kind,
+            unauthorized: false,
+            earnings: None,
+            fan_id: None,
+            notifications: NotificationBatch::empty(),
+            dropper_activity_changed: changed,
+            model_data_changed: false,
         }));
     }
     if status != 200 {
         return Ok(None);
     }
+    if kind == CaptureKind::CreatorPosts {
+        let value: Value =
+            serde_json::from_str(body).map_err(|err| DbError::Invalid(err.to_string()))?;
+        let changed = save_creator_posts(store, model_id, url, &value).await?;
+        return Ok(Some(IngestOutcome {
+            kind,
+            unauthorized: false,
+            earnings: None,
+            fan_id: None,
+            notifications: NotificationBatch::empty(),
+            dropper_activity_changed: changed,
+            model_data_changed: false,
+        }));
+    }
     if kind == CaptureKind::LiveEvent {
-        let creator_of_id = database
+        let creator_of_id = store
             .get_model(model_id)
+            .await
             .ok()
             .and_then(|model| model.of_user_id);
         let candidates =
@@ -115,38 +173,67 @@ pub fn ingest_body(
                 source: BatchSource::WebSocket,
                 candidates,
             },
+            dropper_activity_changed: false,
+            model_data_changed: false,
         }));
     }
-    let value: Value = serde_json::from_str(body).map_err(|err| DbError::Invalid(err.to_string()))?;
+    let value: Value =
+        serde_json::from_str(body).map_err(|err| DbError::Invalid(err.to_string()))?;
     let outcome = match kind {
         CaptureKind::Profile => {
-            save_profile(database, model_id, &value)?;
+            let model_data_changed = save_profile(store, model_id, &value).await?;
             IngestOutcome {
                 kind,
                 unauthorized: false,
                 earnings: None,
                 fan_id: None,
                 notifications: NotificationBatch::empty(),
+                dropper_activity_changed: false,
+                model_data_changed,
             }
         }
         CaptureKind::Balances => {
-            save_balances(database, model_id, &value)?;
+            let model_data_changed = save_balances(store, model_id, &value).await?;
             IngestOutcome {
                 kind,
                 unauthorized: false,
                 earnings: None,
                 fan_id: None,
                 notifications: NotificationBatch::empty(),
+                dropper_activity_changed: false,
+                model_data_changed,
             }
         }
         CaptureKind::Transactions => {
-            let is_chart = chart_earnings(database, model_id, url, &value)?;
+            let is_chart = chart_earnings(store, model_id, url, &value).await?;
             let is_payout_tx = is_chart.is_none();
             let earnings = match is_chart {
                 Some(rows) => rows,
                 None => earnings_from_payload(&value),
             };
-            let (stats, newly_inserted) = database.upsert_earnings_with_new(model_id, &earnings)?;
+            let mut sub_arrivals = Vec::new();
+            if is_payout_tx {
+                for item in &earnings {
+                    if item.kind == TransactionType::Sub
+                        && !item.of_transaction_id.starts_with("chart:")
+                    {
+                        if let Some(fan_id) =
+                            item.fan_of_id.as_deref().filter(|id| !id.is_empty())
+                        {
+                            let arrived = normalize_timestamp_rfc3339(&item.created_at)
+                                .unwrap_or_else(|| item.created_at.clone());
+                            sub_arrivals.push((fan_id.to_owned(), arrived));
+                        }
+                    }
+                }
+            }
+            let (arrival_res, earnings_res) = tokio::join!(
+                store.record_fan_arrivals_batch(model_id, &sub_arrivals),
+                store.upsert_earnings_with_new(model_id, &earnings)
+            );
+            let sub_arrival_added = arrival_res.unwrap_or(false);
+            let (stats, newly_inserted) = earnings_res?;
+            let model_data_changed = stats.linked > 0;
             let notifications = if is_payout_tx {
                 let candidates = newly_inserted
                     .into_iter()
@@ -159,7 +246,9 @@ pub fn ingest_body(
                         };
                         let preview = match sale_kind {
                             SaleKind::Ppv => format!("PPV vendido (${:.2})", item.gross_amount),
-                            SaleKind::Tip => format!("Propina recibida (${:.2})", item.gross_amount),
+                            SaleKind::Tip => {
+                                format!("Propina recibida (${:.2})", item.gross_amount)
+                            }
                         };
                         Some(CandidateEvent::Sale {
                             sale_kind,
@@ -191,24 +280,36 @@ pub fn ingest_body(
                 earnings: Some(stats),
                 fan_id: None,
                 notifications,
+                dropper_activity_changed: sub_arrival_added,
+                model_data_changed,
             }
         }
         CaptureKind::Chat => {
             let is_backfill = url.contains("_cf_backfill=1");
             let fan_id = chat_fan_id(url);
             let mut fan_name = String::new();
+            let mut arrival_added = false;
             if let Some(user) = value.get("withUser") {
                 if let Some(obj) = user.as_object() {
                     fan_name = user_display_hint(obj);
                 }
-                apply_one_subscriber(database, model_id, user)?;
+                let (_, added) = apply_subscribers_batch(store, model_id, &[user]).await?;
+                arrival_added = added;
             }
             let notifications = if let Some(fan_id_str) = fan_id.as_deref() {
-                let mut candidates =
-                    store_chat_ppvs(database, model_id, fan_id_str, &fan_name, &value, is_backfill)?;
+                let mut candidates = store_chat_ppvs(
+                    store,
+                    model_id,
+                    fan_id_str,
+                    &fan_name,
+                    &value,
+                    is_backfill,
+                )
+                .await?;
                 if !is_backfill {
-                    let creator_of_id = database
+                    let creator_of_id = store
                         .get_model(model_id)
+                        .await
                         .ok()
                         .and_then(|model| model.of_user_id);
                     let (max_msg_id, thread_msgs) = extract_thread_messages(
@@ -234,13 +335,17 @@ pub fn ingest_body(
                 earnings: None,
                 fan_id,
                 notifications,
+                dropper_activity_changed: arrival_added,
+                model_data_changed: false,
             }
         }
         CaptureKind::Subscriber => {
-            let fan_id = apply_subscriber_payload(database, model_id, url, &value)?;
+            let (fan_id, arrival_added) =
+                apply_subscriber_payload(store, model_id, url, &value).await?;
             let notifications = if is_chats_inbox_url(url) {
-                let creator_of_id = database
+                let creator_of_id = store
                     .get_model(model_id)
+                    .await
                     .ok()
                     .and_then(|model| model.of_user_id);
                 let (max_msg_id, candidates) =
@@ -258,14 +363,18 @@ pub fn ingest_body(
                 earnings: None,
                 fan_id,
                 notifications,
+                dropper_activity_changed: arrival_added,
+                model_data_changed: false,
             }
         }
-        CaptureKind::LiveEvent => unreachable!(),
+        CaptureKind::Publication | CaptureKind::CreatorPosts | CaptureKind::LiveEvent => {
+            unreachable!()
+        }
     };
     Ok(Some(outcome))
 }
 
-fn save_profile(database: &Database, model_id: i64, value: &Value) -> Result<(), DbError> {
+async fn save_profile(store: &SupabaseStore, model_id: &str, value: &Value) -> Result<bool, DbError> {
     let Some(object) = value.as_object() else {
         return Err(DbError::Invalid(
             "el perfil de OnlyFans no es un objeto".to_owned(),
@@ -293,18 +402,30 @@ fn save_profile(database: &Database, model_id: i64, value: &Value) -> Result<(),
                 .and_then(Value::as_str)
                 .filter(|url| !url.is_empty())
         });
-    database.save_onlyfans_profile(model_id, &of_user_id, username, display_name, avatar_url)?;
-    Ok(())
+    let fans = object
+        .get("subscribersCount")
+        .or_else(|| object.get("fansCount"))
+        .and_then(number_value)
+        .map(|value| value.round() as i64)
+        .filter(|value| *value >= 0);
+    let (_, changed) = store
+        .save_onlyfans_profile(model_id, &of_user_id, username, display_name, avatar_url, fans)
+        .await?;
+    Ok(changed)
 }
 
-fn apply_subscriber_payload(
-    database: &Database,
-    model_id: i64,
+async fn apply_subscriber_payload(
+    store: &SupabaseStore,
+    model_id: &str,
     url: &str,
     value: &Value,
-) -> Result<Option<String>, DbError> {
-    if let Some(list) = value.get("list").and_then(Value::as_array) {
-        let mut last = None;
+) -> Result<(Option<String>, bool), DbError> {
+    if let Some(list) = value
+        .get("list")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    {
+        let mut items: Vec<&Value> = Vec::with_capacity(list.len());
         for item in list {
             let fan = item
                 .get("withUser")
@@ -321,53 +442,78 @@ fn apply_subscriber_payload(
                         None
                     }
                 });
-            let Some(fan) = fan else {
-                continue;
-            };
-            if let Some(fan_id) = apply_one_subscriber(database, model_id, fan)? {
-                last = Some(fan_id);
+            if let Some(fan) = fan {
+                items.push(fan);
             }
         }
-        return Ok(last);
+        return apply_subscribers_batch(store, model_id, &items).await;
     }
     if value.get("id").is_some() {
-        return apply_one_subscriber(database, model_id, value);
+        return apply_subscribers_batch(store, model_id, &[value]).await;
     }
     if let Some(object) = value.as_object() {
-        let mut last = None;
-        for item in object.values() {
-            if item.get("id").is_none() {
-                continue;
+        let items: Vec<&Value> = object
+            .values()
+            .filter(|item| item.get("id").is_some())
+            .collect();
+        if !items.is_empty() {
+            let (last, added) = apply_subscribers_batch(store, model_id, &items).await?;
+            if last.is_some() {
+                return Ok((last, added));
             }
-            if let Some(fan_id) = apply_one_subscriber(database, model_id, item)? {
-                last = Some(fan_id);
-            }
-        }
-        if last.is_some() {
-            return Ok(last);
         }
     }
-    Ok(user_id_from_path(url))
+    Ok((user_id_from_path(url), false))
 }
 
-fn apply_one_subscriber(
-    database: &Database,
-    model_id: i64,
-    value: &Value,
-) -> Result<Option<String>, DbError> {
-    let Some(object) = value.as_object() else {
-        return Ok(None);
-    };
-    let Some(of_fan_id) = object.get("id").and_then(value_id) else {
-        return Ok(None);
-    };
-    let username = object.get("username").and_then(Value::as_str).unwrap_or("");
+async fn apply_subscribers_batch(
+    store: &SupabaseStore,
+    model_id: &str,
+    values: &[&Value],
+) -> Result<(Option<String>, bool), DbError> {
+    let mut fans = Vec::with_capacity(values.len());
+    let mut arrivals = Vec::new();
+    let mut last_id = None;
+
+    for value in values {
+        let Some((fan, arrived)) = extract_subscriber_upsert(value) else {
+            continue;
+        };
+        if let Some(arrived_at) = arrived {
+            arrivals.push((fan.of_fan_id.clone(), arrived_at));
+        }
+        last_id = Some(fan.of_fan_id.clone());
+        fans.push(fan);
+    }
+
+    if fans.is_empty() {
+        return Ok((None, false));
+    }
+
+    let (arrival_res, fan_res) = tokio::join!(
+        store.record_fan_arrivals_batch(model_id, &arrivals),
+        store.upsert_fans_batch(model_id, &fans)
+    );
+    let _ = fan_res;
+    Ok((last_id, arrival_res.unwrap_or(false)))
+}
+
+fn extract_subscriber_upsert(value: &Value) -> Option<(FanUpsertOwned, Option<String>)> {
+    let object = value.as_object()?;
+    let of_fan_id = object.get("id").and_then(value_id)?;
+    let username = object
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     let data = subscription_blob(object);
     let status = subscription_status(object, data);
     let cost = object
         .get("currentSubscribePrice")
         .and_then(number_value)
-        .or_else(|| data.and_then(|item| first_number(item, &["subscribePrice", "price", "regularPrice"])));
+        .or_else(|| {
+            data.and_then(|item| first_number(item, &["subscribePrice", "price", "regularPrice"]))
+        });
     let started = data.and_then(|item| {
         item.get("duration")
             .or_else(|| item.get("subscribedOnDuration"))
@@ -389,7 +535,10 @@ fn apply_one_subscriber(
         let end = object
             .get("subscribedByExpireDate")
             .and_then(Value::as_str)
-            .or_else(|| data.and_then(|item| item.get("expireDate")).and_then(Value::as_str));
+            .or_else(|| {
+                data.and_then(|item| item.get("expireDate"))
+                    .and_then(Value::as_str)
+            });
         match (start, end) {
             (Some(start), Some(end)) => Some(format!("{start} – {end}")),
             _ => None,
@@ -401,7 +550,10 @@ fn apply_one_subscriber(
         .get("subscribedByAutoprolong")
         .and_then(bool_value)
         .or_else(|| data.and_then(|item| item.get("renew")).and_then(bool_value))
-        .or_else(|| data.and_then(|item| item.get("autoRenew")).and_then(bool_value))
+        .or_else(|| {
+            data.and_then(|item| item.get("autoRenew"))
+                .and_then(bool_value)
+        })
         .or_else(|| {
             data.and_then(|item| item.get("subscribedByAutoprolong"))
                 .and_then(bool_value)
@@ -410,35 +562,42 @@ fn apply_one_subscriber(
     if let Some(states) = object.get("listsStates").and_then(Value::as_array) {
         for state in states {
             let checked = state.get("hasUser").and_then(Value::as_bool) == Some(true);
-            if let Some(name) = state.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) {
-                lists.push(crate::fans::FanListItem {
+            if let Some(name) = state
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                lists.push(FanListItem {
                     name: name.to_owned(),
                     checked,
                 });
             }
         }
     }
-    crate::fans::apply_fan_subscription(
-        database,
-        model_id,
-        &of_fan_id,
-        username,
-        status.as_deref(),
-        cost,
-        duration.as_deref(),
-        auto_renewal,
-        total_spend,
-        lists,
-        official.messages,
-        official.tips,
-        official.present,
-    )?;
-    Ok(Some(of_fan_id))
+    let arrived = fan_arrived_at(object);
+    Some((
+        FanUpsertOwned {
+            of_fan_id,
+            username,
+            sub_status: status,
+            sub_cost: cost,
+            sub_duration: duration,
+            auto_renewal,
+            total_spend,
+            lists,
+            messages_summ: official.messages,
+            tips_summ: official.tips,
+            official_spend: official.present,
+            last_spend_at: None,
+            highest_spend: None,
+        },
+        arrived,
+    ))
 }
 
-fn store_chat_ppvs(
-    database: &Database,
-    model_id: i64,
+async fn store_chat_ppvs(
+    store: &SupabaseStore,
+    model_id: &str,
     fan_id: &str,
     fan_name: &str,
     value: &Value,
@@ -447,122 +606,146 @@ fn store_chat_ppvs(
     let Some(list) = value.get("list").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
-    database.with_connection(|conn| {
-        let mut events = Vec::new();
-        for item in list {
-            let Some(object) = item.as_object() else {
-                continue;
-            };
-            if let Some(amount) = chat_tip_amount(object) {
-                let Some(of_message_id) = object.get("id").and_then(value_id) else {
-                    continue;
-                };
-                let created_at = message_created_at(object);
-                let existing_tip: Option<i64> = conn
-                    .query_row(
-                        "SELECT id FROM chat_tips WHERE model_id = ?1 AND of_message_id = ?2",
-                        params![model_id, of_message_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if existing_tip.is_none() {
-                    conn.execute(
-                        "INSERT INTO chat_tips (model_id, of_fan_id, of_message_id, amount, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![model_id, fan_id, of_message_id, amount, created_at],
-                    )?;
-                    if !is_backfill {
-                        let text = object
-                            .get("text")
-                            .or_else(|| object.get("tipText"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let sender_hint = object
-                            .get("fromUser")
-                            .and_then(Value::as_object)
-                            .map(user_display_hint)
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| fan_name.to_owned());
-                        events.push(CandidateEvent::Sale {
-                            sale_kind: SaleKind::Tip,
-                            of_event_id: of_message_id,
-                            of_fan_id: fan_id.to_owned(),
-                            fan_name: sender_hint,
-                            gross_amount: amount,
-                            net_amount: net_from_gross(amount),
-                            preview: text.to_owned(),
-                            created_at: created_at.to_owned(),
-                            live_transition: false,
-                        });
-                    }
-                }
-                continue;
-            }
-            let Some(price) = object.get("price").and_then(number_value) else {
-                continue;
-            };
-            if !price.is_finite() || price <= 0.0 {
-                continue;
-            }
+
+    struct PendingTip {
+        msg_id: String,
+        amount: f64,
+        created_at: String,
+        text: String,
+        sender_hint: String,
+    }
+    struct PendingPpv {
+        msg_id: String,
+        price: f64,
+        purchased: bool,
+        created_at: String,
+    }
+
+    let mut pending_tips = Vec::new();
+    let mut tip_db_rows = Vec::new();
+    let mut pending_ppvs = Vec::new();
+    let mut ppv_db_rows = Vec::new();
+
+    for item in list {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if let Some(amount) = chat_tip_amount(object) {
             let Some(of_message_id) = object.get("id").and_then(value_id) else {
                 continue;
             };
-            let purchased = object.get("isOpened").and_then(bool_value) == Some(true);
-            let created_at = message_created_at(object);
-            let existing: Option<(i64, i64)> = conn
-                .query_row(
-                    "SELECT id, purchased FROM ppv_timeline WHERE model_id = ?1 AND of_message_id = ?2",
-                    params![model_id, of_message_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((id, prev_purchased)) = existing {
-                conn.execute(
-                    "UPDATE ppv_timeline
-                     SET price = ?1,
-                         purchased = CASE WHEN purchased = 1 OR ?2 = 1 THEN 1 ELSE 0 END,
-                         created_at = ?3,
-                         of_fan_id = ?4
-                     WHERE id = ?5",
-                    params![price, i64::from(purchased), created_at, fan_id, id],
-                )?;
-                if prev_purchased == 0 && purchased && !is_backfill {
+            let created_at = message_created_at(object).to_owned();
+            let text = object
+                .get("text")
+                .or_else(|| object.get("tipText"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let sender_hint = object
+                .get("fromUser")
+                .and_then(Value::as_object)
+                .map(user_display_hint)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| fan_name.to_owned());
+            tip_db_rows.push((
+                fan_id.to_owned(),
+                of_message_id.clone(),
+                amount,
+                created_at.clone(),
+            ));
+            pending_tips.push(PendingTip {
+                msg_id: of_message_id,
+                amount,
+                created_at,
+                text,
+                sender_hint,
+            });
+            continue;
+        }
+        let Some(price) = object.get("price").and_then(number_value) else {
+            continue;
+        };
+        if !price.is_finite() || price <= 0.0 {
+            continue;
+        }
+        let Some(of_message_id) = object.get("id").and_then(value_id) else {
+            continue;
+        };
+        let purchased = object.get("isOpened").and_then(bool_value) == Some(true);
+        let created_at = message_created_at(object).to_owned();
+        ppv_db_rows.push((
+            fan_id.to_owned(),
+            of_message_id.clone(),
+            price,
+            purchased,
+            created_at.clone(),
+        ));
+        pending_ppvs.push(PendingPpv {
+            msg_id: of_message_id,
+            price,
+            purchased,
+            created_at,
+        });
+    }
+
+    let (inserted_tips_res, ppv_res) = tokio::join!(
+        store.insert_chat_tips_batch(model_id, &tip_db_rows),
+        store.upsert_ppv_timeline_batch(model_id, &ppv_db_rows)
+    );
+    let inserted_tips = inserted_tips_res.unwrap_or_default();
+    let ppv_states = ppv_res.unwrap_or_default();
+
+    let mut events = Vec::new();
+    if !is_backfill {
+        for tip in pending_tips {
+            if inserted_tips.contains(&tip.msg_id) {
+                events.push(CandidateEvent::Sale {
+                    sale_kind: SaleKind::Tip,
+                    of_event_id: tip.msg_id,
+                    of_fan_id: fan_id.to_owned(),
+                    fan_name: tip.sender_hint,
+                    gross_amount: tip.amount,
+                    net_amount: net_from_gross(tip.amount),
+                    preview: tip.text,
+                    created_at: tip.created_at,
+                    live_transition: false,
+                });
+            }
+        }
+        for ppv in pending_ppvs {
+            let Some(res) = ppv_states.get(&ppv.msg_id) else {
+                continue;
+            };
+            if res.existed {
+                if !res.prev_purchased && ppv.purchased {
                     events.push(CandidateEvent::Sale {
                         sale_kind: SaleKind::Ppv,
-                        of_event_id: of_message_id,
+                        of_event_id: ppv.msg_id,
                         of_fan_id: fan_id.to_owned(),
                         fan_name: fan_name.to_owned(),
-                        gross_amount: price,
-                        net_amount: net_from_gross(price),
-                        preview: format!("PPV desbloqueado (${price:.2})"),
-                        created_at: created_at.to_owned(),
+                        gross_amount: ppv.price,
+                        net_amount: net_from_gross(ppv.price),
+                        preview: format!("PPV desbloqueado (${:.2})", ppv.price),
+                        created_at: ppv.created_at,
                         live_transition: true,
                     });
                 }
-            } else {
-                conn.execute(
-                    "INSERT INTO ppv_timeline (
-                        model_id, of_fan_id, message_id, price, purchased, created_at, of_message_id
-                     ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
-                    params![model_id, fan_id, price, i64::from(purchased), created_at, of_message_id],
-                )?;
-                if purchased && !is_backfill {
-                    events.push(CandidateEvent::Sale {
-                        sale_kind: SaleKind::Ppv,
-                        of_event_id: of_message_id,
-                        of_fan_id: fan_id.to_owned(),
-                        fan_name: fan_name.to_owned(),
-                        gross_amount: price,
-                        net_amount: net_from_gross(price),
-                        preview: format!("PPV comprado (${price:.2})"),
-                        created_at: created_at.to_owned(),
-                        live_transition: false,
-                    });
-                }
+            } else if ppv.purchased {
+                events.push(CandidateEvent::Sale {
+                    sale_kind: SaleKind::Ppv,
+                    of_event_id: ppv.msg_id,
+                    of_fan_id: fan_id.to_owned(),
+                    fan_name: fan_name.to_owned(),
+                    gross_amount: ppv.price,
+                    net_amount: net_from_gross(ppv.price),
+                    preview: format!("PPV comprado (${:.2})", ppv.price),
+                    created_at: ppv.created_at,
+                    live_transition: false,
+                });
             }
         }
-        Ok(events)
-    })
+    }
+    Ok(events)
 }
 
 fn is_chats_inbox_url(url: &str) -> bool {
@@ -766,9 +949,13 @@ fn money_in_text(text: &str) -> Option<f64> {
             let rest = text[index + 1..].trim_start();
             let cleaned: String = rest
                 .chars()
-                .take_while(|character| character.is_ascii_digit() || *character == ',' || *character == '.')
+                .take_while(|character| {
+                    character.is_ascii_digit() || *character == ',' || *character == '.'
+                })
                 .collect();
-            let parsed = cleaned.trim_matches(|character| character == ',' || character == '.').replace(',', "");
+            let parsed = cleaned
+                .trim_matches(|character| character == ',' || character == '.')
+                .replace(',', "");
             if let Ok(amount) = parsed.parse::<f64>() {
                 if amount.is_finite() && amount > 0.0 {
                     return Some(amount);
@@ -811,7 +998,7 @@ fn user_id_from_path(url: &str) -> Option<String> {
     }
 }
 
-fn save_balances(database: &Database, model_id: i64, value: &Value) -> Result<(), DbError> {
+async fn save_balances(store: &SupabaseStore, model_id: &str, value: &Value) -> Result<bool, DbError> {
     let Some(object) = value.as_object() else {
         return Err(DbError::Invalid(
             "los balances de OnlyFans no son un objeto".to_owned(),
@@ -819,7 +1006,171 @@ fn save_balances(database: &Database, model_id: i64, value: &Value) -> Result<()
     };
     let current = first_number(object, &["current", "payoutAvailable", "available"]);
     let pending = first_number(object, &["pending", "payoutPending"]);
-    database.save_onlyfans_balances(model_id, current, pending)
+    store.save_onlyfans_balances(model_id, current, pending).await
+}
+
+fn timestamp_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() || trimmed.starts_with("1970-01-01") {
+                return None;
+            }
+            normalize_timestamp_rfc3339(trimmed)
+        }
+        Value::Number(number) => {
+            let raw = number.to_string();
+            normalize_timestamp_rfc3339(&raw)
+        }
+        _ => None,
+    }
+}
+
+fn fan_arrived_at(object: &serde_json::Map<String, Value>) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "subscribeAt",
+        "subscribedAt",
+        "subscribeDate",
+        "startDate",
+        "subscribedOnDate",
+    ];
+    let stamp = |source: &serde_json::Map<String, Value>| {
+        KEYS.iter()
+            .find_map(|key| source.get(*key).and_then(timestamp_from_value))
+    };
+    for blob_key in ["subscribedByData", "subscribedOnData", "subscribedOn"] {
+        if let Some(blob) = object.get(blob_key).and_then(Value::as_object) {
+            if let Some(found) = stamp(blob) {
+                return Some(found);
+            }
+            if let Some(subs) = blob.get("subscribes").and_then(Value::as_array) {
+                for entry in subs {
+                    if let Some(entry_obj) = entry.as_object() {
+                        if let Some(found) = stamp(entry_obj)
+                            .or_else(|| entry_obj.get("createdAt").and_then(timestamp_from_value))
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    stamp(object)
+}
+
+fn publication_objects(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    if let Some(list) = value
+        .get("list")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    {
+        return list
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|item| looks_like_publication(item))
+            .collect();
+    }
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    if looks_like_publication(object) {
+        return vec![object];
+    }
+    for nested_key in ["post", "data"] {
+        if let Some(inner) = object.get(nested_key).and_then(Value::as_object) {
+            if looks_like_publication(inner) {
+                return vec![inner];
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn looks_like_publication(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("id").is_some()
+        && (object.get("postedAt").is_some()
+            || object.get("postedAtPrecise").is_some()
+            || object.get("createdAt").is_some()
+            || object.get("postedDate").is_some()
+            || object.get("rawText").is_some()
+            || object.get("text").is_some()
+            || object.get("isPublished").is_some()
+            || object.get("author").is_some()
+            || object.get("responseType").and_then(Value::as_str) == Some("post"))
+}
+
+fn publication_created_at(object: &serde_json::Map<String, Value>) -> String {
+    ["postedAt", "createdAt", "postedDate", "postedAtPrecise"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(timestamp_from_value))
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339())
+}
+
+async fn save_publication(
+    store: &SupabaseStore,
+    model_id: &str,
+    value: &Value,
+    author: Option<String>,
+) -> Result<bool, DbError> {
+    let objects = publication_objects(value);
+    let mut items = Vec::with_capacity(objects.len());
+    for object in objects {
+        let Some(of_post_id) = object.get("id").and_then(value_id) else {
+            continue;
+        };
+        items.push((of_post_id, publication_created_at(object)));
+    }
+    store
+        .record_publications_batch(model_id, &items, author.as_deref())
+        .await
+}
+
+async fn save_creator_posts(
+    store: &SupabaseStore,
+    model_id: &str,
+    url: &str,
+    value: &Value,
+) -> Result<bool, DbError> {
+    let Some(expected_creator) = store
+        .get_model(model_id)
+        .await
+        .ok()
+        .and_then(|model| model.of_user_id)
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let path_user_id = tauri::Url::parse(url).ok().and_then(|parsed| {
+        let parts: Vec<&str> = parsed.path().split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() == 5 && parts[2] == "users" && parts[4] == "posts" {
+            Some(parts[3].to_owned())
+        } else {
+            None
+        }
+    });
+    if path_user_id.as_deref() != Some(expected_creator.as_str()) {
+        return Ok(false);
+    }
+    let objects = publication_objects(value);
+    let mut items = Vec::with_capacity(objects.len());
+    for object in objects {
+        if let Some(post_author_id) = object
+            .get("author")
+            .and_then(Value::as_object)
+            .and_then(|author| author.get("id"))
+            .and_then(value_id)
+        {
+            if post_author_id != expected_creator {
+                continue;
+            }
+        }
+        let Some(of_post_id) = object.get("id").and_then(value_id) else {
+            continue;
+        };
+        items.push((of_post_id, publication_created_at(object)));
+    }
+    store.record_publications_batch(model_id, &items, None).await
 }
 
 fn subscription_blob<'a>(
@@ -837,13 +1188,22 @@ fn subscription_status(
     object: &serde_json::Map<String, Value>,
     data: Option<&serde_json::Map<String, Value>>,
 ) -> Option<String> {
-    let expired = object.get("subscribedOnExpiredNow").and_then(Value::as_bool) == Some(true)
-        || object.get("subscribedIsExpiredNow").and_then(Value::as_bool) == Some(true)
+    let expired = object
+        .get("subscribedOnExpiredNow")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || object
+            .get("subscribedIsExpiredNow")
+            .and_then(Value::as_bool)
+            == Some(true)
         || object.get("subscribedByExpire").and_then(Value::as_bool) == Some(true);
     if expired {
         return Some("Expired".to_owned());
     }
-    if let Some(status) = data.and_then(|item| item.get("status")).and_then(Value::as_str) {
+    if let Some(status) = data
+        .and_then(|item| item.get("status"))
+        .and_then(Value::as_str)
+    {
         let lower = status.to_ascii_lowercase();
         if lower.contains("expir") {
             return Some("Expired".to_owned());
@@ -919,7 +1279,13 @@ fn official_spend(data: Option<&serde_json::Map<String, Value>>) -> OfficialSpen
             return None;
         }
         let mut sum = 0.0;
-        for key in ["tipsSumm", "messagesSumm", "subscribesSumm", "postsSumm", "streamsSumm"] {
+        for key in [
+            "tipsSumm",
+            "messagesSumm",
+            "subscribesSumm",
+            "postsSumm",
+            "streamsSumm",
+        ] {
             if let Some(amount) = data.get(key).and_then(number_value) {
                 sum += amount;
             }
@@ -957,7 +1323,13 @@ fn fan_spend(
     if direct.is_some() {
         return direct;
     }
-    let parts = ["tipsSumm", "messagesSumm", "subscribesSumm", "postsSumm", "streamsSumm"];
+    let parts = [
+        "tipsSumm",
+        "messagesSumm",
+        "subscribesSumm",
+        "postsSumm",
+        "streamsSumm",
+    ];
     let source = data.unwrap_or(object);
     let mut any = false;
     let mut total = 0.0;
@@ -988,19 +1360,24 @@ fn duration_since(value: &str) -> Option<String> {
     }
 }
 
-fn chart_earnings(
-    database: &Database,
-    model_id: i64,
+async fn chart_earnings(
+    store: &SupabaseStore,
+    model_id: &str,
     url: &str,
     value: &Value,
 ) -> Result<Option<Vec<EarningDraft>>, DbError> {
     let Some(object) = value.as_object() else {
         return Ok(None);
     };
-    if object.get("list").and_then(Value::as_array).is_some() && !earnings_from_payload(value).is_empty() {
+    if object.get("list").and_then(Value::as_array).is_some()
+        && !earnings_from_payload(value).is_empty()
+    {
         return Ok(None);
     }
-    let body = object.get("data").and_then(Value::as_object).unwrap_or(object);
+    let body = object
+        .get("data")
+        .and_then(Value::as_object)
+        .unwrap_or(object);
     const SERIES: &[(&str, &str)] = &[
         ("subscribes", "sub"),
         ("subscriptions", "sub"),
@@ -1026,7 +1403,9 @@ fn chart_earnings(
             if let Some(amount) = series.as_f64() {
                 if amount > 0.0 {
                     let synthetic = serde_json::json!({ "total": amount });
-                    drafts.extend(store_chart_series(database, model_id, url, kind, &synthetic)?);
+                    drafts.extend(
+                        store_chart_series(store, model_id, url, kind, &synthetic).await?,
+                    );
                 }
                 seen.insert(*kind);
                 continue;
@@ -1041,7 +1420,9 @@ fn chart_earnings(
         let by = query_value(url, "by").unwrap_or_else(|| "total".to_owned());
         let kind = match by.as_str() {
             "subscribes" => "sub",
-            "tips" | "tips_chat" | "tips_profile" | "tips_post" | "tips_stream" | "tips_story" => "tip",
+            "tips" | "tips_chat" | "tips_profile" | "tips_post" | "tips_stream" | "tips_story" => {
+                "tip"
+            }
             "messages" | "chat_messages" => "message",
             "post" | "posts" => "post",
             "stream" | "streams" => "stream",
@@ -1056,14 +1437,14 @@ fn chart_earnings(
         chosen.push((kind, series));
     }
     for (kind, series) in chosen {
-        drafts.extend(store_chart_series(database, model_id, url, kind, series)?);
+        drafts.extend(store_chart_series(store, model_id, url, kind, series).await?);
     }
     Ok(Some(drafts))
 }
 
-fn store_chart_series(
-    database: &Database,
-    model_id: i64,
+async fn store_chart_series(
+    store: &SupabaseStore,
+    model_id: &str,
     url: &str,
     kind: &str,
     series: &Value,
@@ -1081,7 +1462,9 @@ fn store_chart_series(
     if let Some(points) = points {
         for point in points {
             let Some(point) = point.as_object() else { continue };
-            let Some(date) = point.get("date").and_then(Value::as_str) else { continue };
+            let Some(date) = point.get("date").and_then(Value::as_str) else {
+                continue;
+            };
             let amount = first_number(point, &["count", "amount", "sum"]).unwrap_or(0.0);
             if let Some(stamp) = bucket_noon(date) {
                 dated.push((date_key(date), stamp, amount));
@@ -1089,9 +1472,12 @@ fn store_chart_series(
         }
     }
     if dated.is_empty() {
-        let amount = net_total.filter(|value| *value > 0.0).or_else(|| gross_total.filter(|value| *value > 0.0));
+        let amount = net_total
+            .filter(|value| *value > 0.0)
+            .or_else(|| gross_total.filter(|value| *value > 0.0));
         if let Some(amount) = amount {
-            let date = query_value(url, "endDate").unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+            let date = query_value(url, "endDate")
+                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
             if let Some(stamp) = bucket_noon(&date) {
                 dated.push((date_key(&date), stamp, amount));
             }
@@ -1119,7 +1505,9 @@ fn store_chart_series(
         });
     }
     if let Some((start, end)) = span_unix(&stamps) {
-        database.delete_chart_span(model_id, kind, start, end.saturating_add(1))?;
+        store
+            .delete_chart_span(model_id, kind, start, end.saturating_add(1))
+            .await?;
     }
     Ok(rows)
 }
@@ -1157,21 +1545,20 @@ fn chart_factors(sum: f64, net_total: Option<f64>, gross_total: Option<f64>) -> 
     }
     let net = net_total
         .filter(|value| *value > 0.0)
-        .or_else(|| gross_total.map(|gross| gross * crate::db::ONLYFANS_NET_RATIO));
+        .or_else(|| gross_total.map(|gross| gross * ONLYFANS_NET_RATIO));
     match net {
-        Some(net) if close(sum, net) => (1.0, 1.0 / crate::db::ONLYFANS_NET_RATIO),
-        Some(net) if net_total.is_none() => (
-            (net / sum).min(1.0),
-            1.0,
-        ),
-        Some(net) => (net / sum, (net / crate::db::ONLYFANS_NET_RATIO) / sum),
-        None => (1.0, 1.0 / crate::db::ONLYFANS_NET_RATIO),
+        Some(net) if close(sum, net) => (1.0, 1.0 / ONLYFANS_NET_RATIO),
+        Some(net) if net_total.is_none() => ((net / sum).min(1.0), 1.0),
+        Some(net) => (net / sum, (net / ONLYFANS_NET_RATIO) / sum),
+        None => (1.0, 1.0 / ONLYFANS_NET_RATIO),
     }
 }
 
 fn span_unix(stamps: &[String]) -> Option<(i64, i64)> {
     let mut values = stamps.iter().filter_map(|stamp| {
-        chrono::DateTime::parse_from_rfc3339(stamp).ok().map(|date| date.timestamp())
+        chrono::DateTime::parse_from_rfc3339(stamp)
+            .ok()
+            .map(|date| date.timestamp())
     });
     let first = values.next()?;
     let mut min = first;
@@ -1188,7 +1575,10 @@ fn date_key(value: &str) -> String {
     if text.len() >= 10 && text.as_bytes()[4] == b'-' {
         text.chars().take(10).collect()
     } else {
-        text.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect()
+        text.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(16)
+            .collect()
     }
 }
 
@@ -1201,7 +1591,7 @@ fn bucket_noon(value: &str) -> Option<String> {
         chrono::LocalResult::Ambiguous(earliest, _) => earliest,
         chrono::LocalResult::None => return None,
     };
-    Some(local.to_rfc3339())
+    Some(local.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
 fn query_value(url: &str, key: &str) -> Option<String> {
@@ -1222,9 +1612,9 @@ pub struct ObservedProfile {
     pub highest_spend: Option<f64>,
 }
 
-pub fn ingest_observation(
-    database: &Database,
-    model_id: i64,
+pub async fn ingest_observation(
+    store: &SupabaseStore,
+    model_id: &str,
     fan_id: &str,
     profile: Option<&ObservedProfile>,
 ) -> Result<(), DbError> {
@@ -1234,23 +1624,26 @@ pub fn ingest_observation(
     }
     if let Some(profile) = profile {
         let official = profile.total_spend.is_some();
-        crate::fans::apply_fan_subscription_with_spend_meta(
-            database,
-            model_id,
-            &fan_id,
-            "",
-            profile.status.as_deref(),
-            profile.cost,
-            profile.duration.as_deref(),
-            None,
-            profile.total_spend,
-            Vec::new(),
-            None,
-            None,
-            official,
-            profile.last_spend_at.as_deref(),
-            profile.highest_spend,
-        )?;
+        store
+            .upsert_fans_batch(
+                model_id,
+                &[FanUpsertOwned {
+                    of_fan_id: fan_id,
+                    username: String::new(),
+                    sub_status: profile.status.clone(),
+                    sub_cost: profile.cost,
+                    sub_duration: profile.duration.clone(),
+                    auto_renewal: None,
+                    total_spend: profile.total_spend,
+                    lists: Vec::new(),
+                    messages_summ: None,
+                    tips_summ: None,
+                    official_spend: official,
+                    last_spend_at: profile.last_spend_at.clone(),
+                    highest_spend: profile.highest_spend,
+                }],
+            )
+            .await?;
     }
     Ok(())
 }
@@ -1292,16 +1685,22 @@ fn earning_from_item(value: &Value) -> Option<EarningDraft> {
     let amount = object
         .get("amount")
         .and_then(number_value)
-        .or_else(|| amounts_object.and_then(|item| item.get("gross")).and_then(number_value))
+        .or_else(|| {
+            amounts_object
+                .and_then(|item| item.get("gross"))
+                .and_then(number_value)
+        })
         .or_else(|| object.get("gross").and_then(number_value));
-    let net = object
-        .get("net")
-        .and_then(number_value)
-        .or_else(|| amounts_object.and_then(|item| item.get("net")).and_then(number_value));
-    let fee = object
-        .get("fee")
-        .and_then(number_value)
-        .or_else(|| amounts_object.and_then(|item| item.get("fee")).and_then(number_value));
+    let net = object.get("net").and_then(number_value).or_else(|| {
+        amounts_object
+            .and_then(|item| item.get("net"))
+            .and_then(number_value)
+    });
+    let fee = object.get("fee").and_then(number_value).or_else(|| {
+        amounts_object
+            .and_then(|item| item.get("fee"))
+            .and_then(number_value)
+    });
     let (gross_amount, net_amount) = amounts(amount, net, fee)?;
     let user = object.get("user").and_then(Value::as_object);
     let fan_of_id = user.and_then(|user| user.get("id")).and_then(value_id);
@@ -1322,11 +1721,11 @@ fn earning_from_item(value: &Value) -> Option<EarningDraft> {
 }
 
 fn net_from_gross(gross: f64) -> f64 {
-    (gross * crate::db::ONLYFANS_NET_RATIO * 100.0).round() / 100.0
+    (gross * ONLYFANS_NET_RATIO * 100.0).round() / 100.0
 }
 
 fn gross_from_net(net: f64) -> f64 {
-    (net / crate::db::ONLYFANS_NET_RATIO * 100.0).round() / 100.0
+    (net / ONLYFANS_NET_RATIO * 100.0).round() / 100.0
 }
 
 fn amounts(amount: Option<f64>, net: Option<f64>, fee: Option<f64>) -> Option<(f64, f64)> {
@@ -1351,7 +1750,11 @@ fn kind_from_text(value: &str) -> Option<TransactionType> {
     let value = value.to_ascii_lowercase();
     if value.contains("tip") || value.contains("propina") {
         Some(TransactionType::Tip)
-    } else if value.contains("message") || value.contains("chat") || value.contains("mensaje") || value.contains("ppv") {
+    } else if value.contains("message")
+        || value.contains("chat")
+        || value.contains("mensaje")
+        || value.contains("ppv")
+    {
         Some(TransactionType::Message)
     } else if value.contains("subscri") || value.contains("suscrip") {
         Some(TransactionType::Sub)
@@ -1393,460 +1796,64 @@ fn value_id(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, EmployeeRole, TransactionType};
-    use chrono::{Duration, Local, Utc};
     use serde_json::json;
 
-    struct StoredFan {
-        total_spend: f64,
-        ppv_total: f64,
-        tip_total: f64,
-        sub_status: Option<String>,
-        sub_cost: Option<f64>,
-        sub_duration: Option<String>,
-        auto_renewal: Option<i64>,
-        official_spend: i64,
-        lists_json: String,
+    #[test]
+    fn classifies_publications_creator_posts_and_subscribers() {
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/posts?_cf_publish=1"),
+            Some(CaptureKind::Publication)
+        );
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/users/88/posts?limit=10"),
+            Some(CaptureKind::CreatorPosts)
+        );
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/subscriptions/subscribers?limit=20"),
+            Some(CaptureKind::Subscriber)
+        );
     }
 
-    fn stored_fan(database: &Database, of_fan_id: &str) -> StoredFan {
-        database
-            .with_connection(|conn| {
-                conn.query_row(
-                    "SELECT total_spend, ppv_total, tip_total, sub_status, sub_cost, sub_duration,
-                            auto_renewal, official_spend, COALESCE(lists_json, '')
-                     FROM fans WHERE of_fan_id = ?1",
-                    [of_fan_id],
-                    |row| {
-                        Ok(StoredFan {
-                            total_spend: row.get(0)?,
-                            ppv_total: row.get(1)?,
-                            tip_total: row.get(2)?,
-                            sub_status: row.get(3)?,
-                            sub_cost: row.get(4)?,
-                            sub_duration: row.get(5)?,
-                            auto_renewal: row.get(6)?,
-                            official_spend: row.get(7)?,
-                            lists_json: row.get(8)?,
-                        })
-                    },
-                )
-            })
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn repeated_sync_does_not_inflate_the_open_shift() {
-        let dir = std::env::temp_dir().join(format!(
-            "creatorfloww-sync-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        database
-            .save_onlyfans_profile(model.id, "88", "creator", "Creator", Some("https://cdn.example/a.jpg"))
-            .unwrap();
-        let employee = database
-            .add_employee("Ana", EmployeeRole::Chatter, &json!({}))
-            .unwrap();
-        database.toggle_clock_in(employee.id).unwrap();
-        let created_at = (Utc::now() + Duration::seconds(30)).to_rfc3339();
-        let body = json!({
-            "list": [{
-                "id": 501,
-                "amount": 10.0,
-                "net": 8.0,
-                "createdAt": created_at,
-                "description": "Payment for message from fan",
-                "user": { "id": 77, "username": "fan" }
-            }, {
-                "id": "sub-1",
-                "amount": 5.0,
-                "net": 4.0,
-                "createdAt": created_at,
-                "description": "Subscription from fan"
-            }]
+    #[test]
+    fn normalizes_publication_posted_at_and_posted_at_precise() {
+        let with_both = json!({
+            "id": 99001,
+            "postedAt": "2026-11-26T06:36:52+00:00",
+            "postedAtPrecise": "1795588612.000000",
+            "text": "post de prueba"
         });
-        let url = "https://onlyfans.com/api2/v2/payouts/transactions?limit=10";
-        let first = ingest_body(&database, model.id, url, 200, &body.to_string()).unwrap();
-        let second = ingest_body(&database, model.id, url, 200, &body.to_string()).unwrap();
-        let first_stats = first.unwrap().earnings.unwrap();
-        let second_stats = second.unwrap().earnings.unwrap();
-        assert_eq!(first_stats.upserted, 2);
-        assert_eq!(first_stats.linked, 1);
-        assert_eq!(second_stats.upserted, 2);
-        assert_eq!(second_stats.linked, 0);
+        let objects = publication_objects(&with_both);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            publication_created_at(objects[0]),
+            "2026-11-26T06:36:52+00:00"
+        );
 
-        database
-            .with_connection(|conn| {
-                let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))?;
-                let gross: f64 = conn.query_row(
-                    "SELECT total_sales_gross FROM shifts WHERE employee_id = ?1",
-                    [employee.id],
-                    |row| row.get(0),
-                )?;
-                let linked_type: String = conn.query_row(
-                    "SELECT type FROM transactions WHERE employee_id = ?1",
-                    [employee.id],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(count, 2);
-                assert_eq!(gross, 10.0);
-                assert_eq!(linked_type, TransactionType::Message.as_str());
-                Ok(())
-            })
-            .unwrap();
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
+        let precise_only = json!({
+            "id": 99002,
+            "postedAtPrecise": "1795588612.000000",
+            "rawText": "solo epoch"
+        });
+        let objs = publication_objects(&precise_only);
+        assert_eq!(objs.len(), 1);
+        let stamp = publication_created_at(objs[0]);
+        assert!(chrono::DateTime::parse_from_rfc3339(&stamp).is_ok());
     }
 
-    #[tokio::test]
-    async fn chat_messages_and_subscription_update_the_fan() {
-        let dir = std::env::temp_dir().join(format!("creatorfloww-chat-{}", std::process::id()));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        database
-            .save_onlyfans_profile(model.id, "88", "creator", "Creator", None)
-            .unwrap();
-        let chat = json!({
-            "list": [
-                {"id": 9, "price": 10, "isOpened": true, "createdAt": "2026-02-01T00:00:00Z", "fromUser": {"id": 88}},
-                {"id": 10, "price": 10, "isOpened": false, "createdAt": "2026-02-01T00:00:00Z", "fromUser": {"id": 88}},
-                {"id": 11, "isTip": true, "tipAmount": 4, "createdAt": "2026-02-02T00:00:00Z", "fromUser": {"id": 77}}
-            ],
-            "withUser": {
-                "id": 77,
-                "username": "fan",
-                "subscribedBy": true,
-                "currentSubscribePrice": 9.99,
-                "subscribedByAutoprolong": true,
-                "subscribedByData": {"duration": "3 months"},
-                "listsStates": [{"name": "Muted", "hasUser": true}]
-            }
-        });
-        let url = "https://onlyfans.com/api2/v2/chats/77/messages?limit=10";
-        ingest_body(&database, model.id, url, 200, &chat.to_string()).unwrap();
-        ingest_body(&database, model.id, url, 200, &chat.to_string()).unwrap();
-        let from_thread = stored_fan(&database, "77");
-        assert_eq!(from_thread.sub_status.as_deref(), Some("Active"));
-        database
-            .with_connection(|conn| {
-                let rows: i64 = conn.query_row("SELECT COUNT(*) FROM ppv_timeline", [], |row| row.get(0))?;
-                let paid: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM ppv_timeline WHERE purchased = 1",
-                    [],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(rows, 2);
-                assert_eq!(paid, 1);
-                let tips: i64 = conn.query_row("SELECT COUNT(*) FROM chat_tips", [], |row| row.get(0))?;
-                assert_eq!(tips, 1);
-                Ok(())
-            })
-            .unwrap();
-        let subscriber = json!({
-            "id": 77,
-            "username": "fan",
+    #[test]
+    fn extracts_fan_arrival_from_subscribed_by_data_even_when_subscribed_on_data_exists() {
+        let fan = json!({
+            "id": 55501,
+            "username": "newfan",
             "subscribedBy": true,
-            "currentSubscribePrice": 9.99,
-            "subscribedByAutoprolong": true,
-            "subscribedByData": {"duration": "3 months"},
-            "listsStates": [{"name": "Muted", "hasUser": true}]
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/users/77",
-            200,
-            &subscriber.to_string(),
-        )
-        .unwrap();
-        let insights = stored_fan(&database, "77");
-        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
-        assert_eq!(insights.sub_cost, Some(9.99));
-        assert_eq!(insights.sub_duration.as_deref(), Some("3 months"));
-        assert_eq!(insights.auto_renewal, Some(1));
-        assert!(insights.lists_json.contains("Muted"));
-        database
-            .with_connection(|conn| {
-                let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))?;
-                assert_eq!(count, 0);
-                Ok(())
-            })
-            .unwrap();
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn earnings_chart_and_visible_chat_sales_are_stored() {
-        let dir = std::env::temp_dir().join(format!(
-            "creatorfloww-chart-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        database
-            .save_onlyfans_profile(model.id, "88", "creator", "Creator", None)
-            .unwrap();
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let chart = json!({
-            "subscribes": {"total": 8.0, "gross": 10.0, "chartAmount": [{"date": today, "count": 8.0}]},
-            "tips": {"total": 36.0, "gross": 45.0, "chartAmount": [{"date": today, "count": 36.0}]},
-            "messages": {"total": 18.0, "gross": 22.5, "chartAmount": [{"date": today, "count": 18.0}]},
-            "post": {"total": 0, "chartAmount": []},
-            "ref": {"total": 0, "chartAmount": []},
-            "stream": {"total": 0, "chartAmount": []}
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/earnings/chart?startDate=2026-01-01&endDate=2026-11-07&withTotal=true",
-            200,
-            &chart.to_string(),
-        )
-        .unwrap();
-        let overview = crate::dashboard::earnings_overview(
-            &database,
-            crate::dashboard::DashboardRange::Today,
-            crate::dashboard::EarningsBasis::Net,
-        )
-        .unwrap();
-        assert_eq!(overview.total, 62.0);
-        let gross = crate::dashboard::earnings_overview(
-            &database,
-            crate::dashboard::DashboardRange::Today,
-            crate::dashboard::EarningsBasis::Gross,
-        )
-        .unwrap();
-        assert_eq!(gross.total, 77.5);
-
-        let chat = json!({
-            "list": [{
-                "id": 45,
-                "createdAt": "2026-11-07T18:00:00Z",
-                "fromUser": {"id": 77},
-                "text": "Te envié una $45.00 propina"
-            }, {
-                "id": 46,
-                "createdAt": "2026-11-07T18:05:00Z",
-                "fromUser": {"id": 88},
-                "text": "$22.50 pagado"
-            }]
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/chats/u77/messages?limit=10",
-            200,
-            &chat.to_string(),
-        )
-        .unwrap();
-        let subscriber = json!({
-            "id": 77,
-            "username": "joseph",
-            "subscribedBy": true,
-            "currentSubscribePrice": 0,
-            "subscribedByData": {"totalSumm": 466, "subscribeAt": "2026-07-07T00:00:00Z"}
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/users/77",
-            200,
-            &subscriber.to_string(),
-        )
-        .unwrap();
-        let insights = stored_fan(&database, "77");
-        assert_eq!(insights.total_spend, 466.0);
-        assert_eq!(insights.official_spend, 1);
-        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
-        let duration = insights.sub_duration.unwrap();
-        assert!(duration.contains("months") || duration.contains("days"));
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn chat_list_and_users_list_keep_historical_spend() {
-        let dir = std::env::temp_dir().join(format!(
-            "creatorfloww-sums-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        let chats = json!({
-            "list": [{
-                "withUser": {
-                    "id": 405580496,
-                    "username": "realgg",
-                    "name": "Mike 28 (RealG)",
-                    "subscribedBy": true,
-                    "subscribedByAutoprolong": true,
-                    "subscribedOnExpiredNow": false,
-                    "subscribedOnData": {
-                        "subscribePrice": 0,
-                        "duration": "5 months",
-                        "tipsSumm": "40",
-                        "messagesSumm": "165.51",
-                        "totalSumm": "205.51"
-                    }
-                }
-            }]
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/chats?limit=10&offset=0&skip_users=all",
-            200,
-            &chats.to_string(),
-        )
-        .unwrap();
-        let users = json!({
-            "405580496": {
-                "id": 405580496,
-                "username": "realgg",
-                "subscribedBy": true,
-                "subscribedByAutoprolong": true,
-                "subscribedOnData": {
-                    "subscribePrice": 0,
-                    "duration": "5 months",
-                    "tipsSumm": 40,
-                    "messagesSumm": 165.51,
-                    "subscribesSumm": 0,
-                    "totalSumm": 205.51
-                }
-            }
-        });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/users/list?m[]=405580496",
-            200,
-            &users.to_string(),
-        )
-        .unwrap();
-        let insights = stored_fan(&database, "405580496");
-        assert_eq!(insights.total_spend, 205.51);
-        assert_eq!(insights.ppv_total, 165.51);
-        assert_eq!(insights.tip_total, 40.0);
-        assert_eq!(insights.official_spend, 1);
-        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
-        assert_eq!(insights.sub_cost, Some(0.0));
-        assert_eq!(insights.sub_duration.as_deref(), Some("5 months"));
-        assert_eq!(insights.auto_renewal, Some(1));
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn subscribed_by_data_keeps_spend_when_subscribed_on_data_has_no_sums() {
-        let dir = std::env::temp_dir().join(format!(
-            "creatorfloww-bydata-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        database
-            .with_connection(|conn| {
-                conn.execute(
-                    "INSERT INTO fans (of_fan_id, model_id, username) VALUES ('180845750', ?1, 'king')",
-                    [model.id],
-                )?;
-                let fan_id: i64 = conn.query_row(
-                    "SELECT id FROM fans WHERE of_fan_id = '180845750'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                conn.execute(
-                    "INSERT INTO transactions (
-                        of_transaction_id, model_id, fan_id, type, gross_amount, net_amount, created_at
-                     ) VALUES ('b94402399292a0fb3238407260660357', ?1, ?2, 'message', 20, 16, '2026-10-23T06:04:06+00:00')",
-                    rusqlite::params![model.id, fan_id],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        let user = json!({
-            "id": 180845750,
-            "username": "a80974685",
-            "subscribedBy": true,
-            "subscribedByAutoprolong": true,
-            "currentSubscribePrice": 0,
-            "subscribedOnData": {
-                "subscribePrice": 0,
-                "duration": "6 months"
-            },
+            "subscribedOnData": { "subscribePrice": 0 },
             "subscribedByData": {
-                "subscribePrice": 0,
-                "duration": "6 months",
-                "tipsSumm": 0,
-                "messagesSumm": 367.23,
-                "subscribesSumm": 0,
-                "postsSumm": 0,
-                "streamsSumm": 0,
-                "totalSumm": 367.23
+                "subscribeAt": "2026-11-26T06:40:00+00:00"
             }
         });
-        ingest_body(
-            &database,
-            model.id,
-            "https://onlyfans.com/api2/v2/users/180845750",
-            200,
-            &user.to_string(),
-        )
-        .unwrap();
-        let insights = stored_fan(&database, "180845750");
-        assert_eq!(insights.total_spend, 367.23);
-        assert_eq!(insights.ppv_total, 367.23);
-        assert_eq!(insights.tip_total, 0.0);
-        assert_eq!(insights.official_spend, 1);
-        assert_eq!(insights.sub_status.as_deref(), Some("Active"));
-        assert_eq!(insights.sub_cost, Some(0.0));
-        assert_eq!(insights.sub_duration.as_deref(), Some("6 months"));
-        assert_eq!(insights.auto_renewal, Some(1));
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn today_scalar_chart_splits_net_and_gross() {
-        let dir = std::env::temp_dir().join(format!(
-            "creatorfloww-today-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let database = Database::initialize(dir.clone()).await.unwrap();
-        let model = database.create_model_partition().unwrap();
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let chart = json!({ "messages": 28.0 });
-        ingest_body(
-            &database,
-            model.id,
-            &format!("https://onlyfans.com/api2/v2/earnings/chart?startDate={today}&endDate={today}"),
-            200,
-            &chart.to_string(),
-        )
-        .unwrap();
-        let net = crate::dashboard::earnings_overview(
-            &database,
-            crate::dashboard::DashboardRange::Today,
-            crate::dashboard::EarningsBasis::Net,
-        )
-        .unwrap();
-        let gross = crate::dashboard::earnings_overview(
-            &database,
-            crate::dashboard::DashboardRange::Today,
-            crate::dashboard::EarningsBasis::Gross,
-        )
-        .unwrap();
-        assert_eq!(net.total, 28.0);
-        assert_eq!(gross.total, 35.0);
-        drop(database);
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            fan_arrived_at(fan.as_object().unwrap()).as_deref(),
+            Some("2026-11-26T06:40:00+00:00")
+        );
     }
 }

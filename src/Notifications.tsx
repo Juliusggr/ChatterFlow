@@ -137,7 +137,7 @@ export type ToastBanner = {
   title: string;
   subtitle: string;
   tone: "green" | "brand";
-  modelId?: number;
+  modelId?: string;
 };
 
 /**
@@ -152,8 +152,8 @@ export function NotificationToastStack({
   onDismissBanner,
 }: {
   enableSystemEffects?: boolean;
-  onOpenModel?: (modelId: number) => void;
-  onOpenChat?: (modelId: number, ofFanId: string) => void;
+  onOpenModel?: (modelId: string) => void;
+  onOpenChat?: (modelId: string, ofFanId: string) => void;
   extraBanners?: ToastBanner[];
   onDismissBanner?: (id: string) => void;
 }) {
@@ -235,7 +235,8 @@ export function NotificationToastStack({
   return (
     <div
       aria-live="polite"
-      className="pointer-events-none fixed right-3.5 top-3.5 z-50 flex w-[min(22rem,calc(100vw-1.5rem))] flex-col gap-2.5"
+      className="pointer-events-none fixed right-3.5 top-3.5 z-[80] flex w-[min(22rem,calc(100vw-1.5rem))] flex-col gap-2.5"
+      style={{ color: "var(--text-primary)" }}
     >
       {extraBanners.map((banner) => (
         <div
@@ -244,13 +245,13 @@ export function NotificationToastStack({
           style={
             banner.tone === "green"
               ? {
-                  background: "linear-gradient(135deg, #059669 0%, #047857 100%)",
-                  border: "1px solid #34d399",
-                  color: "#ecfdf5",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border)",
+                  color: "var(--text-primary)",
                 }
               : {
                   background: "var(--bg-elevated)",
-                  border: "1px solid var(--brand-400)",
+                  border: "1px solid var(--border)",
                   color: "var(--text-primary)",
                 }
           }
@@ -266,7 +267,7 @@ export function NotificationToastStack({
                   onOpenModel(banner.modelId!);
                   onDismissBanner?.(banner.id);
                 }}
-                className="mt-2 inline-flex items-center gap-1 rounded-md bg-white/20 px-2.5 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-white/30"
+                className="cf-btn-primary mt-2 inline-flex items-center gap-1 px-2.5 py-1 text-[11px]"
               >
                 <MessageSquare size={12} />
                 Ir a Mensajes
@@ -279,6 +280,7 @@ export function NotificationToastStack({
               aria-label="Cerrar aviso"
               onClick={() => onDismissBanner(banner.id)}
               className="rounded p-0.5 opacity-75 hover:opacity-100"
+              style={{ color: "inherit" }}
             >
               <X size={14} />
             </button>
@@ -369,15 +371,15 @@ function NotificationCard({
               ) : null}
             </div>
 
-            <p className="mt-1.5 truncate text-xs font-semibold text-white">
+            <p className="mt-1.5 truncate text-xs font-semibold" style={{ color: "#ffffff" }}>
               {item.modelName}{" "}
-              <span className="font-normal text-emerald-200">← {item.fanName}</span>
+              <span className="font-normal" style={{ color: "#a7f3d0" }}>← {item.fanName}</span>
             </p>
 
-            <p className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-emerald-100/95">
+            <p className="mt-0.5 line-clamp-2 text-[11px] leading-snug" style={{ color: "#d1fae5" }}>
               {item.preview}
               {item.netAmount != null ? (
-                <span className="ml-1.5 font-semibold text-emerald-200">
+                <span className="ml-1.5 font-semibold" style={{ color: "#a7f3d0" }}>
                   ({formatMoney(item.netAmount)} neto)
                 </span>
               ) : null}
@@ -392,7 +394,8 @@ function NotificationCard({
                 e.stopPropagation();
                 onDismiss();
               }}
-              className="shrink-0 rounded-md p-1 text-emerald-200/80 transition-colors hover:bg-white/15 hover:text-white"
+              className="shrink-0 rounded-md p-1 transition-colors hover:bg-white/15"
+              style={{ color: "#a7f3d0" }}
             >
               <X size={14} strokeWidth={2.25} />
             </button>
@@ -475,7 +478,7 @@ function ModelAvatarThumb({
   name,
   avatarUrl,
 }: {
-  modelId: number;
+  modelId: string;
   name: string;
   avatarUrl: string | null;
 }) {
@@ -510,7 +513,7 @@ export function NotificationBellPopover({
   onOpenChat,
 }: {
   navOpen: boolean;
-  onOpenChat: (modelId: number, ofFanId: string) => void;
+  onOpenChat: (modelId: string, ofFanId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [history, setHistory] = useState<AppNotification[]>([]);
@@ -578,14 +581,14 @@ export function NotificationBellPopover({
         className={`relative flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-medium transition-colors ${
           navOpen ? "" : "justify-center"
         }`}
-        style={{ color: "var(--text-secondary)" }}
+        style={{ color: "var(--nav-text)" }}
       >
         <span className="relative flex h-6 w-6 items-center justify-center">
           {anyActive ? <Bell size={16} strokeWidth={1.85} /> : <BellOff size={16} strokeWidth={1.85} />}
           {unseenCount > 0 ? (
             <span
               className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-white"
-              style={{ background: "#10b981" }}
+              style={{ background: "var(--brand-500)" }}
             >
               {unseenCount > 99 ? "99+" : unseenCount}
             </span>
@@ -596,11 +599,16 @@ export function NotificationBellPopover({
 
       {open ? (
         <div
-          className="fixed bottom-14 left-20 z-50 flex max-h-[32rem] w-[23rem] flex-col overflow-hidden rounded-2xl"
+          className={`fixed bottom-14 z-[80] flex max-h-[32rem] w-[23rem] flex-col overflow-hidden rounded-lg ${
+            navOpen
+              ? "left-[calc(3.75rem+15rem+0.75rem)]"
+              : "left-[calc(3.75rem+4.5rem+0.75rem)]"
+          }`}
           style={{
             background: "var(--bg-elevated)",
             border: "1px solid var(--border)",
             boxShadow: "var(--shadow-lg)",
+            color: "var(--text-primary)",
           }}
         >
           <div
@@ -725,8 +733,8 @@ function PrefToggle({
 }) {
   const activeStyle =
     accent === "green"
-      ? { background: "#059669", color: "#ffffff", borderColor: "#047857" }
-      : { background: "var(--brand-600)", color: "#ffffff", borderColor: "var(--brand-700)" };
+      ? { background: "var(--success)", color: "#ffffff", borderColor: "var(--success)" }
+      : { background: "var(--brand-500)", color: "#ffffff", borderColor: "var(--brand-500)" };
 
   return (
     <button

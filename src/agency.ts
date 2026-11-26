@@ -1,4 +1,5 @@
-import type { Model, ScheduleDay, Weekday } from "./types";
+import type { EarningsBasis, FanCounts } from "./api";
+import type { ScheduleDay, Weekday } from "./types";
 import { WEEKDAYS } from "./types";
 import { supabase, usernameToEmail } from "./supabase";
 
@@ -21,11 +22,12 @@ export type AgencyEmployee = {
   is_clocked_in: boolean;
   last_clock_in: string | null;
   days: ScheduleDay[];
-  modelKeys: string[];
+  modelIds: string[];
 };
 
 export type ActiveShift = {
   id: string;
+  userId: string;
   name: string;
   role: string;
   clockIn: string;
@@ -37,7 +39,41 @@ export type EmployeeSaleTotal = {
   amount: number;
 };
 
+export type DashboardChannelPoint = {
+  label: string;
+  subs: number;
+  tips: number;
+  posts: number;
+  ppv: number;
+};
+
+export type DashboardSnapshot = {
+  revenue: PeriodRevenue;
+  shifts: ShiftSummary[];
+  clockedIn: ActiveShift[];
+  onShift: boolean;
+  salesByBasis: Record<EarningsBasis, EmployeeSaleTotal[]>;
+  channelsByBasis: Record<EarningsBasis, DashboardChannelPoint[]>;
+  fans: FanCounts | null;
+};
+
 const WEEKDAY_BY_INDEX: Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const PROFILE_CACHE_TTL_MS = 60_000;
+
+let cachedProfile: AgencyProfile | null = null;
+let cachedProfileUserId: string | null = null;
+let cachedProfileAt = 0;
+let inFlightProfile: Promise<AgencyProfile | null> | null = null;
+
+supabase.auth.onAuthStateChange((event, session) => {
+  const nextId = session?.user?.id ?? null;
+  if (event === "SIGNED_OUT" || nextId !== cachedProfileUserId) {
+    cachedProfile = null;
+    cachedProfileUserId = null;
+    cachedProfileAt = 0;
+    inFlightProfile = null;
+  }
+});
 
 export function isManager(role: AgencyRole | null | undefined): boolean {
   return role === "owner" || role === "admin";
@@ -59,7 +95,7 @@ export async function signInWithUsername(username: string, password: string): Pr
   if (error) {
     throw new Error("Usuario o contraseña incorrectos");
   }
-  const profile = await loadMyProfile();
+  const profile = await loadMyProfile(true);
   if (!profile?.is_active) {
     await supabase.auth.signOut();
     throw new Error("Esta cuenta está desactivada");
@@ -68,84 +104,74 @@ export async function signInWithUsername(username: string, password: string): Pr
 }
 
 export async function signOut(): Promise<void> {
+  cachedProfile = null;
+  cachedProfileUserId = null;
+  cachedProfileAt = 0;
   const { error } = await supabase.auth.signOut();
   if (error) throw error;
 }
 
-export async function loadMyProfile(): Promise<AgencyProfile | null> {
-  const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError) throw userError;
-  if (!userData.user) return null;
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id,username,full_name,role,is_active")
-    .eq("id", userData.user.id)
-    .maybeSingle();
-  if (error) throw error;
-  return (data as AgencyProfile | null) ?? null;
-}
-
-export async function syncAgencyModels(models: Model[]): Promise<void> {
-  if (models.length === 0) return;
-  const rows = models.map((model) => ({
-    external_key: modelExternalKey(model),
-    name: model.display_name || model.username || "Modelo",
-    handle: model.username || "",
-    avatar_url: model.avatar_url,
-    session_data: {
-      sqlite_id: model.id,
-      partition_id: model.partition_id,
-      of_user_id: model.of_user_id,
-    },
-  }));
-  const { error } = await supabase.from("models").upsert(rows, { onConflict: "external_key" });
-  if (error) throw error;
-}
-
-export async function assignedModelKeys(): Promise<Set<string>> {
-  const profile = await loadMyProfile();
-  if (!profile) return new Set();
-  const { data: assignments, error } = await supabase
-    .from("model_assignments")
-    .select("model_id")
-    .eq("user_id", profile.id);
-  if (error) throw error;
-  const ids = (assignments ?? []).map((row) => row.model_id as string);
-  if (ids.length === 0) return new Set();
-  const { data: models, error: modelError } = await supabase
-    .from("models")
-    .select("external_key")
-    .in("id", ids);
-  if (modelError) throw modelError;
-  return new Set((models ?? []).map((row) => row.external_key as string));
-}
-
-async function modelIdByKey(externalKey: string): Promise<string | null> {
-  const { data, error } = await supabase
-    .from("models")
-    .select("id")
-    .eq("external_key", externalKey)
-    .maybeSingle();
-  if (error) throw error;
-  return (data?.id as string | undefined) ?? null;
+export async function loadMyProfile(force = false): Promise<AgencyProfile | null> {
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  if (sessionError) throw sessionError;
+  const userId = sessionData.session?.user?.id ?? null;
+  if (!userId) {
+    cachedProfile = null;
+    cachedProfileUserId = null;
+    cachedProfileAt = 0;
+    return null;
+  }
+  if (
+    !force &&
+    cachedProfile &&
+    cachedProfileUserId === userId &&
+    Date.now() - cachedProfileAt < PROFILE_CACHE_TTL_MS
+  ) {
+    return cachedProfile;
+  }
+  if (!force && inFlightProfile) {
+    return inFlightProfile;
+  }
+  const request = (async () => {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id,username,full_name,role,is_active")
+      .eq("id", userId)
+      .maybeSingle();
+    if (error) throw error;
+    const resolved = (data as AgencyProfile | null) ?? null;
+    cachedProfile = resolved;
+    cachedProfileUserId = userId;
+    cachedProfileAt = Date.now();
+    return resolved;
+  })();
+  inFlightProfile = request;
+  try {
+    return await request;
+  } finally {
+    if (inFlightProfile === request) {
+      inFlightProfile = null;
+    }
+  }
 }
 
 export async function listEmployees(): Promise<AgencyEmployee[]> {
-  const [{ data: profiles, error }, { data: schedules, error: scheduleError }, { data: shifts, error: shiftError }, { data: assignments, error: assignmentError }, { data: models, error: modelError }] =
-    await Promise.all([
-      supabase.from("profiles").select("id,username,full_name,role,is_active").order("full_name"),
-      supabase.from("schedules").select("user_id,day_of_week,start_time,end_time"),
-      supabase.from("shifts").select("user_id,clock_in,status").eq("status", "active"),
-      supabase.from("model_assignments").select("user_id,model_id"),
-      supabase.from("models").select("id,external_key"),
-    ]);
+  const [
+    { data: profiles, error },
+    { data: schedules, error: scheduleError },
+    { data: shifts, error: shiftError },
+    { data: assignments, error: assignmentError },
+  ] = await Promise.all([
+    supabase.from("profiles").select("id,username,full_name,role,is_active").order("full_name"),
+    supabase.from("schedules").select("user_id,day_of_week,start_time,end_time"),
+    supabase.from("shifts").select("user_id,clock_in").eq("status", "active"),
+    supabase.from("model_assignments").select("user_id,model_id"),
+  ]);
   if (error) throw error;
   if (scheduleError) throw scheduleError;
   if (shiftError) throw shiftError;
   if (assignmentError) throw assignmentError;
-  if (modelError) throw modelError;
 
-  const keysByModel = new Map((models ?? []).map((row) => [row.id as string, row.external_key as string]));
   const activeByUser = new Map((shifts ?? []).map((row) => [row.user_id as string, row.clock_in as string]));
   const daysByUser = new Map<string, ScheduleDay[]>();
   for (const row of schedules ?? []) {
@@ -164,10 +190,10 @@ export async function listEmployees(): Promise<AgencyEmployee[]> {
   }
   const modelsByUser = new Map<string, string[]>();
   for (const row of assignments ?? []) {
-    const key = keysByModel.get(row.model_id as string);
-    if (!key) continue;
+    const modelId = row.model_id as string;
+    if (!modelId) continue;
     const list = modelsByUser.get(row.user_id as string) ?? [];
-    list.push(key);
+    list.push(modelId);
     modelsByUser.set(row.user_id as string, list);
   }
 
@@ -180,7 +206,7 @@ export async function listEmployees(): Promise<AgencyEmployee[]> {
     is_clocked_in: activeByUser.has(profile.id as string),
     last_clock_in: activeByUser.get(profile.id as string) ?? null,
     days: daysByUser.get(profile.id as string) ?? blankDays(),
-    modelKeys: modelsByUser.get(profile.id as string) ?? [],
+    modelIds: modelsByUser.get(profile.id as string) ?? [],
   }));
 }
 
@@ -196,7 +222,7 @@ export async function saveEmployee(input: {
   role: AgencyRole;
   isActive: boolean;
   days: ScheduleDay[];
-  modelKeys: string[];
+  modelIds: string[];
 }): Promise<void> {
   const body = input.id
     ? {
@@ -221,9 +247,14 @@ export async function saveEmployee(input: {
   if (payload?.error) throw new Error(payload.error);
   const userId = input.id ?? payload?.id;
   if (!userId) throw new Error("No se recibió el id del empleado");
-  await replaceSchedule(userId, input.days);
-  if (input.role === "chatter" || input.role === "dropper") {
-    await replaceAssignments(userId, input.modelKeys);
+  await Promise.all([
+    replaceSchedule(userId, input.days),
+    input.role === "chatter" || input.role === "dropper"
+      ? replaceAssignments(userId, input.modelIds)
+      : Promise.resolve(),
+  ]);
+  if (userId === cachedProfileUserId) {
+    cachedProfileAt = 0;
   }
 }
 
@@ -258,19 +289,17 @@ async function replaceSchedule(userId: string, days: ScheduleDay[]): Promise<voi
   if (error) throw error;
 }
 
-async function replaceAssignments(userId: string, modelKeys: string[]): Promise<void> {
+async function replaceAssignments(userId: string, modelIds: string[]): Promise<void> {
   const { error: deleteError } = await supabase.from("model_assignments").delete().eq("user_id", userId);
   if (deleteError) throw deleteError;
-  if (modelKeys.length === 0) return;
-  const { data: models, error } = await supabase.from("models").select("id,external_key").in("external_key", modelKeys);
-  if (error) throw error;
+  const uniqueIds = [...new Set(modelIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return;
   const me = await loadMyProfile();
-  const rows = (models ?? []).map((model) => ({
+  const rows = uniqueIds.map((modelId) => ({
     user_id: userId,
-    model_id: model.id as string,
+    model_id: modelId,
     assigned_by: me?.id ?? null,
   }));
-  if (rows.length === 0) return;
   const { error: insertError } = await supabase.from("model_assignments").insert(rows);
   if (insertError) throw insertError;
 }
@@ -286,7 +315,7 @@ export async function deactivateEmployee(id: string): Promise<void> {
     role: employee.role,
     isActive: false,
     days: employee.days,
-    modelKeys: employee.modelKeys,
+    modelIds: employee.modelIds,
   });
 }
 
@@ -309,7 +338,7 @@ export async function deleteShift(id: string): Promise<void> {
 export async function listActiveShifts(): Promise<ActiveShift[]> {
   const { data, error } = await supabase
     .from("shifts")
-    .select("id,clock_in,profiles(full_name,username,role)")
+    .select("id,user_id,clock_in,profiles(full_name,username,role)")
     .eq("status", "active")
     .order("clock_in", { ascending: true });
   if (error) throw error;
@@ -317,6 +346,7 @@ export async function listActiveShifts(): Promise<ActiveShift[]> {
     const profile = firstRelation(row.profiles);
     return {
       id: row.id as string,
+      userId: row.user_id as string,
       name: profile?.full_name || profile?.username || "Empleado",
       role: profile?.role ? roleLabel(profile.role as AgencyRole) : "",
       clockIn: row.clock_in as string,
@@ -326,7 +356,7 @@ export async function listActiveShifts(): Promise<ActiveShift[]> {
 
 export function subscribeActiveShifts(onChange: () => void): () => void {
   const channel = supabase
-    .channel("shifts-live")
+    .channel(`shifts-live-${Math.random().toString(36).slice(2, 8)}`)
     .on("postgres_changes", { event: "*", schema: "public", table: "shifts" }, () => onChange())
     .subscribe();
   return () => {
@@ -334,17 +364,17 @@ export function subscribeActiveShifts(onChange: () => void): () => void {
   };
 }
 
-export async function myShiftOpen(): Promise<boolean> {
-  const profile = await loadMyProfile();
-  if (!profile) return false;
-  const { data, error } = await supabase
-    .from("shifts")
-    .select("id")
-    .eq("user_id", profile.id)
-    .eq("status", "active")
-    .maybeSingle();
-  if (error) throw error;
-  return Boolean(data);
+export function subscribeDropperTables(onChange: () => void): () => void {
+  const channel = supabase
+    .channel(`dropper-live-${Math.random().toString(36).slice(2, 8)}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "shifts" }, () => onChange())
+    .on("postgres_changes", { event: "*", schema: "public", table: "publications" }, () => onChange())
+    .on("postgres_changes", { event: "*", schema: "public", table: "fan_arrivals" }, () => onChange())
+    .on("postgres_changes", { event: "*", schema: "public", table: "dropper_shift_reports" }, () => onChange())
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
 }
 
 export type ShiftSummary = {
@@ -354,19 +384,8 @@ export type ShiftSummary = {
   endTime: string | null;
 };
 
-export type CompletedShift = {
-  id: string;
-  employeeName: string;
-  role: AgencyRole | null;
-  startTime: string;
-  endTime: string;
-  amount: number | null;
-};
-
-export async function listMyShifts(range: DashboardRange): Promise<ShiftSummary[]> {
-  const profile = await loadMyProfile();
+async function listMyShiftsForProfile(profile: AgencyProfile | null, from: string, to: string): Promise<ShiftSummary[]> {
   if (!profile) return [];
-  const { from, to } = rangeBounds(range);
   const { data: shifts, error } = await supabase
     .from("shifts")
     .select("id,clock_in,clock_out")
@@ -382,136 +401,6 @@ export async function listMyShifts(range: DashboardRange): Promise<ShiftSummary[
     startTime: shift.clock_in as string,
     endTime: (shift.clock_out as string | null) ?? null,
   }));
-}
-
-export async function salesByEmployee(range: DashboardRange, basis: "net" | "gross"): Promise<EmployeeSaleTotal[]> {
-  const { from, to } = rangeBounds(range);
-  const sales = await listSales(from, to);
-  const totals = new Map<string, EmployeeSaleTotal>();
-  for (const sale of sales) {
-    if (sale.role !== "chatter") continue;
-    const current = totals.get(sale.employeeId) ?? { employeeId: sale.employeeId, name: sale.name, amount: 0 };
-    current.amount += basis === "net" ? sale.net : sale.gross;
-    totals.set(sale.employeeId, current);
-  }
-  return [...totals.values()].sort((a, b) => b.amount - a.amount);
-}
-
-export function analyticsBounds(range: string): { from: string | null; to: string } {
-  const now = new Date();
-  const clean = range.trim().toLowerCase();
-  const tomorrow = nextLocalMidnight(now);
-  if (clean === "24h" || clean === "24" || clean === "1" || clean === "day" || clean === "today") {
-    return { from: new Date(now.getTime() - 86_400_000).toISOString(), to: now.toISOString() };
-  }
-  const span = daySpan(clean);
-  if (span != null) {
-    const start = localMidnight(now);
-    start.setDate(start.getDate() - (span - 1));
-    return { from: start.toISOString(), to: tomorrow.toISOString() };
-  }
-  if (clean === "all" || clean === "historic" || clean === "historico" || clean === "all_time" || clean === "todo") {
-    return { from: null, to: tomorrow.toISOString() };
-  }
-  const yearMatch = /^(?:year:)?(\d{4})$/.exec(clean);
-  if (yearMatch && (clean.startsWith("year:") || clean.length === 4)) {
-    const year = Number(yearMatch[1]);
-    return {
-      from: localDate(year, 1, 1).toISOString(),
-      to: localDate(year + 1, 1, 1).toISOString(),
-    };
-  }
-  const monthMatch = /^(?:month:)?(\d{4})-(\d{2})$/.exec(clean);
-  if (monthMatch) {
-    const year = Number(monthMatch[1]);
-    const month = Number(monthMatch[2]);
-    if (month >= 1 && month <= 12) {
-      const nextYear = month === 12 ? year + 1 : year;
-      const nextMonth = month === 12 ? 1 : month + 1;
-      return {
-        from: localDate(year, month, 1).toISOString(),
-        to: localDate(nextYear, nextMonth, 1).toISOString(),
-      };
-    }
-  }
-  const start = localMidnight(now);
-  start.setDate(start.getDate() - 6);
-  return { from: start.toISOString(), to: tomorrow.toISOString() };
-}
-
-export async function listCompletedShifts(
-  from: string | null,
-  to: string,
-  basis: "net" | "gross",
-): Promise<CompletedShift[]> {
-  let query = supabase
-    .from("shifts")
-    .select("id,user_id,clock_in,clock_out,profiles(full_name,username,role)")
-    .not("clock_out", "is", null)
-    .lt("clock_in", to)
-    .order("clock_in", { ascending: false });
-  if (from) query = query.gte("clock_in", from);
-  const { data, error } = await query;
-  if (error) throw error;
-  const shifts = data ?? [];
-  if (shifts.length === 0) return [];
-
-  let fromMs = Number.POSITIVE_INFINITY;
-  let toMs = new Date(to).getTime();
-  for (const shift of shifts) {
-    fromMs = Math.min(fromMs, new Date(shift.clock_in as string).getTime());
-    toMs = Math.max(toMs, new Date(shift.clock_out as string).getTime());
-  }
-  const sales = await listSales(new Date(fromMs).toISOString(), new Date(toMs + 1).toISOString());
-
-  return shifts.map((shift) => {
-    const profile = firstRelation(shift.profiles);
-    const rawRole = profile?.role;
-    const role = isAgencyRole(rawRole) ? rawRole : null;
-    const start = new Date(shift.clock_in as string).getTime();
-    const end = new Date(shift.clock_out as string).getTime();
-    const amount =
-      role === "chatter"
-        ? sales
-            .filter((sale) => sale.employeeId === shift.user_id && sale.at >= start && sale.at <= end)
-            .reduce((sum, sale) => sum + (basis === "net" ? sale.net : sale.gross), 0)
-        : null;
-    return {
-      id: shift.id as string,
-      employeeName: profile?.full_name || profile?.username || "Empleado",
-      role,
-      startTime: shift.clock_in as string,
-      endTime: shift.clock_out as string,
-      amount,
-    };
-  });
-}
-
-export async function chatterSales(
-  from: string | null,
-  to: string,
-  basis: "net" | "gross",
-): Promise<EmployeeSaleTotal[]> {
-  const salesFrom = from ?? "1970-01-01T00:00:00.000Z";
-  const [{ data: profiles, error }, sales] = await Promise.all([
-    supabase.from("profiles").select("id,full_name,username").eq("role", "chatter").eq("is_active", true),
-    listSales(salesFrom, to),
-  ]);
-  if (error) throw error;
-  const totals = new Map<string, EmployeeSaleTotal>();
-  for (const profile of profiles ?? []) {
-    totals.set(profile.id as string, {
-      employeeId: profile.id as string,
-      name: (profile.full_name as string) || (profile.username as string) || "Empleado",
-      amount: 0,
-    });
-  }
-  for (const sale of sales) {
-    const current = totals.get(sale.employeeId);
-    if (!current || sale.role !== "chatter") continue;
-    current.amount += basis === "net" ? sale.net : sale.gross;
-  }
-  return [...totals.values()].sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name, "es"));
 }
 
 type SaleRow = { employeeId: string; name: string; role: string | null; gross: number; net: number; at: number };
@@ -536,40 +425,238 @@ async function listSales(from: string, to: string): Promise<SaleRow[]> {
   });
 }
 
-function isAgencyRole(value: unknown): value is AgencyRole {
-  return value === "owner" || value === "admin" || value === "chatter" || value === "dropper";
-}
+export type RevenueBar = {
+  label: string;
+  gross: number;
+  net: number;
+};
 
-function daySpan(clean: string): number | null {
-  const spans: Record<string, number> = {
-    "7": 7,
-    "7d": 7,
-    "14": 14,
-    "14d": 14,
-    "30": 30,
-    "30d": 30,
-    "90": 90,
-    "90d": 90,
-    "180": 180,
-    "180d": 180,
+export type PeriodRevenue = {
+  gross: number;
+  net: number;
+  dayCount: number;
+  averageDaily: number;
+  bars: RevenueBar[];
+};
+
+function computeSalesMetrics(
+  sales: SaleRow[],
+  from: string,
+  to: string,
+): {
+  revenue: PeriodRevenue;
+  salesByBasis: Record<EarningsBasis, EmployeeSaleTotal[]>;
+} {
+  const days = eachLocalDay(from, to);
+  const buckets = new Map(days.map((day) => [day.key, { gross: 0, net: 0 }]));
+  const totalsByEmployee = new Map<string, { name: string; gross: number; net: number }>();
+  let gross = 0;
+  let net = 0;
+
+  for (const sale of sales) {
+    const saleGross = Number.isFinite(sale.gross) ? sale.gross : 0;
+    const saleNet = Number.isFinite(sale.net) ? sale.net : 0;
+    gross += saleGross;
+    net += saleNet;
+    const bucket = buckets.get(localDayKey(sale.at));
+    if (bucket) {
+      bucket.gross += saleGross;
+      bucket.net += saleNet;
+    }
+    if (sale.role === "chatter") {
+      const emp = totalsByEmployee.get(sale.employeeId) ?? { name: sale.name, gross: 0, net: 0 };
+      emp.gross += saleGross;
+      emp.net += saleNet;
+      totalsByEmployee.set(sale.employeeId, emp);
+    }
+  }
+
+  const dayCount = Math.max(days.length, 1);
+  const netRanking: EmployeeSaleTotal[] = [];
+  const grossRanking: EmployeeSaleTotal[] = [];
+  for (const [employeeId, emp] of totalsByEmployee.entries()) {
+    netRanking.push({ employeeId, name: emp.name, amount: emp.net });
+    grossRanking.push({ employeeId, name: emp.name, amount: emp.gross });
+  }
+  netRanking.sort((a, b) => b.amount - a.amount);
+  grossRanking.sort((a, b) => b.amount - a.amount);
+
+  return {
+    revenue: {
+      gross,
+      net,
+      dayCount,
+      averageDaily: gross / dayCount,
+      bars: days.map((day) => {
+        const bucket = buckets.get(day.key) ?? { gross: 0, net: 0 };
+        return { label: day.label, gross: bucket.gross, net: bucket.net };
+      }),
+    },
+    salesByBasis: {
+      net: netRanking,
+      gross: grossRanking,
+    },
   };
-  return spans[clean] ?? null;
 }
 
-function localMidnight(date: Date): Date {
-  const copy = new Date(date);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
+export async function getFanCounts(): Promise<FanCounts> {
+  const { data, error } = await supabase
+    .from("models")
+    .select("id,name,handle,fans_count")
+    .order("name", { ascending: true })
+    .order("handle", { ascending: true })
+    .order("id", { ascending: true });
+  if (error) throw error;
+  const accounts = (data ?? []).map((row) => ({
+    modelId: row.id as string,
+    name: String(row.name || row.handle || "Cuenta").trim() || "Cuenta",
+    fans: row.fans_count == null ? null : Number(row.fans_count),
+  }));
+  const known = accounts.filter((account) => account.fans != null);
+  const total = known.length > 0 ? known.reduce((sum, account) => sum + (account.fans ?? 0), 0) : null;
+  return { total, accounts };
 }
 
-function nextLocalMidnight(date: Date): Date {
-  const start = localMidnight(date);
-  start.setDate(start.getDate() + 1);
-  return start;
+async function dashboardChannelsBoth(
+  from: string,
+  to: string,
+  hourly: boolean,
+): Promise<Record<EarningsBasis, DashboardChannelPoint[]>> {
+  const slots = hourly ? eachLocalHour(from) : eachLocalDay(from, to);
+  const netMap = new Map<string, DashboardChannelPoint>(
+    slots.map((slot) => [slot.key, { label: slot.label, subs: 0, tips: 0, posts: 0, ppv: 0 }]),
+  );
+  const grossMap = new Map<string, DashboardChannelPoint>(
+    slots.map((slot) => [slot.key, { label: slot.label, subs: 0, tips: 0, posts: 0, ppv: 0 }]),
+  );
+
+  const { data, error } = await supabase
+    .from("model_earnings")
+    .select("type,gross_amount,net_amount,created_at")
+    .gte("created_at", from)
+    .lt("created_at", to);
+  if (error) throw error;
+
+  for (const row of data ?? []) {
+    const ms = new Date(row.created_at as string).getTime();
+    if (!Number.isFinite(ms)) continue;
+    const key = hourly ? localHourKey(ms) : localDayKey(ms);
+    const netBucket = netMap.get(key);
+    const grossBucket = grossMap.get(key);
+    if (!netBucket || !grossBucket) continue;
+    const g = Number(row.gross_amount);
+    const n = Number(row.net_amount);
+    const gClean = Number.isFinite(g) ? g : 0;
+    const nClean = Number.isFinite(n) ? n : 0;
+    switch (row.type) {
+      case "sub":
+        netBucket.subs += nClean;
+        grossBucket.subs += gClean;
+        break;
+      case "tip":
+        netBucket.tips += nClean;
+        grossBucket.tips += gClean;
+        break;
+      case "post":
+        netBucket.posts += nClean;
+        grossBucket.posts += gClean;
+        break;
+      case "message":
+        netBucket.ppv += nClean;
+        grossBucket.ppv += gClean;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return {
+    net: slots.map((slot) => netMap.get(slot.key)!),
+    gross: slots.map((slot) => grossMap.get(slot.key)!),
+  };
 }
 
-function localDate(year: number, month: number, day: number): Date {
-  return new Date(year, month - 1, day, 0, 0, 0, 0);
+/**
+ * Fetches the entire Dashboard dataset in a single parallel wave (4 queries total, zero duplicates),
+ * returning both Net and Gross series so toggling Neto/Bruto in the UI is instantaneous (0ms).
+ */
+export async function loadDashboardSnapshot(range: DashboardRange): Promise<DashboardSnapshot> {
+  const profile = await loadMyProfile();
+  const { from, to } = rangeBounds(range);
+  const hourly = range === "today" || range === "yesterday";
+
+  const [sales, shifts, activeShifts, channelsByBasis, fans] = await Promise.all([
+    listSales(from, to),
+    listMyShiftsForProfile(profile, from, to),
+    listActiveShifts(),
+    dashboardChannelsBoth(from, to, hourly).catch(
+      (): Record<EarningsBasis, DashboardChannelPoint[]> => ({ net: [], gross: [] }),
+    ),
+    getFanCounts().catch(() => null),
+  ]);
+
+  const { revenue, salesByBasis } = computeSalesMetrics(sales, from, to);
+  const onShift = Boolean(profile && activeShifts.some((item) => item.userId === profile.id));
+
+  return {
+    revenue,
+    shifts,
+    clockedIn: activeShifts,
+    onShift,
+    salesByBasis,
+    channelsByBasis,
+    fans,
+  };
+}
+
+function eachLocalHour(fromIso: string): { key: string; label: string }[] {
+  const start = new Date(fromIso);
+  start.setMinutes(0, 0, 0);
+  const slots: { key: string; label: string }[] = [];
+  for (let hour = 0; hour < 24; hour += 1) {
+    const cursor = new Date(start.getTime() + hour * 3_600_000);
+    slots.push({
+      key: localHourKey(cursor.getTime()),
+      label: `${String(cursor.getHours()).padStart(2, "0")}:00`,
+    });
+  }
+  return slots;
+}
+
+function localHourKey(ms: number): string {
+  const date = new Date(ms);
+  return `${localDayKey(ms)}-${String(date.getHours()).padStart(2, "0")}`;
+}
+
+function eachLocalDay(fromIso: string, toIso: string): { key: string; label: string }[] {
+  const end = new Date(toIso).getTime();
+  const cursor = new Date(fromIso);
+  cursor.setHours(0, 0, 0, 0);
+  const days: { key: string; label: string }[] = [];
+  while (cursor.getTime() < end && days.length < 4000) {
+    const key = localDayKey(cursor.getTime());
+    days.push({ key, label: dayLabel(key) });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  if (days.length === 0) {
+    const key = localDayKey(new Date(fromIso).getTime());
+    days.push({ key, label: dayLabel(key) });
+  }
+  return days;
+}
+
+function localDayKey(ms: number): string {
+  const date = new Date(ms);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function dayLabel(key: string): string {
+  const [year, month, day] = key.split("-").map(Number);
+  return new Intl.DateTimeFormat("es", { day: "numeric", month: "short" }).format(
+    new Date(year, (month || 1) - 1, day || 1),
+  );
 }
 
 export async function recordSale(input: {
@@ -595,9 +682,7 @@ export async function recordSale(input: {
   }
 }
 
-export async function loadFanNote(externalKey: string, fanPlatformId: string): Promise<string> {
-  const modelId = await modelIdByKey(externalKey);
-  if (!modelId) return "";
+export async function loadFanNote(modelId: string, fanPlatformId: string): Promise<string> {
   const { data, error } = await supabase
     .from("fan_notes")
     .select("notes")
@@ -609,17 +694,16 @@ export async function loadFanNote(externalKey: string, fanPlatformId: string): P
 }
 
 export async function saveFanNote(input: {
-  externalKey: string;
+  modelId: string;
   fanPlatformId: string;
   fanUsername: string;
   notes: string;
 }): Promise<void> {
-  const [modelId, profile] = await Promise.all([modelIdByKey(input.externalKey), loadMyProfile()]);
-  if (!modelId) throw new Error("La modelo todavía no está en Supabase. Un owner o admin debe abrir la app para sincronizarla.");
+  const profile = await loadMyProfile();
   if (!profile) throw new Error("Inicia sesión para guardar notas");
   const { error } = await supabase.from("fan_notes").upsert(
     {
-      model_id: modelId,
+      model_id: input.modelId,
       fan_platform_id: input.fanPlatformId,
       fan_username: input.fanUsername,
       notes: input.notes,
@@ -632,29 +716,23 @@ export async function saveFanNote(input: {
 }
 
 export function subscribeFanNote(
-  externalKey: string,
+  modelId: string,
   fanPlatformId: string,
   onNotes: (notes: string) => void,
 ): () => void {
-  let active = true;
-  let channel: ReturnType<typeof supabase.channel> | null = null;
-  void modelIdByKey(externalKey).then((modelId) => {
-    if (!active || !modelId) return;
-    channel = supabase
-      .channel(`fan-note-${modelId}-${fanPlatformId}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "fan_notes", filter: `model_id=eq.${modelId}` },
-        (payload) => {
-          const next = payload.new as { fan_platform_id?: string; notes?: string } | null;
-          if (next?.fan_platform_id === fanPlatformId) onNotes(next.notes ?? "");
-        },
-      )
-      .subscribe();
-  });
+  const channel = supabase
+    .channel(`fan-note-${modelId}-${fanPlatformId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "fan_notes", filter: `model_id=eq.${modelId}` },
+      (payload) => {
+        const next = payload.new as { fan_platform_id?: string; notes?: string } | null;
+        if (next?.fan_platform_id === fanPlatformId) onNotes(next.notes ?? "");
+      },
+    )
+    .subscribe();
   return () => {
-    active = false;
-    if (channel) void supabase.removeChannel(channel);
+    void supabase.removeChannel(channel);
   };
 }
 

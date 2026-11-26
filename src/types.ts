@@ -1,3 +1,5 @@
+import { shiftLabel } from "./shifts";
+
 export type EmployeeRole = "Owner" | "Admin" | "Chatter" | "Dropper";
 
 export type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
@@ -9,17 +11,8 @@ export type ScheduleDay = {
   end: string;
 };
 
-export type Employee = {
-  id: number;
-  name: string;
-  role: EmployeeRole;
-  schedule_json: unknown;
-  is_clocked_in: boolean;
-  last_clock_in: string | null;
-};
-
 export type Model = {
-  id: number;
+  id: string;
   of_user_id: string | null;
   username: string;
   display_name: string;
@@ -28,6 +21,7 @@ export type Model = {
   pending_balance: number;
   last_synced_at: string | null;
   partition_id: string;
+  fans_count?: number | null;
   window_open: boolean;
 };
 
@@ -83,7 +77,7 @@ export function summarizeSchedule(days: ScheduleDay[]): string {
   return active
     .map((day) => {
       const label = WEEKDAYS.find((item) => item.day === day.day)?.label ?? day.day;
-      return `${label} ${day.start}–${day.end}`;
+      return `${label} ${shiftLabel(day.start, day.end) ?? `${day.start}–${day.end}`}`;
     })
     .join(", ");
 }
@@ -106,8 +100,15 @@ export function initials(label: string): string {
 
 const AVATAR_COLORS = ["#1d4ed8", "#c2410c", "#334155", "#1e3a8a", "#9a3412"];
 
-export function avatarColor(id: number): string {
-  return AVATAR_COLORS[Math.abs(id) % AVATAR_COLORS.length];
+export function avatarColor(id: string | number): string {
+  if (typeof id === "number") {
+    return AVATAR_COLORS[Math.abs(id) % AVATAR_COLORS.length];
+  }
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) {
+    hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  }
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 }
 
 export function formatStamp(value: string | null): string {

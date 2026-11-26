@@ -1,27 +1,24 @@
 import { listen } from "@tauri-apps/api/event";
 import { FileText, PanelRightClose, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
-import { errorMessage, openIncomingChat, getModels, setInsightsOpen } from "./api";
+import { errorMessage, openIncomingChat, setInsightsOpen } from "./api";
 import { NotificationToastStack } from "./Notifications";
-import { loadFanNote, modelExternalKey, saveFanNote, subscribeFanNote, syncAgencyModels } from "./agency";
+import { loadFanNote, saveFanNote, subscribeFanNote } from "./agency";
 
-export function FanInsightsPanel({ modelId }: { modelId: number }) {
+export function FanInsightsPanel({ modelId }: { modelId: string }) {
   const [ofFanId, setOfFanId] = useState("");
   const [notes, setNotes] = useState("");
-  const [externalKey, setExternalKey] = useState<string | null>(() =>
-    window.__CF_PARTITION_ID__ ? modelExternalKey({ partition_id: window.__CF_PARTITION_ID__ }) : null,
-  );
   const [error, setError] = useState<string | null>(null);
   const [savedNoteSuccess, setSavedNoteSuccess] = useState(false);
 
   useEffect(() => {
     const stops: { current: Array<() => void> } = { current: [] };
     let alive = true;
-    const onFan = (event: { payload: { modelId: number; ofFanId: string } }) => {
+    const onFan = (event: { payload: { modelId: string; ofFanId: string } }) => {
       if (event.payload.modelId !== modelId || !event.payload.ofFanId) return;
       setOfFanId(event.payload.ofFanId);
     };
-    void listen<{ modelId: number; ofFanId: string }>("fan-selected", onFan)
+    void listen<{ modelId: string; ofFanId: string }>("fan-selected", onFan)
       .then((stop) => {
         if (alive) stops.current.push(stop);
         else stop();
@@ -34,28 +31,12 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
   }, [modelId]);
 
   useEffect(() => {
-    let alive = true;
-    void getModels()
-      .then(async (models) => {
-        if (!alive) return;
-        const model = models.find((item) => item.id === modelId);
-        if (!model?.partition_id) return;
-        setExternalKey(modelExternalKey(model));
-        await syncAgencyModels([model]);
-      })
-      .catch(() => undefined);
-    return () => {
-      alive = false;
-    };
-  }, [modelId]);
-
-  useEffect(() => {
-    if (!externalKey || !ofFanId) {
+    if (!modelId || !ofFanId) {
       if (!ofFanId) setNotes("");
       return;
     }
     let alive = true;
-    void loadFanNote(externalKey, ofFanId)
+    void loadFanNote(modelId, ofFanId)
       .then((remote) => {
         if (alive) setNotes(remote);
       })
@@ -63,12 +44,12 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
     return () => {
       alive = false;
     };
-  }, [externalKey, ofFanId]);
+  }, [modelId, ofFanId]);
 
   useEffect(() => {
-    if (!externalKey || !ofFanId) return;
-    return subscribeFanNote(externalKey, ofFanId, setNotes);
-  }, [externalKey, ofFanId]);
+    if (!modelId || !ofFanId) return;
+    return subscribeFanNote(modelId, ofFanId, setNotes);
+  }, [modelId, ofFanId]);
 
   useEffect(() => {
     setOfFanId("");
@@ -78,37 +59,12 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
   async function persistNotes() {
     if (!ofFanId) return;
     try {
-      let key = externalKey;
-      if (!key) {
-        const models = await getModels();
-        const model = models.find((item) => item.id === modelId);
-        if (!model?.partition_id) {
-          throw new Error("No se encontró la modelo en esta sesión");
-        }
-        await syncAgencyModels([model]);
-        key = modelExternalKey(model);
-        setExternalKey(key);
-      }
-      try {
-        await saveFanNote({
-          externalKey: key,
-          fanPlatformId: ofFanId,
-          fanUsername: "",
-          notes,
-        });
-      } catch (caught) {
-        if (!/todavía no está en Supabase/i.test(errorMessage(caught))) throw caught;
-        const models = await getModels();
-        const model = models.find((item) => item.id === modelId);
-        if (!model) throw caught;
-        await syncAgencyModels([model]);
-        await saveFanNote({
-          externalKey: key,
-          fanPlatformId: ofFanId,
-          fanUsername: "",
-          notes,
-        });
-      }
+      await saveFanNote({
+        modelId,
+        fanPlatformId: ofFanId,
+        fanUsername: "",
+        notes,
+      });
       setSavedNoteSuccess(true);
       setTimeout(() => setSavedNoteSuccess(false), 2500);
       setError(null);
@@ -123,7 +79,7 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
       style={{
         background: "var(--bg)",
         color: "var(--text-primary)",
-        fontFamily: "Satoshi, sans-serif",
+        fontFamily: "var(--font-ui)",
       }}
     >
       <NotificationToastStack
@@ -166,7 +122,7 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
         <div
           role="alert"
           className="m-3 rounded-lg px-3 py-2 text-xs"
-          style={{ background: "#fef2f2", color: "#b91c1c", border: "1px solid #fecaca" }}
+          style={{ background: "var(--danger-bg)", color: "var(--danger)", border: "1px solid var(--danger-border)" }}
         >
           {error}
         </div>
@@ -195,7 +151,7 @@ export function FanInsightsPanel({ modelId }: { modelId: number }) {
         />
         <div className="flex items-center justify-between gap-2">
           {savedNoteSuccess ? (
-            <span className="text-xs font-semibold" style={{ color: "#059669" }}>
+            <span className="text-xs font-semibold" style={{ color: "var(--success-text)" }}>
               Guardado
             </span>
           ) : (

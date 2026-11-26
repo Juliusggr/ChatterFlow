@@ -6,8 +6,8 @@
   "permissions": [
     "core:default",
     "core:event:default",
+    "allow-set-supabase-session",
     "allow-get-models",
-    "allow-save-fan-notes",
     "allow-open-messages",
     "allow-select-message-tab",
     "allow-get-recent-notifications",

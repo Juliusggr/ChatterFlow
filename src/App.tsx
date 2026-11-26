@@ -25,7 +25,7 @@ import {
   type MessageBarPlacement,
   type MessageTabsState,
 } from "./api";
-import { assignedModelKeys, isManager, modelExternalKey, recordSale, signOut, syncAgencyModels, type AgencyProfile } from "./agency";
+import { isManager, modelExternalKey, recordSale, signOut, type AgencyProfile } from "./agency";
 import { AuthGate } from "./AuthGate";
 import { AnalyticsView } from "./AnalyticsView";
 import { DashboardView } from "./DashboardView";
@@ -38,6 +38,7 @@ import {
   type ToastBanner,
 } from "./Notifications";
 import { TeamsView } from "./TeamsView";
+import { syncDropperShiftRecords } from "./reports/data";
 import { avatarColor, initials, modelLabel, type Model } from "./types";
 
 type Section = "dashboard" | "teams" | "models" | "messages" | "analytics";
@@ -87,7 +88,7 @@ export function App() {
 declare global {
   interface Window {
     __CF_VIEW__?: string;
-    __CF_MODEL_ID__?: number;
+    __CF_MODEL_ID__?: string;
     __CF_PARTITION_ID__?: string;
   }
 }
@@ -99,24 +100,17 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
   const [section, setSection] = useState<Section>("dashboard");
   const [navOpen, setNavOpen] = useState(() => window.innerWidth >= 1100);
   const [models, setModels] = useState<Model[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dark, toggleDark] = useDarkMode();
   const [barPlacement, setBarPlacement] = useState<MessageBarPlacement>("top");
-  const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [loginBanners, setLoginBanners] = useState<ToastBanner[]>([]);
 
   const reload = useCallback(async () => {
     try {
-      const [nextModels, tabsState] = await Promise.all([getModels(), getMessageTabs()]);
-      let visible = nextModels;
-      if (canManage) {
-        await syncAgencyModels(nextModels);
-      } else {
-        const keys = await assignedModelKeys();
-        visible = nextModels.filter((model) => keys.has(modelExternalKey(model)));
-      }
+      const [visible, tabsState] = await Promise.all([getModels(), getMessageTabs()]);
       setModels(visible);
       setBarPlacement(tabsState.barPlacement ?? "top");
       setUnreadCounts(tabsState.unreadCounts ?? {});
@@ -128,7 +122,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
     } catch (caught) {
       setError(errorMessage(caught));
     }
-  }, [canManage]);
+  }, []);
 
   useEffect(() => { void reload(); }, [reload]);
 
@@ -143,6 +137,24 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       setSection("dashboard");
     }
   }, [canManage, canOpenMessages, section]);
+
+  useEffect(() => {
+    if (profile.role !== "dropper" && !canManage) return;
+    let alive = true;
+    let stop = () => {};
+    void listen("dropper-activity-changed", () => {
+      if (alive) void syncDropperShiftRecords();
+    })
+      .then((unlisten) => {
+        if (alive) stop = unlisten;
+        else unlisten();
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+      stop();
+    };
+  }, [profile.role, canManage]);
 
   useEffect(() => {
     if (profile.role === "dropper") return;
@@ -202,7 +214,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       })
       .catch(() => undefined);
 
-    void listen<Record<number, number>>("unread-counts-changed", (event) => {
+    void listen<Record<string, number>>("unread-counts-changed", (event) => {
       if (!alive || !event.payload) return;
       setUnreadCounts(event.payload);
     })
@@ -246,14 +258,14 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
     };
   }, [reload]);
 
-  const handleOpenModelChat = useCallback((modelId: number) => {
+  const handleOpenModelChat = useCallback((modelId: string) => {
     if (!canOpenMessages) return;
     setSelectedModelId(modelId);
     setSection("messages");
     void openMessages(modelId).catch((caught) => setError(errorMessage(caught)));
   }, [canOpenMessages]);
 
-  const handleOpenChat = useCallback((modelId: number, ofFanId: string) => {
+  const handleOpenChat = useCallback((modelId: string, ofFanId: string) => {
     if (!canOpenMessages) return;
     setSelectedModelId(modelId);
     setSection("messages");
@@ -274,9 +286,9 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       try {
         const unlisten = await onAction((event) => {
           const extra = event.notification?.extra ?? {};
-          const modelId = Number(extra.modelId);
+          const modelId = typeof extra.modelId === "string" ? extra.modelId.trim() : "";
           const ofFanId = typeof extra.ofFanId === "string" ? extra.ofFanId : "";
-          if (canOpenMessages && Number.isFinite(modelId) && modelId > 0) {
+          if (canOpenMessages && modelId) {
             setSelectedModelId(modelId);
             setSection("messages");
             void openIncomingChat(modelId, ofFanId);
@@ -336,25 +348,26 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       <aside
         className={`flex shrink-0 flex-col transition-[width] duration-200 ease-out ${navOpen ? "w-60" : "w-[4.5rem]"}`}
         style={{
-          background: "var(--bg-elevated)",
-          borderRight: "1px solid var(--border)",
+          background: "var(--nav-bg)",
+          borderRight: "1px solid var(--nav-border)",
+          color: "var(--nav-text)",
         }}
       >
         {/* Logo / toggle */}
         <div
           className={`flex items-center gap-3 px-3 py-4 ${navOpen ? "" : "justify-center"}`}
-          style={{ borderBottom: "1px solid var(--border-muted)" }}
+          style={{ borderBottom: "1px solid var(--nav-border)" }}
         >
           <button
             type="button"
             className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors"
-            style={{ color: "var(--text-secondary)" }}
+            style={{ color: "var(--nav-text)" }}
             aria-expanded={navOpen}
             aria-controls="app-nav"
             aria-label={navOpen ? "Contraer menú" : "Expandir menú"}
             onClick={() => setNavOpen((open) => !open)}
             onMouseEnter={(e) => {
-              (e.currentTarget as HTMLButtonElement).style.background = "var(--bg-subtle)";
+              (e.currentTarget as HTMLButtonElement).style.background = "var(--nav-hover)";
             }}
             onMouseLeave={(e) => {
               (e.currentTarget as HTMLButtonElement).style.background = "transparent";
@@ -368,7 +381,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
             </svg>
           </button>
           {navOpen && (
-            <span className="truncate text-sm font-semibold tracking-tight" style={{ color: "var(--text-primary)" }}>
+            <span className="truncate text-sm font-semibold tracking-tight" style={{ color: "#fff" }}>
               CreatorFloww
             </span>
           )}
@@ -389,19 +402,19 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
                 className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition-colors ${navOpen ? "" : "justify-center px-0"} ${active ? "cf-nav-active" : ""}`}
                 style={
                   !active
-                    ? { color: "var(--text-secondary)" }
+                    ? { color: "var(--nav-text)" }
                     : undefined
                 }
                 onMouseEnter={(e) => {
                   if (!active) {
-                    (e.currentTarget as HTMLButtonElement).style.background = "var(--bg-subtle)";
-                    (e.currentTarget as HTMLButtonElement).style.color = "var(--text-primary)";
+                    (e.currentTarget as HTMLButtonElement).style.background = "var(--nav-hover)";
+                    (e.currentTarget as HTMLButtonElement).style.color = "#fff";
                   }
                 }}
                 onMouseLeave={(e) => {
                   if (!active) {
                     (e.currentTarget as HTMLButtonElement).style.background = "transparent";
-                    (e.currentTarget as HTMLButtonElement).style.color = "var(--text-secondary)";
+                    (e.currentTarget as HTMLButtonElement).style.color = "var(--nav-text)";
                   }
                 }}
                 onClick={() => setSection(item.id)}
@@ -416,12 +429,12 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
         {/* Notifications & Dark mode controls at bottom */}
         <div
           className={`flex flex-col gap-1.5 p-2 pb-4 ${navOpen ? "px-3" : "items-center"}`}
-          style={{ borderTop: "1px solid var(--border-muted)" }}
+          style={{ borderTop: "1px solid var(--nav-border)" }}
         >
           <button
             type="button"
             className={`flex items-center gap-3 rounded-lg px-3 py-2 text-left text-sm ${navOpen ? "" : "justify-center px-0"}`}
-            style={{ color: "var(--text-secondary)" }}
+            style={{ color: "var(--nav-text)" }}
             onClick={() => void signOut()}
           >
             {navOpen ? <span className="truncate">{profile.username}</span> : null}
@@ -435,20 +448,20 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
               aria-label={dark ? "Modo claro" : "Modo oscuro"}
               title={dark ? "Modo claro" : "Modo oscuro"}
               className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors"
-              style={{ color: "var(--text-tertiary)" }}
+              style={{ color: "var(--nav-text)" }}
               onMouseEnter={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.background = "var(--bg-subtle)";
-                (e.currentTarget as HTMLButtonElement).style.color = "var(--text-primary)";
+                (e.currentTarget as HTMLButtonElement).style.background = "var(--nav-hover)";
+                (e.currentTarget as HTMLButtonElement).style.color = "#fff";
               }}
               onMouseLeave={(e) => {
                 (e.currentTarget as HTMLButtonElement).style.background = "transparent";
-                (e.currentTarget as HTMLButtonElement).style.color = "var(--text-tertiary)";
+                (e.currentTarget as HTMLButtonElement).style.color = "var(--nav-text)";
               }}
             >
               {dark ? <Sun size={16} strokeWidth={1.75} /> : <Moon size={16} strokeWidth={1.75} />}
             </button>
             {navOpen && (
-              <span className="ml-1 self-center text-xs" style={{ color: "var(--text-tertiary)" }}>
+              <span className="ml-1 self-center text-xs" style={{ color: "var(--nav-muted)" }}>
                 {dark ? "Modo claro" : "Modo oscuro"}
               </span>
             )}
@@ -457,23 +470,29 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       </aside>
 
       {/* Main content */}
-      <main className="min-w-0 flex-1 overflow-auto">
+      <main
+        className="min-w-0 flex-1 overflow-auto"
+        style={section === "analytics" ? { background: "var(--report-canvas)" } : undefined}
+      >
+        {loaded && section === "analytics" ? (
+          <AnalyticsView />
+        ) : (
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
           {error ? (
             <div
               role="alert"
               className="flex flex-wrap items-center justify-between gap-3 rounded-xl px-4 py-3 text-sm"
               style={{
-                background: "#fef2f2",
-                border: "1px solid #fecaca",
-                color: "#b91c1c",
+                background: "var(--danger-bg)",
+                border: "1px solid var(--danger-border)",
+                color: "var(--danger)",
               }}
             >
               <p>{error}</p>
               <button
                 type="button"
                 className="cf-btn-secondary text-xs"
-                style={{ color: "#b91c1c", borderColor: "#fca5a5" }}
+                style={{ color: "var(--danger)", borderColor: "var(--danger-border)" }}
                 onClick={() => void reload()}
               >
                 Reintentar
@@ -512,10 +531,8 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
               onOpen={handleOpenModelChat}
             />
           ) : null}
-          {loaded && section === "analytics" ? (
-            <AnalyticsView models={models} canDeleteShifts={profile.role === "owner"} />
-          ) : null}
         </div>
+        )}
       </main>
     </div>
   );
@@ -531,9 +548,9 @@ function MessagesSection({
 }: {
   models: Model[];
   barPlacement: MessageBarPlacement;
-  unreadCounts: Record<number, number>;
+  unreadCounts: Record<string, number>;
   onChangePlacement: (placement: MessageBarPlacement) => void;
-  onOpen: (modelId: number) => void;
+  onOpen: (modelId: string) => void;
 }) {
   return (
     <section className="flex flex-col gap-5">
@@ -601,7 +618,7 @@ function MessagesSection({
         <div className="cf-card flex max-w-sm flex-col items-center justify-center gap-3 py-16 text-center">
           <MessageSquare size={32} strokeWidth={1.25} style={{ color: "var(--text-disabled)" }} />
           <p className="text-sm font-medium" style={{ color: "var(--text-secondary)" }}>
-            No hay modelos en SQLite.
+            No hay modelos disponibles.
           </p>
         </div>
       ) : (
@@ -658,17 +675,17 @@ function ModelRail({
   onSelect,
 }: {
   models: Model[];
-  selectedModelId: number | null;
-  unreadCounts: Record<number, number>;
+  selectedModelId: string | null;
+  unreadCounts: Record<string, number>;
   onOpenModels: () => void;
-  onSelect: (id: number) => void;
+  onSelect: (id: string) => void;
 }) {
   return (
     <aside
       className="flex w-[3.75rem] shrink-0 flex-col items-center px-2 py-3 gap-1"
       style={{
-        background: "var(--bg-elevated)",
-        borderRight: "1px solid var(--border)",
+        background: "var(--nav-bg)",
+        borderRight: "1px solid var(--nav-border)",
       }}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-2 overflow-y-auto pb-2">
@@ -711,19 +728,19 @@ function ModelRail({
           type="button"
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-dashed transition-colors"
           style={{
-            borderColor: "var(--border)",
-            color: "var(--text-tertiary)",
+            borderColor: "var(--nav-text)",
+            color: "var(--nav-text)",
           }}
           aria-label="Ir a Modelos"
           title="Modelos"
           onClick={onOpenModels}
           onMouseEnter={(e) => {
-            (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--brand-400)";
-            (e.currentTarget as HTMLButtonElement).style.color = "var(--brand-600)";
+            (e.currentTarget as HTMLButtonElement).style.borderColor = "#fff";
+            (e.currentTarget as HTMLButtonElement).style.color = "#fff";
           }}
           onMouseLeave={(e) => {
-            (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)";
-            (e.currentTarget as HTMLButtonElement).style.color = "var(--text-tertiary)";
+            (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--nav-text)";
+            (e.currentTarget as HTMLButtonElement).style.color = "var(--nav-text)";
           }}
         >
           <Plus size={16} strokeWidth={2} />

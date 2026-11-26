@@ -9,6 +9,7 @@ import {
   type AgencyEmployee,
   type AgencyRole,
 } from "./agency";
+import { shiftsForRole } from "./shifts";
 import { blankSchedule, modelLabel, summarizeSchedule, WEEKDAYS, type Model, type ScheduleDay } from "./types";
 
 const ROLES: AgencyRole[] = ["owner", "admin", "chatter", "dropper"];
@@ -19,11 +20,11 @@ type Draft = {
   name: string;
   role: AgencyRole | "";
   days: ScheduleDay[];
-  modelKeys: string[];
+  modelIds: string[];
 };
 
 function emptyDraft(): Draft {
-  return { username: "", password: "", name: "", role: "", days: blankSchedule(), modelKeys: [] };
+  return { username: "", password: "", name: "", role: "", days: blankSchedule(), modelIds: [] };
 }
 
 export function TeamsView({ models }: { models: Model[] }) {
@@ -67,7 +68,7 @@ export function TeamsView({ models }: { models: Model[] }) {
       name: employee.name,
       role: employee.role,
       days: employee.days,
-      modelKeys: employee.modelKeys,
+      modelIds: employee.modelIds,
     });
   }
 
@@ -95,7 +96,7 @@ export function TeamsView({ models }: { models: Model[] }) {
         role: draft.role,
         isActive: true,
         days: draft.days,
-        modelKeys: draft.modelKeys,
+        modelIds: draft.modelIds,
       });
       setDraft(emptyDraft());
       setEditingId(null);
@@ -182,9 +183,20 @@ export function TeamsView({ models }: { models: Model[] }) {
               value={draft.role}
               required
               className="cf-input"
-              onChange={(event) =>
-                setDraft((current) => ({ ...current, role: event.target.value as AgencyRole | "" }))
-              }
+              onChange={(event) => {
+                const role = event.target.value as AgencyRole | "";
+                setDraft((current) => ({
+                  ...current,
+                  role,
+                  days: current.days.map((day) => {
+                    const shifts = shiftsForRole(role);
+                    if (!shifts) return day;
+                    const match = shifts.some((shift) => shift.start === day.start && shift.end === day.end);
+                    if (day.enabled && match) return day;
+                    return { ...day, enabled: false, start: "", end: "" };
+                  }),
+                }));
+              }}
             >
               <option value="">Selecciona un rol</option>
               {ROLES.map((role) => (
@@ -196,7 +208,6 @@ export function TeamsView({ models }: { models: Model[] }) {
           </label>
         </div>
 
-        {draft.role === "owner" || draft.role === "admin" ? null : (
         <fieldset className="mt-6">
           <legend className="mb-3 text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
             Horario semanal
@@ -204,10 +215,11 @@ export function TeamsView({ models }: { models: Model[] }) {
           <div className="grid gap-2 sm:grid-cols-2">
             {draft.days.map((day, index) => {
               const label = WEEKDAYS.find((item) => item.day === day.day)?.label ?? day.day;
+              const shifts = shiftsForRole(draft.role);
               return (
                 <div
                   key={day.day}
-                  className="grid grid-cols-[auto_5.5rem_1fr_1fr] items-center gap-2 rounded-lg px-3 py-2"
+                  className={`grid items-center gap-2 rounded-lg px-3 py-2 ${shifts ? "grid-cols-[auto_5.5rem_1fr]" : "grid-cols-[auto_5.5rem_1fr_1fr]"}`}
                   style={{
                     border: "1px solid var(--border)",
                     background: day.enabled ? "var(--bg-elevated)" : "var(--bg-subtle)",
@@ -222,28 +234,54 @@ export function TeamsView({ models }: { models: Model[] }) {
                   <span className="text-sm font-medium" style={{ color: day.enabled ? "var(--text-primary)" : "var(--text-disabled)" }}>
                     {label}
                   </span>
-                  <input
-                    type="time"
-                    value={day.start}
-                    disabled={!day.enabled}
-                    aria-label={`Inicio ${label}`}
-                    className="cf-input min-w-0"
-                    onChange={(event) => updateDay(index, { start: event.target.value })}
-                  />
-                  <input
-                    type="time"
-                    value={day.end}
-                    disabled={!day.enabled}
-                    aria-label={`Fin ${label}`}
-                    className="cf-input min-w-0"
-                    onChange={(event) => updateDay(index, { end: event.target.value })}
-                  />
+                  {shifts ? (
+                    <select
+                      value={shifts.some((shift) => shift.start === day.start && shift.end === day.end) ? `${day.start}|${day.end}` : ""}
+                      disabled={!day.enabled}
+                      aria-label={`Turno ${label}`}
+                      className="cf-input min-w-0"
+                      onChange={(event) => {
+                        const [start, end] = event.target.value.split("|");
+                        if (!start || !end) return;
+                        updateDay(index, { start, end });
+                      }}
+                    >
+                      <option value="" disabled>Elige un turno</option>
+                      {(["Droppers", "Chatters"] as const).filter((group) => shifts.some((shift) => shift.group === group)).map((group) => (
+                        <optgroup key={group} label={group}>
+                          {shifts.filter((shift) => shift.group === group).map((shift) => (
+                            <option key={`${shift.start}-${shift.end}`} value={`${shift.start}|${shift.end}`}>
+                              {shift.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                  ) : (
+                    <>
+                      <input
+                        type="time"
+                        value={day.start}
+                        disabled={!day.enabled}
+                        aria-label={`Inicio ${label}`}
+                        className="cf-input min-w-0"
+                        onChange={(event) => updateDay(index, { start: event.target.value })}
+                      />
+                      <input
+                        type="time"
+                        value={day.end}
+                        disabled={!day.enabled}
+                        aria-label={`Fin ${label}`}
+                        className="cf-input min-w-0"
+                        onChange={(event) => updateDay(index, { end: event.target.value })}
+                      />
+                    </>
+                  )}
                 </div>
               );
             })}
           </div>
         </fieldset>
-        )}
 
         {assignable ? (
           <fieldset className="mt-6">
@@ -256,33 +294,30 @@ export function TeamsView({ models }: { models: Model[] }) {
                   Todavía no hay modelos sincronizadas.
                 </p>
               ) : (
-                models.map((model) => {
-                  const key = `partition:${model.partition_id}`;
-                  return (
-                    <label key={model.id} className="flex items-center gap-2 text-sm" style={{ color: "var(--text-primary)" }}>
-                      <input
-                        type="checkbox"
-                        checked={draft.modelKeys.includes(key)}
-                        onChange={(event) =>
-                          setDraft((current) => ({
-                            ...current,
-                            modelKeys: event.target.checked
-                              ? [...current.modelKeys, key]
-                              : current.modelKeys.filter((item) => item !== key),
-                          }))
-                        }
-                      />
-                      {modelLabel(model)}
-                    </label>
-                  );
-                })
+                models.map((model) => (
+                  <label key={model.id} className="flex items-center gap-2 text-sm" style={{ color: "var(--text-primary)" }}>
+                    <input
+                      type="checkbox"
+                      checked={draft.modelIds.includes(model.id)}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          modelIds: event.target.checked
+                            ? [...current.modelIds, model.id]
+                            : current.modelIds.filter((item) => item !== model.id),
+                        }))
+                      }
+                    />
+                    {modelLabel(model)}
+                  </label>
+                ))
               )}
             </div>
           </fieldset>
         ) : null}
 
         {formError ? (
-          <p role="alert" className="mt-4 text-sm" style={{ color: "#b91c1c" }}>
+          <p role="alert" className="mt-4 text-sm" style={{ color: "var(--danger)" }}>
             {formError}
           </p>
         ) : null}
@@ -368,11 +403,20 @@ function validateDraft(draft: Draft, editing: boolean): string | null {
   if (!editing && draft.password.length < 6) return "La contraseña debe tener al menos 6 caracteres.";
   if (draft.name.trim() === "") return "El nombre es obligatorio.";
   if (!draft.role) return "Selecciona un rol.";
-  if (draft.role === "owner" || draft.role === "admin") return null;
+  const shifts = shiftsForRole(draft.role);
+  const optionalSchedule = draft.role === "owner" || draft.role === "admin";
   for (const day of draft.days) {
     if (!day.enabled) continue;
     const label = WEEKDAYS.find((item) => item.day === day.day)?.label ?? day.day;
-    if (!day.start || !day.end) return `Indica inicio y fin para ${label}.`;
+    if (shifts) {
+      const match = shifts.some((shift) => shift.start === day.start && shift.end === day.end);
+      if (!match && !optionalSchedule) return `Elige un turno para ${label}.`;
+      continue;
+    }
+    if (!day.start || !day.end) {
+      if (optionalSchedule) continue;
+      return `Indica inicio y fin para ${label}.`;
+    }
     if (day.start >= day.end) return `La hora de inicio de ${label} debe ser anterior a la de fin.`;
   }
   return null;

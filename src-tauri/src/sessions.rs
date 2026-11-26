@@ -1,11 +1,12 @@
-﻿use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-use crate::db::{Database, Model};
+use crate::supabase::{Model, SupabaseStore};
 use crate::sync::{ingest_body, IngestOutcome};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,11 +33,11 @@ pub enum MessageBarPlacement {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageTabsState {
-    pub open_model_ids: Vec<i64>,
-    pub active_model_id: Option<i64>,
+    pub open_model_ids: Vec<String>,
+    pub active_model_id: Option<String>,
     pub bar_placement: MessageBarPlacement,
     pub insights_open: bool,
-    pub unread_counts: std::collections::HashMap<i64, u32>,
+    pub unread_counts: HashMap<String, u32>,
 }
 
 impl Default for MessageTabsState {
@@ -46,7 +47,7 @@ impl Default for MessageTabsState {
             active_model_id: None,
             bar_placement: MessageBarPlacement::default(),
             insights_open: true,
-            unread_counts: std::collections::HashMap::new(),
+            unread_counts: HashMap::new(),
         }
     }
 }
@@ -84,21 +85,41 @@ fn hub_rest() -> &'static Mutex<HubRest> {
     REST.get_or_init(|| Mutex::new(HubRest { x: 120, y: 80, parked: false }))
 }
 
-fn viewing_fans() -> &'static Mutex<std::collections::HashMap<i64, String>> {
-    static FANS: std::sync::OnceLock<Mutex<std::collections::HashMap<i64, String>>> =
-        std::sync::OnceLock::new();
-    FANS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn known_model_ids() -> &'static Mutex<HashSet<String>> {
+    static KNOWN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-pub fn note_viewing_fan(model_id: i64, of_fan_id: &str) {
+fn remember_model_id(model_id: &str) {
+    if !model_id.trim().is_empty() {
+        known_model_ids()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(model_id.to_owned());
+    }
+}
+
+fn forget_model_id(model_id: &str) {
+    known_model_ids()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(model_id);
+}
+
+fn viewing_fans() -> &'static Mutex<HashMap<String, String>> {
+    static FANS: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    FANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn note_viewing_fan(model_id: &str, of_fan_id: &str) {
     let fan = of_fan_id.trim().trim_start_matches(['u', 'U']);
-    if fan.is_empty() {
+    if fan.is_empty() || model_id.trim().is_empty() {
         return;
     }
     viewing_fans()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .insert(model_id, fan.to_owned());
+        .insert(model_id.to_owned(), fan.to_owned());
 }
 
 fn current_live_focus() -> Option<crate::notifications::LiveFocus> {
@@ -108,7 +129,8 @@ fn current_live_focus() -> Option<crate::notifications::LiveFocus> {
     let active = messages_hub_state()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .active_model_id?;
+        .active_model_id
+        .clone()?;
     let fan = viewing_fans()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -128,20 +150,18 @@ fn place_webview(view: &tauri::Webview, x: f64, y: f64, width: f64, height: f64)
 }
 
 fn park_of_webview(view: &tauri::Webview) {
-    // Real viewport inside the parked hub. A 4×4 webview never boots OnlyFans,
-    // so the signed client stays null and no account is polled.
     place_webview(view, 0.0, 0.0, 1100.0, 760.0);
 }
 
 fn park_every_of_webview(app: &AppHandle) {
-    let Some(database) = app.try_state::<Database>() else {
-        return;
-    };
-    let Ok(models) = database.list_models() else {
-        return;
-    };
-    for model in models {
-        if let Some(view) = app.get_webview(&messages_of_label(model.id)) {
+    let ids: Vec<String> = known_model_ids()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    for id in ids {
+        if let Some(view) = app.get_webview(&messages_of_label(&id)) {
             park_of_webview(&view);
         }
     }
@@ -177,6 +197,7 @@ fn reveal_messages_hub(window: &tauri::Window) {
     let _ = window.set_skip_taskbar(false);
     let _ = window.show();
 }
+
 #[cfg(target_os = "windows")]
 const FAST_WEBVIEW_ARGS: &str =
     "--no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=TranslateUI,msSmartScreenProtection,IntensiveWakeUpThrottling,CalculateNativeWinOcclusion";
@@ -186,29 +207,28 @@ fn messages_hub_state() -> &'static Mutex<MessageTabsState> {
     STATE.get_or_init(|| Mutex::new(MessageTabsState::default()))
 }
 
-fn model_aliases() -> &'static Mutex<std::collections::HashMap<i64, i64>> {
-    static ALIASES: std::sync::OnceLock<Mutex<std::collections::HashMap<i64, i64>>> =
-        std::sync::OnceLock::new();
-    ALIASES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn model_aliases() -> &'static Mutex<HashMap<String, String>> {
+    static ALIASES: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    ALIASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_model_alias(from_id: i64, to_id: i64) {
+fn register_model_alias(from_id: &str, to_id: &str) {
     if from_id == to_id {
         return;
     }
     model_aliases()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .insert(from_id, to_id);
+        .insert(from_id.to_owned(), to_id.to_owned());
 }
 
-fn resolve_model_alias(model_id: i64) -> i64 {
+fn resolve_model_alias(model_id: &str) -> String {
     model_aliases()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .get(&model_id)
-        .copied()
-        .unwrap_or(model_id)
+        .get(model_id)
+        .cloned()
+        .unwrap_or_else(|| model_id.to_owned())
 }
 
 pub fn warm_session_environment(app: &AppHandle) {
@@ -244,7 +264,7 @@ fn persist_ui_preferences(app: &AppHandle) {
     }
 }
 
-pub fn set_message_bar_placement(
+pub async fn set_message_bar_placement(
     app: &AppHandle,
     placement: MessageBarPlacement,
 ) -> Result<MessageTabsState, String> {
@@ -256,11 +276,12 @@ pub fn set_message_bar_placement(
     }
     persist_ui_preferences(app);
     layout_messages_hub(app);
-    emit_tabs_changed(app);
-    Ok(get_message_tabs(app))
+    let snapshot = get_message_tabs(app).await;
+    let _ = app.emit("message-tabs-changed", &snapshot);
+    Ok(snapshot)
 }
 
-pub fn set_insights_open(app: &AppHandle, open: bool) -> Result<MessageTabsState, String> {
+pub async fn set_insights_open(app: &AppHandle, open: bool) -> Result<MessageTabsState, String> {
     {
         let mut state = messages_hub_state()
             .lock()
@@ -269,11 +290,12 @@ pub fn set_insights_open(app: &AppHandle, open: bool) -> Result<MessageTabsState
     }
     persist_ui_preferences(app);
     layout_messages_hub(app);
-    emit_tabs_changed(app);
-    Ok(get_message_tabs(app))
+    let snapshot = get_message_tabs(app).await;
+    let _ = app.emit("message-tabs-changed", &snapshot);
+    Ok(snapshot)
 }
 
-fn messages_insights_label(model_id: i64) -> String {
+fn messages_insights_label(model_id: &str) -> String {
     format!("messages-{model_id}-insights")
 }
 
@@ -281,25 +303,24 @@ fn tabs_script() -> &'static str {
     "window.__CF_VIEW__ = \"messages-tabs\";"
 }
 
-fn emit_tabs_changed(app: &AppHandle) {
-    let snapshot = get_message_tabs(app);
+async fn emit_tabs_changed(app: &AppHandle) {
+    let snapshot = get_message_tabs(app).await;
     let _ = app.emit("message-tabs-changed", snapshot);
 }
 
-fn update_hub_title(app: &AppHandle, database: &Database, active_model_id: Option<i64>) {
+async fn update_hub_title(app: &AppHandle, store: &SupabaseStore, active_model_id: Option<&str>) {
     let Some(window) = app.get_window(MESSAGES_WINDOW_LABEL) else {
         return;
     };
-    let title = active_model_id
-        .and_then(|id| database.get_model(id).ok())
-        .map(|model| {
-            if model.display_name.trim().is_empty() {
-                "Mensajes · CreatorFloww".to_owned()
-            } else {
+    let title = match active_model_id {
+        Some(id) => match store.get_model(id).await {
+            Ok(model) if !model.display_name.trim().is_empty() => {
                 format!("Mensajes · {}", model.display_name)
             }
-        })
-        .unwrap_or_else(|| "Mensajes · CreatorFloww".to_owned());
+            _ => "Mensajes · CreatorFloww".to_owned(),
+        },
+        None => "Mensajes · CreatorFloww".to_owned(),
+    };
     let _ = window.set_title(&title);
 }
 
@@ -326,104 +347,111 @@ impl Slot {
 }
 
 pub struct SyncBus {
-    slots: Mutex<std::collections::HashMap<i64, Arc<Slot>>>,
+    slots: Mutex<HashMap<String, Arc<Slot>>>,
 }
 
 impl SyncBus {
     pub fn new() -> Self {
         Self {
-            slots: Mutex::new(std::collections::HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
 
-    fn begin(&self, model_id: i64) -> Arc<Slot> {
+    fn begin(&self, model_id: &str) -> Arc<Slot> {
         let slot = Arc::new(Slot::new());
         self.slots
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(model_id, slot.clone());
+            .insert(model_id.to_owned(), slot.clone());
         slot
     }
 
-    fn mark_widened(&self, model_id: i64) {
+    fn mark_widened(&self, model_id: &str) {
         if let Some(slot) = self.slot(model_id) {
             slot.widened.store(true, Ordering::Relaxed);
         }
     }
 
-    fn slot(&self, model_id: i64) -> Option<Arc<Slot>> {
+    fn slot(&self, model_id: &str) -> Option<Arc<Slot>> {
         self.slots
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get(&model_id)
+            .get(model_id)
             .cloned()
     }
 }
 
-pub fn window_label(model_id: i64) -> String {
+pub fn window_label(model_id: &str) -> String {
     format!("model-{model_id}")
 }
 
-pub fn list_accounts(app: &AppHandle, database: &Database) -> Result<Vec<ModelAccount>, String> {
-    let models = database.list_models().map_err(|err| err.to_string())?;
+pub async fn list_accounts(app: &AppHandle, store: &SupabaseStore) -> Result<Vec<ModelAccount>, String> {
+    let models = store.list_models().await.map_err(|err| err.to_string())?;
+    for model in &models {
+        remember_model_id(&model.id);
+    }
     Ok(models
         .into_iter()
         .map(|model| account(app, model))
         .collect())
 }
 
-pub fn open_model_session(
+pub async fn open_model_session(
     app: &AppHandle,
-    database: &Database,
-    model_id: Option<i64>,
+    store: &SupabaseStore,
+    model_id: Option<String>,
 ) -> Result<ModelAccount, String> {
     let model = match model_id {
-        Some(id) => database.get_model(id).map_err(|err| err.to_string())?,
+        Some(id) => store.get_model(&id).await.map_err(|err| err.to_string())?,
         None => {
-            let open_ids = currently_open_model_ids(app, database);
-            match database
+            let open_ids = currently_open_model_ids(app);
+            match store
                 .find_reusable_empty_model(&open_ids)
+                .await
                 .map_err(|err| err.to_string())?
             {
                 Some(existing_empty) => existing_empty,
-                None => database
+                None => store
                     .create_model_partition()
+                    .await
                     .map_err(|err| err.to_string())?,
             }
         }
     };
+    remember_model_id(&model.id);
+    let _ = detach_model_from_hub(app, None, &model.id).await;
     let window = open_or_focus(app, &model)?;
-    spawn_reader(app.clone(), window.label().to_string(), model.id);
+    spawn_reader(app.clone(), window.label().to_string(), model.id.clone());
     Ok(account(app, model))
 }
 
-fn currently_open_model_ids(app: &AppHandle, database: &Database) -> Vec<i64> {
-    let Ok(models) = database.list_models() else {
-        return Vec::new();
-    };
-    models
-        .into_iter()
-        .filter(|m| {
-            app.get_webview_window(&window_label(m.id)).is_some()
-                || app.get_webview(&messages_of_label(m.id)).is_some()
+fn currently_open_model_ids(app: &AppHandle) -> Vec<String> {
+    let ids: Vec<String> = known_model_ids()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    ids.into_iter()
+        .filter(|id| {
+            app.get_webview_window(&window_label(id)).is_some()
+                || app.get_webview(&messages_of_label(id)).is_some()
         })
-        .map(|m| m.id)
         .collect()
 }
 
-pub fn delete_model_session(
+pub async fn delete_model_session(
     app: &AppHandle,
-    database: &Database,
-    model_id: i64,
+    store: &SupabaseStore,
+    model_id: &str,
 ) -> Result<(), String> {
-    let model = database.get_model(model_id).map_err(|err| err.to_string())?;
-    let _ = detach_model_from_hub(app, Some(database), model_id);
+    let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
+    let _ = detach_model_from_hub(app, Some(store), model_id).await;
     if let Some(window) = app.get_webview_window(&window_label(model_id)) {
         let _ = window.destroy();
     }
-    database
-        .delete_model(model_id)
-        .map_err(|err| err.to_string())?;
+    store.delete_model(model_id).await.map_err(|err| err.to_string())?;
+    forget_model_id(model_id);
     if let Ok(directory) = partition_dir(app, &model.partition_id) {
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -431,18 +459,20 @@ pub fn delete_model_session(
     Ok(())
 }
 
-/// Starts background OnlyFans sessions for all authenticated models so incoming messages,
-/// PPV unlocks, and tips trigger notifications no matter which view or chat is active.
 pub fn start_background_monitors(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
         let models = {
-            let Some(db) = app.try_state::<Database>() else {
+            let Some(store) = app.try_state::<SupabaseStore>() else {
                 return;
             };
-            db.list_models().unwrap_or_default()
+            if !store.has_session() {
+                return;
+            }
+            store.list_models().await.unwrap_or_default()
         };
         for model in models {
+            remember_model_id(&model.id);
             if model.of_user_id.is_none() {
                 continue;
             }
@@ -452,20 +482,28 @@ pub fn start_background_monitors(app: AppHandle) {
     });
 }
 
-pub fn schedule_background_monitor(app: &AppHandle, model_id: i64) {
-    let app_for_main = app.clone();
-    let app_inner = app.clone();
-    let _ = app_for_main.run_on_main_thread(move || {
-        let Some(db) = app_inner.try_state::<Database>() else {
-            return;
+pub fn schedule_background_monitor(app: &AppHandle, model_id: String) {
+    let app_async = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let model = {
+            let Some(store) = app_async.try_state::<SupabaseStore>() else {
+                return;
+            };
+            if !store.has_session() {
+                return;
+            }
+            let Ok(model) = store.get_model(&model_id).await else {
+                return;
+            };
+            if model.of_user_id.is_none() {
+                return;
+            }
+            model
         };
-        let Ok(model) = db.get_model(model_id) else {
-            return;
-        };
-        if model.of_user_id.is_none() {
-            return;
-        }
-        let _ = ensure_background_monitor_on_main(&app_inner, &model);
+        let app_inner = app_async.clone();
+        let _ = app_async.run_on_main_thread(move || {
+            let _ = ensure_background_monitor_on_main(&app_inner, &model);
+        });
     });
 }
 
@@ -474,12 +512,13 @@ fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(
     if model.of_user_id.is_none() {
         return Ok(());
     }
-    if app.get_webview_window(&window_label(model.id)).is_some() {
+    remember_model_id(&model.id);
+    if app.get_webview_window(&window_label(&model.id)).is_some() {
         return Ok(());
     }
-    let of_label = messages_of_label(model.id);
+    let of_label = messages_of_label(&model.id);
     if app.get_webview(&of_label).is_some() {
-        spawn_reader(app.clone(), of_label, model.id);
+        spawn_reader(app.clone(), of_label, model.id.clone());
         return Ok(());
     }
     let placement = messages_hub_state()
@@ -487,18 +526,23 @@ fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(
         .unwrap_or_else(|poison| poison.into_inner())
         .bar_placement;
     let initial_panes = default_message_panes(placement);
-    let window = ensure_hub_window(app, &model.display_name, HUB_VISIBLE.load(Ordering::SeqCst), &initial_panes)?;
+    let window = ensure_hub_window(
+        app,
+        &model.display_name,
+        HUB_VISIBLE.load(Ordering::SeqCst),
+        &initial_panes,
+    )?;
     let directory = partition_dir(app, &model.partition_id)?;
     std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
-    let model_id = model.id;
+    let nav_model_id = model.id.clone();
     let builder = tauri::webview::WebviewBuilder::new(
         of_label.clone(),
         WebviewUrl::External(chats_url()?),
     )
     .background_color(tauri::window::Color(15, 23, 42, 255))
     .data_directory(directory)
-    .initialization_script(capture_script(model_id, true))
-    .on_navigation(move |url| navigation_allowed(model_id, url))
+    .initialization_script(capture_script(&model.id, true))
+    .on_navigation(move |url| navigation_allowed(&nav_model_id, url))
     .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
     .focused(false);
     #[cfg(target_os = "windows")]
@@ -515,30 +559,29 @@ fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .active_model_id
-            == Some(model.id);
+            .as_deref()
+            == Some(model.id.as_str());
     if !is_active_visible {
         park_of_webview(&created);
     }
-    spawn_reader(app.clone(), of_label, model.id);
+    spawn_reader(app.clone(), of_label, model.id.clone());
     Ok(())
 }
 
 pub async fn sync_model_data(
     app: &AppHandle,
-    database: &Database,
+    store: &SupabaseStore,
     bus: &SyncBus,
-    model_id: i64,
+    model_id: &str,
 ) -> Result<SyncReport, String> {
-    let model = database.get_model(model_id).map_err(|err| err.to_string())?;
+    let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
     let slot = bus.begin(model_id);
-    // The messages webview already owns this account's WebView2 profile.
-    // Destroying it and opening another window on the same data directory
-    // starts a blank profile and OnlyFans shows the login page.
     let in_hub_tabs = messages_hub_state()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .open_model_ids
-        .contains(&model_id);
+        .iter()
+        .any(|id| id == model_id);
     let messages_sync = if let Some(existing) = app.get_webview(&messages_of_label(model_id)) {
         Some(begin_messages_sync(&existing, model_id)?)
     } else if in_hub_tabs && app.get_window(MESSAGES_WINDOW_LABEL).is_some() {
@@ -547,7 +590,7 @@ pub async fn sync_model_data(
                 .to_owned(),
         );
     } else {
-        let opened = open_model_session(app, database, Some(model_id))?;
+        let opened = open_model_session(app, store, Some(model_id.to_owned())).await?;
         let window = app
             .get_webview_window(&window_label(model_id))
             .ok_or_else(|| "no se pudo abrir la ventana de OnlyFans".to_owned())?;
@@ -563,7 +606,7 @@ pub async fn sync_model_data(
             .clone()
     };
     if messages_sync.is_some() {
-        spawn_reader(app.clone(), messages_of_label(model_id), model_id);
+        spawn_reader(app.clone(), messages_of_label(model_id), model_id.to_owned());
     }
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_secs(80);
@@ -606,19 +649,20 @@ pub async fn sync_model_data(
                 .to_owned(),
         );
     }
-    let model = database.get_model(model_id).map_err(|err| err.to_string())?;
+    let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
     Ok(SyncReport {
         transactions_upserted: slot.upserted.load(Ordering::Relaxed),
         model: account(app, model),
     })
 }
 
-pub fn record_capture(
+#[allow(clippy::too_many_arguments)]
+pub async fn record_capture(
     app: &AppHandle,
-    database: &Database,
+    store: &SupabaseStore,
     bus: &SyncBus,
     window_label_value: &str,
-    model_id: i64,
+    model_id: &str,
     url: &str,
     status: u16,
     body: &str,
@@ -629,18 +673,23 @@ pub fn record_capture(
     if body.len() > 1_500_000 {
         return Err("la respuesta de OnlyFans es demasiado grande".to_owned());
     }
+    if !store.has_session() {
+        return Ok(());
+    }
     let effective_model_id = resolve_model_alias(model_id);
-    let was_unauthenticated = database
-        .get_model(effective_model_id)
+    let was_unauthenticated = store
+        .get_model(&effective_model_id)
+        .await
         .map(|m| m.of_user_id.is_none())
         .unwrap_or(false);
 
-    let outcome = match ingest_body(database, effective_model_id, url, status, body) {
+    let outcome = match ingest_body(store, &effective_model_id, url, status, body).await {
         Ok(outcome) => outcome,
         Err(err) => {
             let msg = err.to_string();
             if was_unauthenticated && msg.contains("ya está agregada") {
-                if try_adopt_duplicate_profile(app, database, model_id, effective_model_id, body)
+                if try_adopt_duplicate_profile(app, store, model_id, &effective_model_id, body)
+                    .await
                     .is_some()
                 {
                     let _ = app.emit("models-changed", ());
@@ -653,10 +702,10 @@ pub fn record_capture(
     let Some(outcome) = outcome else {
         return Ok(());
     };
-    note(bus, effective_model_id, &outcome);
+    note(bus, &effective_model_id, &outcome);
 
     if outcome.kind == crate::sync::CaptureKind::Profile && !outcome.unauthorized && was_unauthenticated {
-        if let Ok(updated) = database.get_model(effective_model_id) {
+        if let Ok(updated) = store.get_model(&effective_model_id).await {
             if updated.of_user_id.is_some() {
                 on_model_first_authenticated(app, model_id, &updated);
             }
@@ -666,21 +715,28 @@ pub fn record_capture(
     if outcome.notifications.source != crate::notifications::BatchSource::None {
         if let Some(notif_bus) = app.try_state::<crate::notifications::NotificationBus>() {
             let focus = current_live_focus();
-            let emitted = notif_bus.process_batch(
-                Some(app),
-                database,
-                effective_model_id,
-                outcome.notifications,
-                focus.as_ref(),
-            );
+            let emitted = notif_bus
+                .process_batch(
+                    Some(app),
+                    store,
+                    &effective_model_id,
+                    outcome.notifications,
+                    focus.as_ref(),
+                )
+                .await;
             if !emitted.is_empty() {
-                emit_tabs_changed(app);
+                emit_tabs_changed(app).await;
             }
         }
     }
 
     if !outcome.unauthorized && outcome.kind != crate::sync::CaptureKind::LiveEvent {
-        let _ = app.emit("models-changed", ());
+        if outcome.model_data_changed {
+            let _ = app.emit("models-changed", ());
+        }
+        if outcome.dropper_activity_changed {
+            let _ = app.emit("dropper-activity-changed", effective_model_id.clone());
+        }
         if let Some(fan_id) = &outcome.fan_id {
             let _ = app.emit(
                 "fan-insights-changed",
@@ -691,7 +747,7 @@ pub fn record_capture(
     Ok(())
 }
 
-fn on_model_first_authenticated(app: &AppHandle, raw_window_model_id: i64, updated: &Model) {
+fn on_model_first_authenticated(app: &AppHandle, raw_window_model_id: &str, updated: &Model) {
     let label_name = if !updated.display_name.trim().is_empty() {
         updated.display_name.trim().to_owned()
     } else if !updated.username.trim().is_empty() {
@@ -700,7 +756,11 @@ fn on_model_first_authenticated(app: &AppHandle, raw_window_model_id: i64, updat
         "OnlyFans".to_owned()
     };
     let title = if !updated.username.trim().is_empty() && !updated.display_name.trim().is_empty() {
-        format!("{} (@{}) · CreatorFloww", updated.display_name.trim(), updated.username.trim())
+        format!(
+            "{} (@{}) · CreatorFloww",
+            updated.display_name.trim(),
+            updated.username.trim()
+        )
     } else {
         format!("{label_name} · CreatorFloww")
     };
@@ -713,14 +773,14 @@ fn on_model_first_authenticated(app: &AppHandle, raw_window_model_id: i64, updat
         let _ = win.eval(&banner_js);
     }
     let _ = app.emit("model-login-completed", account(app, updated.clone()));
-    schedule_background_monitor(app, updated.id);
+    schedule_background_monitor(app, updated.id.clone());
 }
 
-fn try_adopt_duplicate_profile(
+async fn try_adopt_duplicate_profile(
     app: &AppHandle,
-    database: &Database,
-    raw_window_model_id: i64,
-    placeholder_id: i64,
+    store: &SupabaseStore,
+    raw_window_model_id: &str,
+    placeholder_id: &str,
     body: &str,
 ) -> Option<Model> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -743,7 +803,7 @@ fn try_adopt_duplicate_profile(
         .filter(|s| !s.is_empty())
         .or_else(|| obj.get("avatar").and_then(|v| v.as_str()).filter(|s| !s.is_empty()));
 
-    let (adopted, old_partition) = database
+    let (adopted, old_partition) = store
         .adopt_partition_into_existing_model(
             placeholder_id,
             &of_user_id,
@@ -751,27 +811,31 @@ fn try_adopt_duplicate_profile(
             display_name,
             avatar_url,
         )
+        .await
         .ok()??;
 
-    register_model_alias(raw_window_model_id, adopted.id);
-    register_model_alias(placeholder_id, adopted.id);
+    register_model_alias(raw_window_model_id, &adopted.id);
+    register_model_alias(placeholder_id, &adopted.id);
+    remember_model_id(&adopted.id);
 
-    if app.get_webview_window(&window_label(adopted.id)).is_none()
-        && app.get_webview(&messages_of_label(adopted.id)).is_none()
+    if app.get_webview_window(&window_label(&adopted.id)).is_none()
+        && app.get_webview(&messages_of_label(&adopted.id)).is_none()
     {
-        if let Ok(old_dir) = partition_dir(app, &old_partition) {
-            let _ = std::fs::remove_dir_all(old_dir);
+        if !old_partition.is_empty() {
+            if let Ok(old_dir) = partition_dir(app, &old_partition) {
+                let _ = std::fs::remove_dir_all(old_dir);
+            }
         }
     }
     on_model_first_authenticated(app, raw_window_model_id, &adopted);
     Some(adopted)
 }
 
-fn capture_window_matches(label: &str, model_id: i64) -> bool {
+fn capture_window_matches(label: &str, model_id: &str) -> bool {
     label == window_label(model_id) || label == format!("messages-{model_id}-of")
 }
 
-fn note(bus: &SyncBus, model_id: i64, outcome: &IngestOutcome) {
+fn note(bus: &SyncBus, model_id: &str, outcome: &IngestOutcome) {
     let Some(slot) = bus.slot(model_id) else {
         return;
     };
@@ -791,18 +855,26 @@ fn note(bus: &SyncBus, model_id: i64, outcome: &IngestOutcome) {
                 slot.upserted.fetch_add(stats.upserted, Ordering::Relaxed);
             }
         }
-        crate::sync::CaptureKind::Subscriber | crate::sync::CaptureKind::LiveEvent => {}
+        crate::sync::CaptureKind::Subscriber
+        | crate::sync::CaptureKind::LiveEvent
+        | crate::sync::CaptureKind::Publication
+        | crate::sync::CaptureKind::CreatorPosts => {}
     }
 }
 
-pub fn get_message_tabs(app: &AppHandle) -> MessageTabsState {
-    let unread_counts = app
-        .try_state::<crate::notifications::NotificationBus>()
-        .and_then(|bus| {
-            app.try_state::<Database>()
-                .map(|database| bus.unread_counts(&database))
-        })
-        .unwrap_or_default();
+pub async fn get_message_tabs(app: &AppHandle) -> MessageTabsState {
+    let unread_counts = if let (Some(bus), Some(store)) = (
+        app.try_state::<crate::notifications::NotificationBus>(),
+        app.try_state::<SupabaseStore>(),
+    ) {
+        if store.has_session() {
+            bus.unread_counts(&store).await
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
     let mut state = messages_hub_state()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -814,46 +886,47 @@ pub fn get_message_tabs(app: &AppHandle) -> MessageTabsState {
     }
     state
         .open_model_ids
-        .retain(|id| app.get_webview(&messages_of_label(*id)).is_some());
-    if let Some(active) = state.active_model_id {
+        .retain(|id| app.get_webview(&messages_of_label(id)).is_some());
+    if let Some(active) = state.active_model_id.clone() {
         if !state.open_model_ids.contains(&active) {
-            state.active_model_id = state.open_model_ids.first().copied();
+            state.active_model_id = state.open_model_ids.first().cloned();
         }
     } else {
-        state.active_model_id = state.open_model_ids.first().copied();
+        state.active_model_id = state.open_model_ids.first().cloned();
     }
     state.clone()
 }
 
-pub fn select_message_tab(
+pub async fn select_message_tab(
     app: &AppHandle,
-    database: &Database,
-    model_id: i64,
+    store: &SupabaseStore,
+    model_id: &str,
 ) -> Result<(), String> {
     let already_open = {
         let state = messages_hub_state()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         HUB_VISIBLE.load(Ordering::SeqCst)
-            && state.open_model_ids.contains(&model_id)
+            && state.open_model_ids.iter().any(|id| id == model_id)
             && app.get_window(MESSAGES_WINDOW_LABEL).is_some()
             && app.get_webview(&messages_of_label(model_id)).is_some()
     };
     if !already_open {
-        return open_messages(app, database, model_id);
+        return open_messages(app, store, model_id).await;
     }
     {
         let mut state = messages_hub_state()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        state.active_model_id = Some(model_id);
+        state.active_model_id = Some(model_id.to_owned());
     }
     if let Some(nb) = app.try_state::<crate::notifications::NotificationBus>() {
-        if nb.clear_unread(database, model_id) {
-            let _ = app.emit("unread-counts-changed", nb.unread_counts(database));
+        if nb.clear_unread(store, model_id).await {
+            let counts = nb.unread_counts(store).await;
+            let _ = app.emit("unread-counts-changed", counts);
         }
     }
-    update_hub_title(app, database, Some(model_id));
+    update_hub_title(app, store, Some(model_id)).await;
     layout_messages_hub(app);
     if let Some(window) = app.get_window(MESSAGES_WINDOW_LABEL) {
         let _ = focus_window(&window);
@@ -861,16 +934,14 @@ pub fn select_message_tab(
     if let Some(of_view) = app.get_webview(&messages_of_label(model_id)) {
         let _ = of_view.set_focus();
     }
-    emit_tabs_changed(app);
+    emit_tabs_changed(app).await;
     Ok(())
 }
 
-/// Closes a visible tab in `MessagesTabBar` while keeping the model's background OnlyFans
-/// webview alive so incoming messages and sales continue triggering notifications.
-pub fn close_message_tab(
+pub async fn close_message_tab(
     app: &AppHandle,
-    database: Option<&Database>,
-    model_id: i64,
+    store: Option<&SupabaseStore>,
+    model_id: &str,
 ) -> Result<(), String> {
     if let Some(of_view) = app.get_webview(&messages_of_label(model_id)) {
         park_of_webview(&of_view);
@@ -878,15 +949,13 @@ pub fn close_message_tab(
     if let Some(insights) = app.get_webview(&messages_insights_label(model_id)) {
         let _ = insights.hide();
     }
-    finish_removing_tab(app, database, model_id)
+    finish_removing_tab(app, store, model_id).await
 }
 
-/// Truly destroys the `messages-<id>-of` webview so its WebView2 `data_directory` lock is
-/// released (used when opening standalone `model-<id>` or deleting the model).
-fn detach_model_from_hub(
+async fn detach_model_from_hub(
     app: &AppHandle,
-    database: Option<&Database>,
-    model_id: i64,
+    store: Option<&SupabaseStore>,
+    model_id: &str,
 ) -> Result<(), String> {
     if let Some(of_view) = app.get_webview(&messages_of_label(model_id)) {
         let _ = of_view.close();
@@ -894,29 +963,29 @@ fn detach_model_from_hub(
     if let Some(insights) = app.get_webview(&messages_insights_label(model_id)) {
         let _ = insights.close();
     }
-    finish_removing_tab(app, database, model_id)
+    finish_removing_tab(app, store, model_id).await
 }
 
-fn finish_removing_tab(
+async fn finish_removing_tab(
     app: &AppHandle,
-    database: Option<&Database>,
-    model_id: i64,
+    store: Option<&SupabaseStore>,
+    model_id: &str,
 ) -> Result<(), String> {
     let next_active = {
         let mut state = messages_hub_state()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let removed_idx = state.open_model_ids.iter().position(|id| *id == model_id);
-        state.open_model_ids.retain(|id| *id != model_id);
+        let removed_idx = state.open_model_ids.iter().position(|id| id == model_id);
+        state.open_model_ids.retain(|id| id != model_id);
         if state.open_model_ids.is_empty() {
             state.active_model_id = None;
-        } else if state.active_model_id == Some(model_id) {
+        } else if state.active_model_id.as_deref() == Some(model_id) {
             let pick = removed_idx
                 .map(|idx| idx.saturating_sub(1).min(state.open_model_ids.len() - 1))
                 .unwrap_or(0);
-            state.active_model_id = state.open_model_ids.get(pick).copied();
+            state.active_model_id = state.open_model_ids.get(pick).cloned();
         }
-        state.active_model_id
+        state.active_model_id.clone()
     };
     if next_active.is_none() {
         HUB_VISIBLE.store(false, Ordering::SeqCst);
@@ -925,17 +994,17 @@ fn finish_removing_tab(
             park_messages_hub(&window);
         }
     } else {
-        if let Some(db) = database {
-            update_hub_title(app, db, next_active);
+        if let Some(store) = store {
+            update_hub_title(app, store, next_active.as_deref()).await;
         }
         layout_messages_hub(app);
-        if let Some(active_id) = next_active {
+        if let Some(active_id) = &next_active {
             if let Some(of_view) = app.get_webview(&messages_of_label(active_id)) {
                 let _ = of_view.set_focus();
             }
         }
     }
-    emit_tabs_changed(app);
+    emit_tabs_changed(app).await;
     let _ = app.emit("models-changed", ());
     Ok(())
 }
@@ -998,7 +1067,7 @@ fn ensure_hub_window(
     let host = created.clone();
     let closing = created.clone();
     let app_for_events = app.clone();
-    let layout_queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let layout_queued = Arc::new(AtomicBool::new(false));
     created.on_window_event(move |event| {
         let relayout = match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
@@ -1014,10 +1083,10 @@ fn ensure_hub_window(
                     (prev, state.clone())
                 };
                 for id in removed_ids {
-                    if let Some(of_view) = app_for_events.get_webview(&messages_of_label(id)) {
+                    if let Some(of_view) = app_for_events.get_webview(&messages_of_label(&id)) {
                         park_of_webview(&of_view);
                     }
-                    if let Some(ins) = app_for_events.get_webview(&messages_insights_label(id)) {
+                    if let Some(ins) = app_for_events.get_webview(&messages_insights_label(&id)) {
                         let _ = ins.hide();
                     }
                 }
@@ -1050,125 +1119,137 @@ fn ensure_hub_window(
     Ok(created)
 }
 
-pub fn open_messages(app: &AppHandle, database: &Database, model_id: i64) -> Result<(), String> {
-    let _gate = HUB_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let model = database.get_model(model_id).map_err(|err| err.to_string())?;
+pub async fn open_messages(
+    app: &AppHandle,
+    store: &SupabaseStore,
+    model_id: &str,
+) -> Result<(), String> {
+    let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
+    remember_model_id(&model.id);
+
+    let of_label = messages_of_label(model_id);
+    let insights_label = messages_insights_label(model_id);
     let standalone = window_label(model_id);
     let closed_standalone = app.get_webview_window(&standalone).is_some();
     close_label(app, &standalone);
     if closed_standalone {
-        // WebView2 keeps the partition directory locked until the destroyed window finishes closing.
-        std::thread::sleep(Duration::from_millis(450));
+        tokio::time::sleep(Duration::from_millis(450)).await;
     }
 
-    let placement = messages_hub_state()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .bar_placement;
-    let initial_panes = default_message_panes(placement);
-    let window = ensure_hub_window(app, &model.display_name, true, &initial_panes)?;
-    // The hub may be parked at -32000. WebView2 refuses to create a controller there (0x8007139F).
-    reveal_messages_hub(&window);
+    {
+        let _gate = HUB_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let placement = messages_hub_state()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .bar_placement;
+        let initial_panes = default_message_panes(placement);
+        let window = ensure_hub_window(app, &model.display_name, true, &initial_panes)?;
+        reveal_messages_hub(&window);
 
-    let of_label = messages_of_label(model_id);
-    let insights_label = messages_insights_label(model_id);
-    if app.get_webview(&of_label).is_none() {
-        let directory = partition_dir(app, &model.partition_id)?;
-        std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
-        let mut last_err = String::new();
-        let mut attached = false;
-        for attempt in 0..8 {
-            let builder = tauri::webview::WebviewBuilder::new(
-                of_label.clone(),
-                WebviewUrl::External(chats_url()?),
-            )
-            .background_color(tauri::window::Color(15, 23, 42, 255))
-            .data_directory(directory.clone())
-            .initialization_script(capture_script(model.id, true))
-            .on_navigation(move |url| navigation_allowed(model.id, url))
-            .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
-            .focused(true);
-            #[cfg(target_os = "windows")]
-            let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
-            match window.add_child(
-                builder,
-                tauri::LogicalPosition::new(initial_panes.chat_x, initial_panes.chat_y),
-                tauri::LogicalSize::new(initial_panes.chat_width, initial_panes.chat_height),
-            ) {
-                Ok(_) => {
-                    attached = true;
-                    break;
-                }
-                Err(err) => {
-                    last_err = err.to_string();
-                    let retry = last_err.contains("8007139F")
-                        || last_err.contains("estado correcto")
-                        || last_err.contains("correct state");
-                    if !retry || attempt == 7 {
-                        return Err(last_err);
+        if app.get_webview(&of_label).is_none() {
+            let directory = partition_dir(app, &model.partition_id)?;
+            std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
+            let mut last_err = String::new();
+            let mut attached = false;
+            for attempt in 0..8 {
+                let nav_id = model.id.clone();
+                let builder = tauri::webview::WebviewBuilder::new(
+                    of_label.clone(),
+                    WebviewUrl::External(chats_url()?),
+                )
+                .background_color(tauri::window::Color(15, 23, 42, 255))
+                .data_directory(directory.clone())
+                .initialization_script(capture_script(&model.id, true))
+                .on_navigation(move |url| navigation_allowed(&nav_id, url))
+                .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+                .focused(true);
+                #[cfg(target_os = "windows")]
+                let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
+                match window.add_child(
+                    builder,
+                    tauri::LogicalPosition::new(initial_panes.chat_x, initial_panes.chat_y),
+                    tauri::LogicalSize::new(initial_panes.chat_width, initial_panes.chat_height),
+                ) {
+                    Ok(_) => {
+                        attached = true;
+                        break;
                     }
-                    std::thread::sleep(Duration::from_millis(250));
+                    Err(err) => {
+                        last_err = err.to_string();
+                        let retry = last_err.contains("8007139F")
+                            || last_err.contains("estado correcto")
+                            || last_err.contains("correct state");
+                        if !retry || attempt == 7 {
+                            return Err(last_err);
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
                 }
             }
+            if !attached {
+                return Err(last_err);
+            }
         }
-        if !attached {
-            return Err(last_err);
-        }
-    }
-    if app.get_webview(&insights_label).is_none() {
-        window
-            .add_child(
-                tauri::webview::WebviewBuilder::new(
-                    insights_label,
-                    WebviewUrl::App("index.html".into()),
+        if app.get_webview(&insights_label).is_none() {
+            window
+                .add_child(
+                    tauri::webview::WebviewBuilder::new(
+                        insights_label,
+                        WebviewUrl::App("index.html".into()),
+                    )
+                    .initialization_script(insights_script(&model.id, &model.partition_id)),
+                    tauri::LogicalPosition::new(initial_panes.insights_x, initial_panes.insights_y),
+                    tauri::LogicalSize::new(
+                        initial_panes.insights_width,
+                        initial_panes.insights_height,
+                    ),
                 )
-                .initialization_script(insights_script(model.id, &model.partition_id)),
-                tauri::LogicalPosition::new(initial_panes.insights_x, initial_panes.insights_y),
-                tauri::LogicalSize::new(initial_panes.insights_width, initial_panes.insights_height),
-            )
-            .map_err(|err| err.to_string())?;
+                .map_err(|err| err.to_string())?;
+        }
+
+        HUB_VISIBLE.store(true, Ordering::SeqCst);
+        {
+            let mut state = messages_hub_state()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !state.open_model_ids.iter().any(|id| id == model_id) {
+                state.open_model_ids.push(model_id.to_owned());
+            }
+            state.active_model_id = Some(model_id.to_owned());
+        }
+        reveal_messages_hub(&window);
+        focus_window(&window)?;
     }
 
-    HUB_VISIBLE.store(true, Ordering::SeqCst);
-    {
-        let mut state = messages_hub_state()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !state.open_model_ids.contains(&model_id) {
-            state.open_model_ids.push(model_id);
-        }
-        state.active_model_id = Some(model_id);
-    }
     if let Some(nb) = app.try_state::<crate::notifications::NotificationBus>() {
-        if nb.clear_unread(database, model_id) {
-            let _ = app.emit("unread-counts-changed", nb.unread_counts(database));
+        if nb.clear_unread(store, model_id).await {
+            let counts = nb.unread_counts(store).await;
+            let _ = app.emit("unread-counts-changed", counts);
         }
     }
 
-    update_hub_title(app, database, Some(model_id));
-    reveal_messages_hub(&window);
-    focus_window(&window)?;
+    update_hub_title(app, store, Some(model_id)).await;
     layout_messages_hub(app);
-    spawn_reader(app.clone(), of_label.clone(), model_id);
+    spawn_reader(app.clone(), of_label.clone(), model_id.to_owned());
     if let Some(of_view) = app.get_webview(&of_label) {
         let _ = of_view.set_focus();
     }
-    emit_tabs_changed(app);
+    emit_tabs_changed(app).await;
     let _ = app.emit("models-changed", ());
     Ok(())
 }
 
-pub fn open_incoming_chat(
+pub async fn open_incoming_chat(
     app: &AppHandle,
-    database: &Database,
-    model_id: i64,
+    store: &SupabaseStore,
+    model_id: &str,
     of_fan_id: &str,
 ) -> Result<(), String> {
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.unminimize();
         let _ = main.show();
     }
-    open_messages(app, database, model_id)?;
+    open_messages(app, store, model_id).await?;
     let fan = of_fan_id.trim().trim_start_matches(['u', 'U']).to_owned();
     if fan.is_empty() {
         return Ok(());
@@ -1194,18 +1275,17 @@ fn account(app: &AppHandle, model: Model) -> ModelAccount {
             .unwrap_or_else(|poison| poison.into_inner())
             .open_model_ids
             .contains(&model.id);
-    let window_open = app.get_webview_window(&window_label(model.id)).is_some() || hub_open;
+    let window_open = app.get_webview_window(&window_label(&model.id)).is_some() || hub_open;
     ModelAccount { model, window_open }
 }
 
 fn open_or_focus(app: &AppHandle, model: &Model) -> Result<WebviewWindow, String> {
-    let label = window_label(model.id);
+    let label = window_label(&model.id);
     if let Some(window) = app.get_webview_window(&label) {
         allow_small_onlyfans(&window);
         focus(&window)?;
         return Ok(window);
     }
-    let _ = detach_model_from_hub(app, None, model.id);
     let directory = partition_dir(app, &model.partition_id)?;
     std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
     let title = if !model.display_name.trim().is_empty() {
@@ -1215,7 +1295,6 @@ fn open_or_focus(app: &AppHandle, model: &Model) -> Result<WebviewWindow, String
     } else {
         "Iniciar sesión en OnlyFans · CreatorFloww".to_owned()
     };
-    // The background monitor may still be releasing this partition. Same HRESULT as a bad WebView2 state.
     let mut last_err = String::new();
     for attempt in 0..6 {
         let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(home_url()?))
@@ -1228,12 +1307,12 @@ fn open_or_focus(app: &AppHandle, model: &Model) -> Result<WebviewWindow, String
             .focused(true)
             .background_color(tauri::window::Color(15, 23, 42, 255))
             .data_directory(directory.clone())
-            .initialization_script(capture_script(model.id, false));
+            .initialization_script(capture_script(&model.id, false));
         #[cfg(target_os = "windows")]
         let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
         match builder.build() {
             Ok(window) => {
-                bind_close(&window, model.id);
+                bind_close(&window, model.id.clone());
                 allow_small_onlyfans(&window);
                 return Ok(window);
             }
@@ -1256,7 +1335,7 @@ fn allow_small_onlyfans(window: &WebviewWindow) {
     let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(320.0, 400.0))));
 }
 
-fn bind_close(window: &WebviewWindow, raw_model_id: i64) {
+fn bind_close(window: &WebviewWindow, raw_model_id: String) {
     let target = window.clone();
     let app_handle = window.app_handle().clone();
     window.on_window_event(move |event| {
@@ -1264,9 +1343,8 @@ fn bind_close(window: &WebviewWindow, raw_model_id: i64) {
             api.prevent_close();
             let _ = target.destroy();
             let _ = app_handle.emit("models-changed", ());
-            // Resume silent background monitoring after WebView2 releases the partition directory
             let app_resume = app_handle.clone();
-            let effective_id = resolve_model_alias(raw_model_id);
+            let effective_id = resolve_model_alias(&raw_model_id);
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(900)).await;
                 schedule_background_monitor(&app_resume, effective_id);
@@ -1394,30 +1472,31 @@ fn layout_messages_hub(app: &AppHandle) {
         let _ = tabs.show();
     }
     let mut all_ids = state.open_model_ids.clone();
-    if let Some(db) = app.try_state::<Database>() {
-        if let Ok(models) = db.list_models() {
-            for m in models {
-                if !all_ids.contains(&m.id) {
-                    all_ids.push(m.id);
-                }
-            }
+    for id in known_model_ids()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+    {
+        if !all_ids.contains(id) {
+            all_ids.push(id.clone());
         }
     }
     let hub_visible = HUB_VISIBLE.load(Ordering::SeqCst);
     let mut active_of: Option<tauri::Webview> = None;
     for id in &all_ids {
-        let is_active = hub_visible && state.active_model_id == Some(*id) && state.open_model_ids.contains(id);
-        if let Some(of_view) = app.get_webview(&messages_of_label(*id)) {
+        let is_active = hub_visible
+            && state.active_model_id.as_deref() == Some(id.as_str())
+            && state.open_model_ids.contains(id);
+        if let Some(of_view) = app.get_webview(&messages_of_label(id)) {
             if is_active {
                 active_of = Some(of_view);
             } else if hub_visible {
-                // Off the visible hub, still 1100×760. A later webview would otherwise cover the open chat.
                 place_webview(&of_view, -1400.0, 0.0, 1100.0, 760.0);
             } else {
                 park_of_webview(&of_view);
             }
         }
-        if let Some(insights) = app.get_webview(&messages_insights_label(*id)) {
+        if let Some(insights) = app.get_webview(&messages_insights_label(id)) {
             if is_active && panes.insights_width >= 8.0 {
                 place_webview(
                     &insights,
@@ -1485,7 +1564,7 @@ fn chats_url() -> Result<Url, String> {
         .map_err(|err| err.to_string())
 }
 
-pub fn onlyfans_webview(app: &AppHandle, model_id: i64) -> Result<tauri::Webview, String> {
+pub fn onlyfans_webview(app: &AppHandle, model_id: &str) -> Result<tauri::Webview, String> {
     for label in [window_label(model_id), format!("messages-{model_id}-of")] {
         if let Some(webview) = app.get_webview(&label) {
             return Ok(webview);
@@ -1494,7 +1573,7 @@ pub fn onlyfans_webview(app: &AppHandle, model_id: i64) -> Result<tauri::Webview
     Err("Abre la ventana de la modelo e inicia sesión en OnlyFans.".to_owned())
 }
 
-pub async fn fetch_onlyfans_json(app: &AppHandle, model_id: i64, url: &str) -> Result<String, String> {
+pub async fn fetch_onlyfans_json(app: &AppHandle, model_id: &str, url: &str) -> Result<String, String> {
     let webview = onlyfans_webview(app, model_id)?;
     let token = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1648,10 +1727,11 @@ fn vault_fetch_body(text: &str) -> Result<String, String> {
         .ok_or_else(|| "OnlyFans devolvió un vault vacío.".to_owned())
 }
 
-fn insights_script(model_id: i64, partition_id: &str) -> String {
+fn insights_script(model_id: &str, partition_id: &str) -> String {
+    let id = serde_json::to_string(model_id).unwrap_or_else(|_| "\"\"".to_string());
     let partition = serde_json::to_string(partition_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {model_id}; window.__CF_PARTITION_ID__ = {partition};"
+        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {id}; window.__CF_PARTITION_ID__ = {partition};"
     )
 }
 
@@ -1692,23 +1772,22 @@ fn earnings_page(url: &Url) -> bool {
     path.starts_with("/my/statements") || path.starts_with("/my/statistics")
 }
 
-fn navigation_allowed(model_id: i64, url: &Url) -> bool {
+fn navigation_allowed(model_id: &str, url: &Url) -> bool {
     chats_navigation(url) || (earnings_gate(model_id).load(Ordering::SeqCst) && earnings_page(url))
 }
 
-fn earnings_gate(model_id: i64) -> Arc<AtomicBool> {
-    use std::collections::HashMap;
+fn earnings_gate(model_id: &str) -> Arc<AtomicBool> {
     use std::sync::OnceLock;
-    static GATES: OnceLock<Mutex<HashMap<i64, Arc<AtomicBool>>>> = OnceLock::new();
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
     let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut gates = gates.lock().unwrap_or_else(|poison| poison.into_inner());
     gates
-        .entry(model_id)
+        .entry(model_id.to_owned())
         .or_insert_with(|| Arc::new(AtomicBool::new(false)))
         .clone()
 }
 
-fn messages_of_label(model_id: i64) -> String {
+fn messages_of_label(model_id: &str) -> String {
     format!("messages-{model_id}-of")
 }
 
@@ -1742,24 +1821,24 @@ fn restore_chat_script(url: &str) -> String {
 }
 
 struct MessagesSyncGuard {
-    model_id: i64,
+    model_id: String,
     webview: tauri::Webview,
     restore_url: String,
 }
 
 impl Drop for MessagesSyncGuard {
     fn drop(&mut self) {
-        earnings_gate(self.model_id).store(false, Ordering::SeqCst);
+        earnings_gate(&self.model_id).store(false, Ordering::SeqCst);
         let _ = self.webview.eval(restore_chat_script(&self.restore_url));
     }
 }
 
-fn begin_messages_sync(webview: &tauri::Webview, model_id: i64) -> Result<MessagesSyncGuard, String> {
+fn begin_messages_sync(webview: &tauri::Webview, model_id: &str) -> Result<MessagesSyncGuard, String> {
     let restore_url = restore_target(webview.url().ok());
     let script = open_earnings_script()?;
     earnings_gate(model_id).store(true, Ordering::SeqCst);
     let guard = MessagesSyncGuard {
-        model_id,
+        model_id: model_id.to_owned(),
         webview: webview.clone(),
         restore_url,
     };
@@ -1767,11 +1846,12 @@ fn begin_messages_sync(webview: &tauri::Webview, model_id: i64) -> Result<Messag
     Ok(guard)
 }
 
-fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
+fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
+    let model_id_json = serde_json::to_string(model_id).unwrap_or_else(|_| "\"\"".to_owned());
     format!(
         r##"
 (() => {{
-  const modelId = {model_id};
+  const modelId = {model_id_json};
   const stayInChats = {stay_in_chats};
   const paths = new Set([
     "/api2/v2/users/me",
@@ -1799,6 +1879,7 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
       if (/^\/api2\/v2\/chats\/\d+$/.test(path)) return true;
       if (path.indexOf("/api2/v2/subscriptions") === 0) return true;
       if (path.indexOf("/api2/v2/vault/") === 0) return true;
+      if (window.__CF_CREATOR_ID && path === "/api2/v2/users/" + window.__CF_CREATOR_ID + "/posts") return true;
       return /^\/api2\/v2\/users\/\d+$/.test(path);
     }} catch (error) {{
       return false;
@@ -1842,6 +1923,24 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
       const joined = data && (data.joinDate || data.createdAt || data.joinDateTime);
       if (joined) window.__CF_JOIN = String(joined).slice(0, 10);
     }} catch (error) {{}}
+  }}
+  function hydrateProfile() {{
+    if (window.__CF_PROFILE_HYDRATED) return;
+    const attempt = (tries) => {{
+      if (window.__CF_PROFILE_HYDRATED) return;
+      const client = findSignedClient();
+      if (!client) {{
+        if (tries < 8) setTimeout(() => attempt(tries + 1), 650);
+        return;
+      }}
+      window.__CF_PROFILE_HYDRATED = true;
+      client.get("https://onlyfans.com/api2/v2/users/me").then((response) => {{
+        const data = response && response.data;
+        const text = typeof data === "string" ? data : JSON.stringify(data || {{}});
+        deliver("https://onlyfans.com/api2/v2/users/me", (response && response.status) || 200, text);
+      }}).catch(() => {{}});
+    }};
+    setTimeout(() => attempt(0), 400);
   }}
   const vaultItems = window.__CF_VAULT_ITEMS || (window.__CF_VAULT_ITEMS = {{}});
   function mediaUrl(value) {{
@@ -2149,6 +2248,8 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
         window.__CF_LAST_INBOX_AT = Date.now();
       }} else if (p === "/api2/v2/payouts/transactions") {{
         window.__CF_LAST_TX_AT = Date.now();
+      }} else if (p.indexOf("/api2/v2/subscriptions") === 0) {{
+        window.__CF_LAST_SUBS_AT = Date.now();
       }}
     }} catch (e) {{}}
     const send = () => {{
@@ -2216,6 +2317,7 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     return result;
   }};
   if (stayInChats) window.open = function () {{ return null; }};
+  hydrateProfile();
   window.addEventListener("popstate", () => {{
     fanFromUrl();
     installVaultButton();
@@ -2231,9 +2333,11 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     const now = Date.now();
     const lastInbox = window.__CF_LAST_INBOX_AT || 0;
     const lastTx = window.__CF_LAST_TX_AT || 0;
+    const lastSubs = window.__CF_LAST_SUBS_AT || 0;
     const needInbox = forceInbox || (now - lastInbox >= 1500);
     const needTx = (now - lastTx >= 14000);
-    if (!needInbox && !needTx) return;
+    const needSubs = (now - lastSubs >= 30000);
+    if (!needInbox && !needTx && !needSubs) return;
     bgPollBusy = true;
     try {{
       if (!window.__CF_CREATOR_ID) {{
@@ -2261,6 +2365,15 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
         if (res && res.data) {{
           const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
           deliver(txUrl, res.status || 200, text);
+        }}
+      }}
+      if (needSubs) {{
+        window.__CF_LAST_SUBS_AT = Date.now();
+        const subsUrl = "https://onlyfans.com/api2/v2/subscriptions/subscribers?limit=20&offset=0&type=active&sort=desc&field=last_activity";
+        const res = await client.get(subsUrl);
+        if (res && res.data) {{
+          const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+          deliver(subsUrl, res.status || 200, text);
         }}
       }}
     }} catch (err) {{
@@ -2350,36 +2463,60 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
   if (typeof originalFetch === "function") {{
     window.fetch = function () {{
       const input = arguments[0];
+      const init = arguments[1];
       const url = typeof input === "string" ? input : (input && input.url) || "";
+      const method = (init && init.method) || (input && input.method) || "GET";
       const pending = originalFetch.apply(this, arguments);
-      if (!watched(url)) {{
+      const publish = isPublish(method, url);
+      if (!watched(url) && !publish) {{
         return pending;
       }}
       return pending.then((response) => {{
-        response.clone().text().then((body) => deliver(url, response.status, body)).catch(() => {{}});
+        const target = publish ? publishUrl(url) : url;
+        response.clone().text().then((body) => deliver(target, response.status, body)).catch(() => {{}});
         return response;
       }});
     }};
   }}
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSend = XMLHttpRequest.prototype.send;
+  function isPublish(method, url) {{
+    try {{
+      const parsed = new URL(url, location.href);
+      if (parsed.hostname !== "onlyfans.com" && !parsed.hostname.endsWith(".onlyfans.com")) return false;
+      const path = parsed.pathname.replace(/\/+$/, "");
+      return String(method || "GET").toUpperCase() === "POST" && path === "/api2/v2/posts";
+    }} catch (error) {{
+      return false;
+    }}
+  }}
+  function publishUrl(url) {{
+    const absoluteUrl = absolute(url);
+    return absoluteUrl + (absoluteUrl.indexOf("?") === -1 ? "?" : "&") + "_cf_publish=1";
+  }}
   XMLHttpRequest.prototype.open = function (method, url) {{
     this.__cfUrl = url;
+    this.__cfMethod = method;
     return originalOpen.apply(this, arguments);
   }};
   XMLHttpRequest.prototype.send = function () {{
     this.addEventListener("load", function () {{
       const url = this.__cfUrl || "";
-      if (!watched(url)) {{
+      const publish = isPublish(this.__cfMethod, url);
+      if (!watched(url) && !publish) {{
         return;
       }}
       let body = "";
       try {{
-        body = typeof this.responseText === "string" ? this.responseText : JSON.stringify(this.response);
+        if (!this.responseType || this.responseType === "text") {{
+          body = typeof this.responseText === "string" ? this.responseText : "";
+        }} else if (this.response != null) {{
+          body = typeof this.response === "string" ? this.response : JSON.stringify(this.response);
+        }}
       }} catch (error) {{
         body = "";
       }}
-      deliver(url, this.status, body);
+      deliver(publish ? publishUrl(url) : url, this.status, body);
     }});
     return originalSend.apply(this, arguments);
   }};
@@ -3059,8 +3196,7 @@ fn capture_script(model_id: i64, stay_in_chats: bool) -> String {
     )
 }
 
-fn spawn_reader(app: AppHandle, webview_label: String, model_id: i64) {
-    use std::collections::HashSet;
+fn spawn_reader(app: AppHandle, webview_label: String, model_id: String) {
     use std::sync::Mutex as StdMutex;
     static STARTED: std::sync::OnceLock<StdMutex<HashSet<String>>> = std::sync::OnceLock::new();
     let started = STARTED.get_or_init(|| StdMutex::new(HashSet::new()));
@@ -3109,27 +3245,28 @@ fn spawn_reader(app: AppHandle, webview_label: String, model_id: i64) {
                 }
             }
             poll_ms = if raw.contains("\"active\":true") { 800 } else { 1000 };
-            let Some(database) = app.try_state::<Database>() else {
+            let Some(store) = app.try_state::<SupabaseStore>() else {
                 continue;
             };
             let bus = app.try_state::<SyncBus>();
             apply_tick(
                 &app,
-                database.inner(),
+                store.inner(),
                 bus.as_deref(),
-                model_id,
+                &model_id,
                 &webview_label,
                 &raw,
-            );
+            )
+            .await;
         }
     });
 }
 
-fn apply_tick(
+async fn apply_tick(
     app: &AppHandle,
-    database: &Database,
+    store: &SupabaseStore,
     bus: Option<&SyncBus>,
-    model_id: i64,
+    model_id: &str,
     label: &str,
     raw: &str,
 ) {
@@ -3143,7 +3280,7 @@ fn apply_tick(
             let status = item.get("status").and_then(|entry| entry.as_u64()).unwrap_or(0) as u16;
             let body = item.get("body").and_then(|entry| entry.as_str()).unwrap_or("");
             if let Some(bus) = bus {
-                let _ = record_capture(app, database, bus, label, model_id, url, status, body);
+                let _ = record_capture(app, store, bus, label, model_id, url, status, body).await;
             }
         }
     }
@@ -3193,7 +3330,6 @@ fn apply_tick(
             Some(observed)
         }
     });
-    // Always notify the insights pane when the active chat fan changes.
     let fan_signature = format!("fan:{fan_id}");
     if observation_changed(model_id, "__active_fan__", &fan_signature) {
         let _ = app.emit(
@@ -3215,7 +3351,10 @@ fn apply_tick(
     if !observation_changed(model_id, &fan_id, &signature) {
         return;
     }
-    if crate::sync::ingest_observation(database, model_id, &fan_id, Some(&profile)).is_ok() {
+    if crate::sync::ingest_observation(store, model_id, &fan_id, Some(&profile))
+        .await
+        .is_ok()
+    {
         let _ = app.emit(
             "fan-insights-changed",
             serde_json::json!({ "modelId": model_id, "ofFanId": fan_id }),
@@ -3224,8 +3363,7 @@ fn apply_tick(
     }
 }
 
-fn observation_changed(model_id: i64, fan_id: &str, signature: &str) -> bool {
-    use std::collections::HashMap;
+fn observation_changed(model_id: &str, fan_id: &str, signature: &str) -> bool {
     use std::sync::Mutex as StdMutex;
     static LAST: std::sync::OnceLock<StdMutex<HashMap<String, String>>> = std::sync::OnceLock::new();
     let map = LAST.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -3277,7 +3415,7 @@ mod tests {
 
     #[test]
     fn capture_script_includes_clean_composer_and_auto_expiry() {
-        let script = super::capture_script(42, false);
+        let script = super::capture_script("model-uuid-42", false);
         assert!(script.contains("cleanComposerButtons"));
         assert!(!script.contains("mountChatComposer"));
         assert!(!script.contains("pullPurchases"));
@@ -3320,7 +3458,7 @@ mod tests {
     fn statements_stay_inside_chats_until_sync_opens_them() {
         let blocked: tauri::Url = "https://onlyfans.com/my/statements/earnings".parse().unwrap();
         let chats: tauri::Url = "https://onlyfans.com/my/chats/chat/42".parse().unwrap();
-        let model_id = 9_000_001;
+        let model_id = "model-uuid-9000001";
         super::earnings_gate(model_id).store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(!super::navigation_allowed(model_id, &blocked));
         assert!(super::navigation_allowed(model_id, &chats));
@@ -3340,7 +3478,7 @@ mod tests {
 
     #[test]
     fn chat_composer_keeps_native_ppv_controls_without_custom_bar() {
-        let script = super::capture_script(42, true);
+        let script = super::capture_script("model-uuid-42", true);
         assert!(script.contains("function isChatPage()"));
         assert!(script.contains("if (isChatPage()) return false;"));
         assert!(script.contains("if (isChatPage()) return;"));

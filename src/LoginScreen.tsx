@@ -57,7 +57,7 @@ export function LoginScreen({ onSignedIn }: { onSignedIn: (profile: AgencyProfil
           />
         </label>
         {error ? (
-          <p role="alert" className="mt-4 text-sm" style={{ color: "#b91c1c" }}>
+          <p role="alert" className="mt-4 text-sm" style={{ color: "var(--danger)" }}>
             {error}
           </p>
         ) : null}

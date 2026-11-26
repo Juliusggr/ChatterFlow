@@ -6,8 +6,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
-use crate::db::Database;
 use crate::sessions;
+use crate::supabase::SupabaseStore;
 
 const PAGE_LIMIT: u32 = 24;
 
@@ -48,7 +48,7 @@ pub struct VaultDownloadReport {
 
 pub async fn list_vault_media(
     app: &AppHandle,
-    model_id: i64,
+    model_id: &str,
     offset: u32,
     kind: &str,
 ) -> Result<VaultPage, String> {
@@ -67,8 +67,8 @@ pub async fn list_vault_media(
 
 pub async fn download_vault_media(
     app: &AppHandle,
-    database: &Database,
-    model_id: i64,
+    store: &SupabaseStore,
+    model_id: &str,
     files: Vec<VaultDownloadFile>,
 ) -> Result<VaultDownloadReport, String> {
     if files.is_empty() {
@@ -77,7 +77,10 @@ pub async fn download_vault_media(
     if files.len() > 400 {
         return Err("selecciona como máximo 400 archivos por descarga".to_owned());
     }
-    let model = database.get_model(model_id).map_err(|err| err.to_string())?;
+    let model = store
+        .get_model(model_id)
+        .await
+        .map_err(|err| err.to_string())?;
     let folder_name = folder_name(&model.username, &model.display_name, model_id);
     let parent = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new()
@@ -296,7 +299,7 @@ fn value_id(value: &Value) -> Option<String> {
     }
 }
 
-fn folder_name(username: &str, display_name: &str, model_id: i64) -> String {
+fn folder_name(username: &str, display_name: &str, model_id: &str) -> String {
     let raw = if !username.trim().is_empty() {
         username
     } else if !display_name.trim().is_empty() {
