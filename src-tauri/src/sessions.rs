@@ -574,7 +574,7 @@ pub async fn sync_model_data(
     bus: &SyncBus,
     model_id: &str,
 ) -> Result<SyncReport, String> {
-    let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
+    store.get_model(model_id).await.map_err(|err| err.to_string())?;
     let slot = bus.begin(model_id);
     let in_hub_tabs = messages_hub_state()
         .lock()
@@ -608,52 +608,188 @@ pub async fn sync_model_data(
     if messages_sync.is_some() {
         spawn_reader(app.clone(), messages_of_label(model_id), model_id.to_owned());
     }
-    let started = tokio::time::Instant::now();
-    let deadline = started + Duration::from_secs(80);
-    let mut asked_for_transactions = messages_sync.is_some() || model.of_user_id.is_some();
-    loop {
-        if slot.unauthorized.load(Ordering::Relaxed) && !slot.profile.load(Ordering::Relaxed) {
-            return Err(
-                "La sesión de OnlyFans no está autenticada. Inicia sesión en la ventana de la modelo."
-                    .to_owned(),
-            );
-        }
-        if slot.profile.load(Ordering::Relaxed)
-            && !slot.transactions.load(Ordering::Relaxed)
-            && !asked_for_transactions
-        {
-            asked_for_transactions = true;
-            let _ = webview.navigate(statements_url()?);
-        }
-        if slot.profile.load(Ordering::Relaxed)
-            && slot.balances.load(Ordering::Relaxed)
-            && (slot.transactions.load(Ordering::Relaxed) || slot.widened.load(Ordering::Relaxed))
-            && slot.widened.load(Ordering::Relaxed)
-        {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    if !slot.profile.load(Ordering::Relaxed) {
-        if slot.unauthorized.load(Ordering::Relaxed) {
-            return Err(
-                "La sesión de OnlyFans no está autenticada. Inicia sesión en la ventana de la modelo."
-                    .to_owned(),
-            );
-        }
-        return Err(
-            "No se recibieron datos de OnlyFans. Abre la ventana, inicia sesión y sincroniza de nuevo."
-                .to_owned(),
-        );
-    }
+    let capture_label = if messages_sync.is_some() {
+        messages_of_label(model_id)
+    } else {
+        window_label(model_id)
+    };
+    let _ = webview;
+    pull_model_api(app, store, bus, model_id, &capture_label).await?;
+    let _ = store.refresh_fan_spend_peaks(model_id).await;
     let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
     Ok(SyncReport {
         transactions_upserted: slot.upserted.load(Ordering::Relaxed),
         model: account(app, model),
     })
+}
+
+async fn pull_model_api(
+    app: &AppHandle,
+    store: &SupabaseStore,
+    bus: &SyncBus,
+    model_id: &str,
+    capture_label: &str,
+) -> Result<(), String> {
+    let me = crate::of_api::get_me(app, model_id).await?;
+    let me_body = serde_json::to_string(&me).map_err(|err| err.to_string())?;
+    record_capture(
+        app,
+        store,
+        bus,
+        capture_label,
+        model_id,
+        "https://onlyfans.com/api2/v2/users/me",
+        200,
+        &me_body,
+    )
+    .await?;
+    let balances = crate::of_api::get_balances(app, model_id).await?;
+    let balances_body = serde_json::to_string(&balances).map_err(|err| err.to_string())?;
+    record_capture(
+        app,
+        store,
+        bus,
+        capture_label,
+        model_id,
+        "https://onlyfans.com/api2/v2/payouts/balances",
+        200,
+        &balances_body,
+    )
+    .await?;
+
+    let mut marker: Option<String> = None;
+    for _ in 0..40 {
+        let page = match crate::of_api::list_transactions(app, model_id, 50, marker.as_deref()).await {
+            Ok(page) => page,
+            Err(err) if crate::of_api::stop_sync(&err) => return Err(err),
+            Err(err) => return Err(err),
+        };
+        let empty = crate::of_api::page_list(&page).map(|list| list.is_empty()).unwrap_or(true);
+        let body = serde_json::to_string(&page).map_err(|err| err.to_string())?;
+        record_capture(
+            app,
+            store,
+            bus,
+            capture_label,
+            model_id,
+            "https://onlyfans.com/api2/v2/payouts/transactions",
+            200,
+            &body,
+        )
+        .await?;
+        if empty {
+            break;
+        }
+        match crate::of_api::next_marker(&page) {
+            Some(next) => marker = Some(next),
+            None => break,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let mut offset = 0_u32;
+    for _ in 0..40 {
+        let page = match crate::of_api::list_subscribers(app, model_id, "all", 50, offset).await {
+            Ok(page) => page,
+            Err(err) if crate::of_api::stop_sync(&err) => return Err(err),
+            Err(err) => return Err(err),
+        };
+        let count = crate::of_api::page_list(&page).map(|list| list.len()).unwrap_or(0);
+        let body = serde_json::to_string(&page).map_err(|err| err.to_string())?;
+        record_capture(
+            app,
+            store,
+            bus,
+            capture_label,
+            model_id,
+            "https://onlyfans.com/api2/v2/subscriptions/subscribers?type=all",
+            200,
+            &body,
+        )
+        .await?;
+        if count == 0 {
+            break;
+        }
+        offset += 50;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let mut from_id: Option<String> = None;
+    for _ in 0..5 {
+        let page = match crate::of_api::list_subscription_notifications(
+            app,
+            model_id,
+            50,
+            from_id.as_deref(),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(err) if crate::of_api::stop_sync(&err) => return Err(err),
+            Err(_) => break,
+        };
+        let list = crate::of_api::page_list(&page);
+        let count = list.map(|items| items.len()).unwrap_or(0);
+        let last_id = list.and_then(|items| {
+            items.last().and_then(|entry| {
+                entry.get("id").and_then(|val| match val {
+                    serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+            })
+        });
+        let has_more = page
+            .get("hasMore")
+            .and_then(|val| val.as_bool())
+            .unwrap_or(false);
+        let body = serde_json::to_string(&page).map_err(|err| err.to_string())?;
+        record_capture(
+            app,
+            store,
+            bus,
+            capture_label,
+            model_id,
+            "https://onlyfans.com/api2/v2/users/notifications?limit=50&type=subscribed",
+            200,
+            &body,
+        )
+        .await?;
+        if count == 0 || !has_more {
+            break;
+        }
+        match last_id {
+            Some(next) if from_id.as_deref() != Some(next.as_str()) => from_id = Some(next),
+            _ => break,
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    for notif_type in ["purchases", "tips"] {
+        let page = match crate::of_api::list_user_notifications(app, model_id, notif_type, 50, None).await
+        {
+            Ok(page) => page,
+            Err(err) if crate::of_api::stop_sync(&err) => return Err(err),
+            Err(_) => continue,
+        };
+        let body = serde_json::to_string(&page).map_err(|err| err.to_string())?;
+        let url = format!(
+            "https://onlyfans.com/api2/v2/users/notifications?limit=50&type={notif_type}"
+        );
+        record_capture(
+            app,
+            store,
+            bus,
+            capture_label,
+            model_id,
+            &url,
+            200,
+            &body,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -730,18 +866,20 @@ pub async fn record_capture(
         }
     }
 
-    if !outcome.unauthorized && outcome.kind != crate::sync::CaptureKind::LiveEvent {
-        if outcome.model_data_changed {
-            let _ = app.emit("models-changed", ());
-        }
+    if !outcome.unauthorized {
         if outcome.dropper_activity_changed {
             let _ = app.emit("dropper-activity-changed", effective_model_id.clone());
         }
-        if let Some(fan_id) = &outcome.fan_id {
-            let _ = app.emit(
-                "fan-insights-changed",
-                serde_json::json!({ "modelId": effective_model_id, "ofFanId": fan_id }),
-            );
+        if outcome.kind != crate::sync::CaptureKind::LiveEvent {
+            if outcome.model_data_changed {
+                let _ = app.emit("models-changed", ());
+            }
+            if let Some(fan_id) = &outcome.fan_id {
+                let _ = app.emit(
+                    "fan-insights-changed",
+                    serde_json::json!({ "modelId": effective_model_id, "ofFanId": fan_id }),
+                );
+            }
         }
     }
     Ok(())
@@ -856,6 +994,7 @@ fn note(bus: &SyncBus, model_id: &str, outcome: &IngestOutcome) {
             }
         }
         crate::sync::CaptureKind::Subscriber
+        | crate::sync::CaptureKind::Notifications
         | crate::sync::CaptureKind::LiveEvent
         | crate::sync::CaptureKind::Publication
         | crate::sync::CaptureKind::CreatorPosts => {}
@@ -1574,157 +1713,12 @@ pub fn onlyfans_webview(app: &AppHandle, model_id: &str) -> Result<tauri::Webvie
 }
 
 pub async fn fetch_onlyfans_json(app: &AppHandle, model_id: &str, url: &str) -> Result<String, String> {
-    let webview = onlyfans_webview(app, model_id)?;
-    let token = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let url_literal = serde_json::to_string(url).map_err(|err| err.to_string())?;
-    let start = vault_request_script(token, &url_literal);
-    eval_text(&webview, &start).await?;
-    let read = format!(r#"(window["__CF_VAULT_{token}"] || "")"#);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    loop {
-        let value = eval_text(&webview, &read).await?;
-        let decoded = decode_eval_string(&value);
-        if !decoded.is_empty() {
-            return vault_fetch_body(&decoded);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("OnlyFans no respondió el vault.".to_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-async fn eval_text(webview: &tauri::Webview, script: &str) -> Result<String, String> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let slot = Mutex::new(Some(sender));
-    webview
-        .eval_with_callback(script, move |value| {
-            if let Some(sender) = slot.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
-                let _ = sender.send(value);
-            }
-        })
-        .map_err(|err| err.to_string())?;
-    tokio::time::timeout(Duration::from_secs(8), receiver)
-        .await
-        .map_err(|_| "OnlyFans no respondió.".to_owned())?
-        .map_err(|_| "la ventana de OnlyFans se cerró".to_owned())
-}
-
-fn decode_eval_string(value: &str) -> String {
-    serde_json::from_str::<String>(value).unwrap_or_else(|_| value.trim().trim_matches('"').to_owned())
-}
-
-fn vault_request_script(token: u128, url_literal: &str) -> String {
-    format!(
-        r#"(async () => {{
-          const key = "__CF_VAULT_{token}";
-          const target = {url_literal};
-          window[key] = "";
-          function finish(status, body, error) {{
-            window[key] = JSON.stringify({{ status: status, body: String(body || "").slice(0, 2000000), error: error || "" }});
-          }}
-          function webpackRequire() {{
-            const names = Object.getOwnPropertyNames(window).filter((name) => name.indexOf("webpackChunk") === 0);
-            for (let index = 0; index < names.length; index += 1) {{
-              const chunk = window[names[index]];
-              if (!chunk || typeof chunk.push !== "function") continue;
-              const id = "cfvault" + Date.now() + index;
-              let req = null;
-              try {{
-                const modules = {{}};
-                modules[id] = function (module, exports, require) {{ req = require; }};
-                chunk.push([[id], modules, [[id]]]);
-              }} catch (error) {{}}
-              if (!req) {{
-                try {{
-                  chunk.push([[id + "b"], {{}}, function (require) {{ req = require; }}]);
-                }} catch (error) {{}}
-              }}
-              if (req) return req;
-            }}
-            return null;
-          }}
-          function isClient(value) {{
-            return !!(value && typeof value.get === "function" && value.interceptors && value.interceptors.request);
-          }}
-          function findClient() {{
-            const req = webpackRequire();
-            const cache = req && req.c;
-            if (!cache) return null;
-            let best = null;
-            let bestScore = 0;
-            Object.keys(cache).forEach((id) => {{
-              const exp = cache[id] && cache[id].exports;
-              [exp, exp && exp.default].forEach((value) => {{
-                if (!isClient(value)) return;
-                let score = 1;
-                try {{
-                  const headers = value.defaults && value.defaults.headers;
-                  const bag = headers && (headers.common || headers);
-                  if (bag && (bag["app-token"] || bag["App-Token"])) score += 3;
-                  const base = String((value.defaults && value.defaults.baseURL) || "");
-                  if (base.indexOf("onlyfans.com") !== -1) score += 2;
-                }} catch (error) {{}}
-                if (score > bestScore) {{
-                  best = value;
-                  bestScore = score;
-                }}
-              }});
-            }});
-            return best;
-          }}
-          try {{
-            const client = findClient();
-            if (!client) {{
-              const cached = window.__CF_VAULT_ITEMS || {{}};
-              const items = Object.keys(cached).map((id) => cached[id]).filter((item) => item && (item.type === "photo" || item.type === "video" || item.type === "gif"));
-              if (items.length) {{
-                finish(200, JSON.stringify({{ list: items, hasMore: false }}), "");
-                return;
-              }}
-              finish(0, "", "Abre la bóveda en la ventana de la modelo. No pedí el vault sin la firma de OnlyFans.");
-              return;
-            }}
-            const response = await client.get(target);
-            const data = response && response.data;
-            const body = typeof data === "string" ? data : JSON.stringify(data || {{}});
-            finish((response && response.status) || 200, body, "");
-          }} catch (error) {{
-            const status = error && error.response ? error.response.status : 0;
-            const data = error && error.response ? error.response.data : null;
-            const body = data ? (typeof data === "string" ? data : JSON.stringify(data)) : "";
-            finish(status, body, status ? "" : String(error && error.message || error));
-          }}
-        }})();
-        "started""#
-    )
-}
-
-fn vault_fetch_body(text: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|err| err.to_string())?;
-    if let Some(error) = value.get("error").and_then(|item| item.as_str()) {
-        if !error.is_empty() {
-            return Err(error.to_owned());
-        }
-    }
-    let status = value.get("status").and_then(|item| item.as_u64()).unwrap_or(0);
-    if status == 401 || status == 403 {
-        return Err(
-            "La sesión de OnlyFans no está autenticada. Inicia sesión en la ventana de la modelo."
-                .to_owned(),
-        );
-    }
-    if status != 200 {
-        return Err(format!("OnlyFans respondió {status} al pedir el vault."));
-    }
-    value
-        .get("body")
-        .and_then(|item| item.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| "OnlyFans devolvió un vault vacío.".to_owned())
+    let path = url
+        .split_once("onlyfans.com")
+        .map(|(_, path)| path)
+        .unwrap_or(url);
+    let path = if path.starts_with('/') { path } else { url };
+    crate::of_api::request_raw(app, model_id, "GET", path, None).await
 }
 
 fn insights_script(model_id: &str, partition_id: &str) -> String {
@@ -1875,6 +1869,7 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       if (path.indexOf("/api2/v2/payouts/") === 0) return true;
       if (path === "/api2/v2/chats") return true;
       if (path === "/api2/v2/users/list") return true;
+      if (path === "/api2/v2/users/notifications" || path.indexOf("/api2/v2/users/notifications/") === 0) return true;
       if (path.indexOf("/api2/v2/chats/") !== -1 && path.indexOf("/messages") !== -1) return true;
       if (/^\/api2\/v2\/chats\/\d+$/.test(path)) return true;
       if (path.indexOf("/api2/v2/subscriptions") === 0) return true;
@@ -2250,6 +2245,10 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
         window.__CF_LAST_TX_AT = Date.now();
       }} else if (p.indexOf("/api2/v2/subscriptions") === 0) {{
         window.__CF_LAST_SUBS_AT = Date.now();
+      }} else if (p === "/api2/v2/users/notifications" && String(url).indexOf("type=subscribed") !== -1) {{
+        window.__CF_LAST_SUB_NOTIFS_AT = Date.now();
+      }} else if (p === "/api2/v2/users/notifications" && (String(url).indexOf("type=purchases") !== -1 || String(url).indexOf("type=tips") !== -1)) {{
+        window.__CF_LAST_SALE_NOTIFS_AT = Date.now();
       }}
     }} catch (e) {{}}
     const send = () => {{
@@ -2325,7 +2324,7 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
   fanFromUrl();
   let bgPollBusy = false;
   let lastWsRefreshAt = 0;
-  async function runBgPoll(forceInbox) {{
+  async function runBgPoll(forceInbox, forceSubNotifs) {{
     if (bgPollBusy || isLoginOrAuthSurface()) return;
     if (/statements|statistics/i.test(location.pathname)) return;
     const client = findSignedClient();
@@ -2334,10 +2333,14 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     const lastInbox = window.__CF_LAST_INBOX_AT || 0;
     const lastTx = window.__CF_LAST_TX_AT || 0;
     const lastSubs = window.__CF_LAST_SUBS_AT || 0;
+    const lastSubNotifs = window.__CF_LAST_SUB_NOTIFS_AT || 0;
+    const lastSaleNotifs = window.__CF_LAST_SALE_NOTIFS_AT || 0;
     const needInbox = forceInbox || (now - lastInbox >= 1500);
     const needTx = (now - lastTx >= 14000);
     const needSubs = (now - lastSubs >= 30000);
-    if (!needInbox && !needTx && !needSubs) return;
+    const needSubNotifs = forceSubNotifs || (now - lastSubNotifs >= 15000);
+    const needSaleNotifs = (now - lastSaleNotifs >= 12000);
+    if (!needInbox && !needTx && !needSubs && !needSubNotifs && !needSaleNotifs) return;
     bgPollBusy = true;
     try {{
       if (!window.__CF_CREATOR_ID) {{
@@ -2351,32 +2354,84 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       }}
       if (needInbox) {{
         window.__CF_LAST_INBOX_AT = Date.now();
-        const chatUrl = "https://onlyfans.com/api2/v2/chats?limit=10&offset=0&order=recent";
-        const res = await client.get(chatUrl);
-        if (res && res.data) {{
-          const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-          deliver(chatUrl, res.status || 200, text);
-        }}
+        try {{
+          const chatUrl = "https://onlyfans.com/api2/v2/chats?limit=10&offset=0&order=recent";
+          const res = await client.get(chatUrl);
+          if (res && res.data) {{
+            const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+            deliver(chatUrl, res.status || 200, text);
+          }}
+        }} catch (e) {{}}
+      }}
+      if (needSubNotifs) {{
+        window.__CF_LAST_SUB_NOTIFS_AT = Date.now();
+        try {{
+          const maxPages = window.__CF_SUB_NOTIFS_BACKFILLED ? 1 : 5;
+          const cutoffMs = Date.now() - 36 * 3600 * 1000;
+          let fromId = "";
+          let fetchedAny = false;
+          for (let page = 0; page < maxPages; page += 1) {{
+            const notifUrl = fromId
+              ? "https://onlyfans.com/api2/v2/users/notifications?limit=50&type=subscribed&fromId=" + encodeURIComponent(fromId)
+              : "https://onlyfans.com/api2/v2/users/notifications?limit=50&type=subscribed";
+            const res = await client.get(notifUrl);
+            if (!res || !res.data) break;
+            fetchedAny = true;
+            const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
+            const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+            deliver(notifUrl, res.status || 200, text);
+            const list = Array.isArray(data) ? data : ((data && (data.list || data.items || data.notifications)) || []);
+            const hasMore = !!(data && data.hasMore);
+            if (!hasMore || !Array.isArray(list) || list.length === 0) break;
+            const lastItem = list[list.length - 1];
+            const lastStamp = lastItem && (lastItem.createdAt || lastItem.created_at || lastItem.date);
+            const lastMs = lastStamp ? Date.parse(String(lastStamp)) : NaN;
+            if (Number.isFinite(lastMs) && lastMs < cutoffMs) break;
+            const nextId = lastItem && lastItem.id != null ? String(lastItem.id) : "";
+            if (!nextId || nextId === fromId) break;
+            fromId = nextId;
+            if (page + 1 < maxPages) {{
+              await new Promise((resolve) => setTimeout(resolve, 300));
+            }}
+          }}
+          if (fetchedAny) window.__CF_SUB_NOTIFS_BACKFILLED = true;
+        }} catch (e) {{}}
+      }}
+      if (needSaleNotifs) {{
+        window.__CF_LAST_SALE_NOTIFS_AT = Date.now();
+        try {{
+          for (const saleType of ["purchases", "tips"]) {{
+            const saleUrl = "https://onlyfans.com/api2/v2/users/notifications?limit=50&type=" + saleType;
+            const res = await client.get(saleUrl);
+            if (res && res.data) {{
+              const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+              deliver(saleUrl, res.status || 200, text);
+            }}
+          }}
+        }} catch (e) {{}}
       }}
       if (needTx) {{
         window.__CF_LAST_TX_AT = Date.now();
-        const txUrl = "https://onlyfans.com/api2/v2/payouts/transactions?limit=10";
-        const res = await client.get(txUrl);
-        if (res && res.data) {{
-          const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-          deliver(txUrl, res.status || 200, text);
-        }}
+        try {{
+          const txUrl = "https://onlyfans.com/api2/v2/payouts/transactions?limit=50";
+          const res = await client.get(txUrl);
+          if (res && res.data) {{
+            const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+            deliver(txUrl, res.status || 200, text);
+          }}
+        }} catch (e) {{}}
       }}
       if (needSubs) {{
         window.__CF_LAST_SUBS_AT = Date.now();
-        const subsUrl = "https://onlyfans.com/api2/v2/subscriptions/subscribers?limit=20&offset=0&type=active&sort=desc&field=last_activity";
-        const res = await client.get(subsUrl);
-        if (res && res.data) {{
-          const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-          deliver(subsUrl, res.status || 200, text);
-        }}
+        try {{
+          const subsUrl = "https://onlyfans.com/api2/v2/subscriptions/subscribers?limit=50&offset=0&type=active&sort=desc&field=last_activity";
+          const res = await client.get(subsUrl);
+          if (res && res.data) {{
+            const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+            deliver(subsUrl, res.status || 200, text);
+          }}
+        }} catch (e) {{}}
       }}
-    }} catch (err) {{
     }} finally {{
       bgPollBusy = false;
     }}
@@ -2395,7 +2450,8 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       rawText.indexOf("tip") !== -1 ||
       rawText.indexOf("isOpened") !== -1 ||
       rawText.indexOf("notification") !== -1 ||
-      rawText.indexOf("toast") !== -1
+      rawText.indexOf("toast") !== -1 ||
+      rawText.indexOf("subscrib") !== -1
     ) {{
       const payload = {{
         modelId: modelId,
@@ -2412,10 +2468,14 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
         internals.invoke("ingest_of_response", payload).catch(() => {{}});
       }};
       sendLive();
+      const isSubSignal =
+        rawText.indexOf("subscrib") !== -1 ||
+        rawText.indexOf("notification") !== -1 ||
+        rawText.indexOf("toast") !== -1;
       const now = Date.now();
       if (now - lastWsRefreshAt >= 1200) {{
         lastWsRefreshAt = now;
-        void runBgPoll(true);
+        void runBgPoll(true, isSubSignal);
       }}
     }}
   }}
@@ -3191,6 +3251,42 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     if (onVaultPage()) installVaultButton();
   }}, 1200);
   installVaultButton();
+  if (!window.__CF_API_BRIDGE_INSTALLED) {{
+    window.__CF_API_BRIDGE_INSTALLED = true;
+    window.__CF_API_CALL = async (reqId, method, path, payload) => {{
+      const internals = window.__TAURI_INTERNALS__;
+      const reply = (status, body, error) => {{
+        if (internals && typeof internals.invoke === "function") {{
+          internals.invoke("of_api_bridge_reply", {{
+            reqId: String(reqId),
+            status: Number(status || 0),
+            body: String(body || ""),
+            error: String(error || "")
+          }}).catch(() => {{}});
+        }}
+      }};
+      try {{
+        const client = findSignedClient();
+        if (!client) {{
+          reply(0, "", "CLIENT_NOT_READY");
+          return;
+        }}
+        const url = String(path || "").indexOf("http") === 0
+          ? String(path)
+          : "https://onlyfans.com" + (String(path || "").indexOf("/") === 0 ? "" : "/") + String(path || "");
+        const upper = String(method || "GET").toUpperCase();
+        const response = upper === "POST" ? await client.post(url, payload || {{}}) : await client.get(url);
+        const data = response && response.data;
+        const text = typeof data === "string" ? data : JSON.stringify(data || {{}});
+        reply((response && response.status) || 200, text, "");
+      }} catch (err) {{
+        const status = err && err.response ? err.response.status : 0;
+        const data = err && err.response ? err.response.data : null;
+        const body = data ? (typeof data === "string" ? data : JSON.stringify(data)) : "";
+        reply(status, body, status ? "" : String((err && err.message) || err));
+      }}
+    }};
+  }}
 }})();
 "##
     )
@@ -3423,6 +3519,8 @@ mod tests {
         assert!(!script.contains("observeMessages"));
         assert!(!script.contains("cf-msg-tools"));
         assert!(script.contains("/api2/v2/chats/"));
+        assert!(script.contains("/api2/v2/users/notifications"));
+        assert!(script.contains("type=subscribed"));
         assert!(script.contains("isHourglassButton"));
         assert!(script.contains("executeAutoExpiry"));
         assert!(script.contains("monitorPublishStatus"));
@@ -3447,9 +3545,9 @@ mod tests {
         assert!(!script.contains("[class*='active'], [class*='selected'], [class*='checked']"));
         assert!(!script.contains("needle.indexOf(candidate)"));
         assert!(script.contains("endsWith(\".onlyfans.com\")"));
-        let request = super::vault_request_script(7, "\"https://onlyfans.com/api2/v2/vault/media\"");
-        assert!(request.contains("interceptors"));
-        assert!(!request.contains("credentials"));
+        assert!(script.contains("__CF_API_CALL"));
+        assert!(script.contains("of_api_bridge_reply"));
+        assert!(script.contains("findSignedClient"));
         assert!(!script.contains("__CF_FETCH_ATTEMPTED"));
         assert!(!script.contains("earnings/chart?startDate"));
     }

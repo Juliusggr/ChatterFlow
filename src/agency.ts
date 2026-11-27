@@ -668,6 +668,10 @@ export async function recordSale(input: {
   recordedAt: string;
   sourceId: string;
 }): Promise<void> {
+  const timeZone =
+    typeof localStorage !== "undefined"
+      ? localStorage.getItem("cf-report-tz") || "America/Caracas"
+      : "America/Caracas";
   const { error } = await supabase.rpc("record_sale", {
     p_external_key: input.externalKey,
     p_fan_platform_id: input.fanPlatformId,
@@ -676,8 +680,12 @@ export async function recordSale(input: {
     p_category: input.category,
     p_recorded_at: input.recordedAt,
     p_source_id: input.sourceId,
+    p_timezone: timeZone,
   });
-  if (error && !/turno activo|no asignado|not allowed/i.test(error.message)) {
+  if (
+    error &&
+    !/turno activo|fuera del horario del turno|no asignado|not allowed/i.test(error.message)
+  ) {
     throw new Error(error.message);
   }
 }

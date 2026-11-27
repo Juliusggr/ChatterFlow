@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { DollarSign, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Plus, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   closeMessageTab,
   getMessageTabs,
@@ -13,6 +13,7 @@ import {
   type MessageBarPlacement,
   type MessageTabsState,
 } from "./api";
+import { startSaleRecording } from "./saleRecording";
 import { avatarColor, formatMoney, initials, modelLabel, type Model } from "./types";
 
 const EMPTY_TABS: MessageTabsState = {
@@ -28,6 +29,8 @@ export function MessagesTabBar() {
   const [tabs, setTabs] = useState<MessageTabsState>(EMPTY_TABS);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [recentSales, setRecentSales] = useState<Record<string, number>>({});
+  const modelsRef = useRef(models);
+  modelsRef.current = models;
 
   const reload = useCallback(async () => {
     try {
@@ -42,6 +45,19 @@ export function MessagesTabBar() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => {
+    let alive = true;
+    let stop = () => {};
+    void startSaleRecording(() => modelsRef.current).then((unlisten) => {
+      if (alive) stop = unlisten;
+      else unlisten();
+    });
+    return () => {
+      alive = false;
+      stop();
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;

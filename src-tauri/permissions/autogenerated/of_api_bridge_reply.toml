@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-of-api-bridge-reply"
+description = "Enables the of_api_bridge_reply command without any pre-configured scope."
+commands.allow = ["of_api_bridge_reply"]
+
+[[permission]]
+identifier = "deny-of-api-bridge-reply"
+description = "Denies the of_api_bridge_reply command without any pre-configured scope."
+commands.deny = ["of_api_bridge_reply"]

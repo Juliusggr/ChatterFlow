@@ -1,5 +1,6 @@
 mod commands;
 mod notifications;
+mod of_api;
 mod sessions;
 pub mod supabase;
 mod sync;
@@ -44,6 +45,7 @@ pub fn run() {
             commands::delete_model,
             commands::sync_model_data,
             commands::ingest_of_response,
+            of_api::of_api_bridge_reply,
             commands::list_vault_media,
             commands::download_vault_media,
         ])

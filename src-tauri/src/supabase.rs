@@ -1101,6 +1101,17 @@ impl SupabaseStore {
         Ok(())
     }
 
+    pub async fn refresh_fan_spend_peaks(&self, model_id: &str) -> Result<(), DbError> {
+        let req = self
+            .request(Method::POST, "rpc/refresh_fan_spend_peaks")?
+            .json(&json!({ "p_model_id": model_id }));
+        match self.send_empty(req).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_missing_rpc(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn delete_chart_span(
         &self,
         model_id: &str,
@@ -1210,6 +1221,13 @@ impl SupabaseStore {
                 .json(&chunk);
             self.send_empty(req).await?;
         }
+        if unique.iter().any(|item| {
+            item.fan_of_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+        }) {
+            let _ = self.refresh_fan_spend_peaks(model_id).await;
+        }
 
         Ok((
             EarningStats {
@@ -1296,6 +1314,7 @@ impl SupabaseStore {
                 inserted.insert(id.to_owned());
             }
         }
+        let _ = self.refresh_fan_spend_peaks(model_id).await;
         Ok(inserted)
     }
 
@@ -1371,6 +1390,7 @@ impl SupabaseStore {
                 .json(&chunk);
             self.send_empty(req).await?;
         }
+        let _ = self.refresh_fan_spend_peaks(model_id).await;
 
         Ok(results)
     }
@@ -1576,6 +1596,61 @@ impl SupabaseStore {
             .json(&json!({ "unread_count": 0 }));
         let rows: Vec<Value> = self.send_json(req).await?;
         Ok(!rows.is_empty())
+    }
+
+    pub async fn record_employee_sale(
+        &self,
+        external_key: &str,
+        fan_platform_id: &str,
+        amount_gross: f64,
+        amount_net: f64,
+        category: &str,
+        recorded_at: &str,
+        source_id: &str,
+        timezone: &str,
+    ) -> Result<(), DbError> {
+        if self.active_dropper_id().is_some() {
+            return Ok(());
+        }
+        if external_key.trim().is_empty() || source_id.trim().is_empty() {
+            return Ok(());
+        }
+        let req = self
+            .request(Method::POST, "rpc/record_sale")?
+            .json(&json!({
+                "p_external_key": external_key,
+                "p_fan_platform_id": fan_platform_id,
+                "p_amount_gross": round2(amount_gross),
+                "p_amount_net": round2(amount_net),
+                "p_category": category,
+                "p_recorded_at": recorded_at,
+                "p_source_id": source_id,
+                "p_timezone": if timezone.trim().is_empty() {
+                    "America/Caracas"
+                } else {
+                    timezone.trim()
+                },
+            }));
+        match self.send_json::<Value>(req).await {
+            Ok(_) => Ok(()),
+            Err(err) if sale_record_suppressed(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn sale_record_suppressed(err: &DbError) -> bool {
+    match err {
+        DbError::Auth => true,
+        DbError::Http(message) | DbError::Invalid(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("turno activo")
+                || lower.contains("fuera del horario del turno")
+                || lower.contains("no asignado")
+                || lower.contains("not allowed")
+                || lower.contains("droppers no registran")
+        }
+        DbError::NotFound(_) => false,
     }
 }
 
