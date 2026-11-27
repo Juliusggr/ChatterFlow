@@ -120,10 +120,15 @@ export function buildEmployeeReport(input: {
   sales: SalePoint[];
 }): EmployeeReport {
   const salesByChatter = input.sales.filter((sale) => sale.role === "chatter" && Number.isFinite(new Date(sale.at).getTime()));
+  const granularity = resolveBucketGranularity(
+    input.range,
+    salesByChatter.map((sale) => sale.at),
+    input.timeZone,
+  );
   const keys = salesByChatter
-    .map((sale) => bucketKey(input.range, sale.at, input.timeZone))
+    .map((sale) => bucketKeyFor(granularity, sale.at, input.timeZone))
     .filter((key): key is string => Boolean(key));
-  const buckets = collectBuckets(input.range, keys, input.timeZone);
+  const buckets = collectBuckets(input.range, keys, input.timeZone, granularity);
   const byEmployee = new Map<string, { name: string; total: number; byBucket: Map<string, number> }>();
 
   for (const chatter of input.chatters) {
@@ -134,7 +139,7 @@ export function buildEmployeeReport(input: {
     const raw = input.basis === "net" ? sale.net : sale.gross;
     if (!Number.isFinite(raw)) continue;
     const amount = roundMoney(raw);
-    const key = bucketKey(input.range, sale.at, input.timeZone);
+    const key = bucketKeyFor(granularity, sale.at, input.timeZone);
     const current = byEmployee.get(sale.employeeId) ?? { name: sale.name, total: 0, byBucket: new Map() };
     current.name = sale.name || current.name;
     current.total = roundMoney(current.total + amount);
@@ -222,14 +227,18 @@ export async function loadCreatorReport(range: ReportRangeId, basis: EarningsBas
     .order("handle", { ascending: true })
     .order("id", { ascending: true });
 
-  const aggPromise = supabase.rpc("creator_report_agg", {
-    p_from: currentWin.from,
-    p_to: currentWin.to,
-    p_prev_from: prevWin?.from ?? null,
-    p_prev_to: prevWin?.to ?? null,
-    p_bucket: bucketKind,
-    p_tz: timeZone,
-  });
+  // For "today", use row-level query so we can render hourly buckets immediately without requiring an RPC migration.
+  const aggPromise =
+    range === "today"
+      ? Promise.resolve({ data: null, error: null })
+      : supabase.rpc("creator_report_agg", {
+          p_from: currentWin.from,
+          p_to: currentWin.to,
+          p_prev_from: prevWin?.from ?? null,
+          p_prev_to: prevWin?.to ?? null,
+          p_bucket: bucketKind,
+          p_tz: timeZone,
+        });
 
   const [modelsRes, aggRes] = await Promise.all([modelsPromise, aggPromise]);
   if (modelsRes.error) throw modelsRes.error;
@@ -391,13 +400,18 @@ function buildCreatorReportFromRows(
 
   const cur = sumPeriod(currentRows);
   const prev = prevRows ? sumPeriod(prevRows) : null;
+  const granularity = resolveBucketGranularity(
+    range,
+    currentRows.map((row) => row.at),
+    timeZone,
+  );
   const byBucket = new Map<string, number>();
   const bucketKeys: string[] = [];
   const perModel = new Map<string, { messageEarnings: number; totalEarnings: number }>();
 
   for (const row of currentRows) {
     const value = amountOf(row);
-    const key = bucketKey(range, row.at, timeZone);
+    const key = bucketKeyFor(granularity, row.at, timeZone);
     if (key) {
       bucketKeys.push(key);
       byBucket.set(key, roundMoney((byBucket.get(key) ?? 0) + value));
@@ -410,7 +424,7 @@ function buildCreatorReportFromRows(
     perModel.set(row.modelId, modelTotals);
   }
 
-  const buckets = collectBuckets(range, bucketKeys, timeZone);
+  const buckets = collectBuckets(range, bucketKeys, timeZone, granularity);
   const trends = buckets.map((bucket) => ({
     label: bucket.label,
     amount: roundMoney(byBucket.get(bucket.key) ?? 0),
@@ -514,22 +528,58 @@ export type DropperShiftEntry = {
   isActualShift: boolean;
 };
 
+export type DropperModelBreakdown = {
+  id: string;
+  modelId: string;
+  accountName: string;
+  publicationsCount: number;
+  subscriptionsCount: number;
+};
+
+export type DropperSummaryRow = {
+  id: string;
+  name: string;
+  schedule: string;
+  posts: number;
+  fans: number;
+  shifts: number;
+  modelsCount: number;
+  models: DropperModelBreakdown[];
+};
+
+export type DropperShiftGroup = {
+  id: string;
+  shiftId: string;
+  dropperUserId: string;
+  dropperName: string;
+  shiftStart: string;
+  shiftEnd: string | null;
+  scheduleLabel: string;
+  status: "active" | "completed";
+  publicationsCount: number;
+  subscriptionsCount: number;
+  accountsCount: number;
+  isActualShift: boolean;
+  models: DropperModelBreakdown[];
+};
+
+export type DropperRankingEntry = {
+  id: string;
+  name: string;
+  fans: number;
+  posts: number;
+  shifts: number;
+};
+
 export type DropperReport = {
   labels: string[];
   series: { id: string; name: string; values: number[] }[];
-  ranking: { id: string; name: string }[];
+  ranking: DropperRankingEntry[];
   totalPosts: number;
   totalFans: number;
   totalShifts: number;
-  rows: {
-    id: string;
-    name: string;
-    account: string;
-    schedule: string;
-    posts: number;
-    fans: number;
-    shifts: number;
-  }[];
+  rows: DropperSummaryRow[];
+  shiftGroups: DropperShiftGroup[];
   shiftRecords: DropperShiftEntry[];
 };
 
@@ -619,8 +669,9 @@ export function buildDropperReport(input: {
   activity: ActivityEvent[];
   now?: Date;
 }): DropperReport {
-  const nowMs = (input.now ?? new Date()).getTime();
-  const { from, to } = queryWindow(input.range, input.timeZone);
+  const now = input.now ?? new Date();
+  const nowMs = now.getTime();
+  const { from, to } = queryWindow(input.range, input.timeZone, now);
   const rangeStartMs = from ? new Date(from).getTime() : null;
   const rangeEndMs = new Date(to).getTime();
   const inRange = (ms: number) => (rangeStartMs === null || ms >= rangeStartMs) && ms < rangeEndMs;
@@ -628,55 +679,75 @@ export function buildDropperReport(input: {
   const peopleById = new Map(input.people.map((person) => [person.id, person]));
   const counted = input.activity.filter((event) => Number.isFinite(new Date(event.at).getTime()));
 
-  const summaryRows = new Map<
+  const dropperSummaries = new Map<
     string,
     {
       id: string;
-      personId: string;
       name: string;
-      account: string;
-      modelId: string;
       schedule: string;
       posts: number;
       fans: number;
-      shifts: number;
+      shiftIds: Set<string>;
       byBucket: Map<string, number>;
+      models: Map<string, { modelId: string; accountName: string; posts: number; fans: number }>;
     }
   >();
 
-  const ensureSummary = (personId: string, personName: string, account: AssignedAccount) => {
-    const modelKey = account.modelId || "unassigned";
-    const key = `${personId}:${modelKey}`;
-    const existing = summaryRows.get(key);
+  const ensureDropper = (personId: string, personName: string) => {
+    const existing = dropperSummaries.get(personId);
     if (existing) {
-      if (existing.account === "Cuenta" && account.name !== "Cuenta") existing.account = account.name;
+      if (existing.name === "Sin nombre" && personName && personName !== "Sin nombre") {
+        existing.name = personName;
+      }
       return existing;
     }
     const created = {
-      id: key,
-      personId,
+      id: personId,
       name: personName,
-      account: account.name,
-      modelId: account.modelId,
       schedule: summarizeSlots(input.slotsByPerson.get(personId) ?? []),
       posts: 0,
       fans: 0,
-      shifts: 0,
+      shiftIds: new Set<string>(),
       byBucket: new Map<string, number>(),
+      models: new Map<string, { modelId: string; accountName: string; posts: number; fans: number }>(),
     };
-    summaryRows.set(key, created);
+    dropperSummaries.set(personId, created);
     return created;
   };
 
+  const ensureDropperAccount = (personId: string, personName: string, account: AssignedAccount) => {
+    const dropper = ensureDropper(personId, personName);
+    if (account.modelId) {
+      const existingModel = dropper.models.get(account.modelId);
+      if (existingModel) {
+        if (existingModel.accountName === "Cuenta" && account.name !== "Cuenta") {
+          existingModel.accountName = account.name;
+        }
+      } else {
+        dropper.models.set(account.modelId, {
+          modelId: account.modelId,
+          accountName: account.name,
+          posts: 0,
+          fans: 0,
+        });
+      }
+    }
+    return dropper;
+  };
+
   for (const person of input.people) {
+    ensureDropper(person.id, person.name);
     for (const account of input.accountsByPerson.get(person.id) ?? []) {
-      ensureSummary(person.id, person.name, account);
+      ensureDropperAccount(person.id, person.name, account);
     }
   }
 
   type MutableShiftEntry = DropperShiftEntry & {
     startMs: number;
     endMs: number;
+    slotStartMs: number | null;
+    slotEndMs: number | null;
+    fanSlotEndMs: number | null;
     livePosts: number;
     liveFans: number;
   };
@@ -705,13 +776,13 @@ export function buildDropperReport(input: {
     const rawEndMs = shift.clockOut ? new Date(shift.clockOut).getTime() : null;
     const endMs = rawEndMs && Number.isFinite(rawEndMs) ? rawEndMs : Math.max(nowMs, startMs);
     const slots = input.slotsByPerson.get(person.id) ?? [];
-    const slotMatch = shiftWindow(new Date(startMs), slots, input.timeZone);
+    const slotMatch = findShiftScheduleWindow(startMs, endMs, slots, input.timeZone);
     const scheduleLabel = slotMatch?.label || summarizeSlots(slots);
     const assigned = input.accountsByPerson.get(person.id) ?? [];
     const targets: AssignedAccount[] =
       assigned.length > 0 ? assigned : [{ modelId: "", name: "Sin cuenta" }];
     for (const account of targets) {
-      ensureSummary(person.id, person.name, account);
+      ensureDropperAccount(person.id, person.name, account);
       const id = `${shift.id}:${account.modelId || "unassigned"}`;
       registerShiftEntry({
         id,
@@ -729,6 +800,9 @@ export function buildDropperReport(input: {
         isActualShift: true,
         startMs,
         endMs,
+        slotStartMs: slotMatch?.start ?? null,
+        slotEndMs: slotMatch?.end ?? null,
+        fanSlotEndMs: slotMatch?.fanEnd ?? null,
         livePosts: 0,
         liveFans: 0,
       });
@@ -759,14 +833,35 @@ export function buildDropperReport(input: {
     return candidates[0];
   };
 
+  const findMatchingShiftForFan = (
+    personId: string,
+    account: AssignedAccount,
+    whenMs: number,
+  ): MutableShiftEntry | null => {
+    const direct = findMatchingActualShift(personId, account, whenMs);
+    if (direct) return direct;
+    const bySchedule = (actualShiftsByPerson.get(personId) ?? []).filter(
+      (entry) =>
+        entry.modelId === account.modelId &&
+        entry.slotStartMs !== null &&
+        entry.fanSlotEndMs !== null &&
+        whenMs >= entry.slotStartMs &&
+        whenMs < entry.fanSlotEndMs,
+    );
+    if (bySchedule.length === 0) return null;
+    bySchedule.sort((a, b) => a.startMs - b.startMs);
+    return bySchedule[0];
+  };
+
   const ensureScheduledShift = (
     person: { id: string; name: string },
     account: AssignedAccount,
     when: Date,
     allowUnscheduledFallback: boolean,
+    forFans = false,
   ): MutableShiftEntry | null => {
     const slots = input.slotsByPerson.get(person.id) ?? [];
-    const window = shiftWindow(when, slots, input.timeZone);
+    const window = shiftWindow(when, slots, input.timeZone, forFans);
     if (window) {
       const startIso = new Date(window.start).toISOString();
       const endIso = new Date(window.end).toISOString();
@@ -788,6 +883,9 @@ export function buildDropperReport(input: {
         isActualShift: false,
         startMs: window.start,
         endMs: window.end,
+        slotStartMs: window.start,
+        slotEndMs: window.end,
+        fanSlotEndMs: window.fanEnd,
         livePosts: 0,
         liveFans: 0,
       });
@@ -815,13 +913,15 @@ export function buildDropperReport(input: {
       isActualShift: false,
       startMs: dayStart.getTime(),
       endMs: dayEnd.getTime(),
+      slotStartMs: null,
+      slotEndMs: null,
+      fanSlotEndMs: null,
       livePosts: 0,
       liveFans: 0,
     });
   };
 
-  // 2. Attribute publications to shifts & chart buckets.
-  const chartPostKeys: string[] = [];
+  // 2. Attribute publications to shifts.
   for (const event of counted) {
     if (event.kind !== "post") continue;
     const when = new Date(event.at);
@@ -842,13 +942,11 @@ export function buildDropperReport(input: {
       const person = peopleById.get(authorId);
       if (!person) continue;
       const account = resolveAccountForEvent(authorId, event.modelId);
-      const summary = ensureSummary(authorId, person.name, account);
+      ensureDropperAccount(authorId, person.name, account);
       const actualShift = findMatchingActualShift(authorId, account, whenMs);
-      let recordedInShift = false;
       if (actualShift) {
         actualShift.livePosts += 1;
         actualShift.publicationsCount = actualShift.livePosts;
-        recordedInShift = true;
       } else if (inRange(whenMs)) {
         const scheduledShift = ensureScheduledShift(
           person,
@@ -859,20 +957,13 @@ export function buildDropperReport(input: {
         if (scheduledShift) {
           scheduledShift.livePosts += 1;
           scheduledShift.publicationsCount = scheduledShift.livePosts;
-          recordedInShift = true;
-        }
-      }
-      if (recordedInShift && inRange(whenMs)) {
-        const key = bucketKey(input.range, event.at, input.timeZone);
-        if (key) {
-          chartPostKeys.push(key);
-          summary.byBucket.set(key, (summary.byBucket.get(key) ?? 0) + 1);
         }
       }
     }
   }
 
-  // 3. Attribute fan subscriptions arriving during a dropper's active/completed shift or scheduled hours.
+  // 3. Attribute fan subscriptions arriving during a dropper's active/completed shift or scheduled hours & chart timestamps.
+  const chartFanEvents: { dropperId: string; at: string; count: number }[] = [];
   for (const event of counted) {
     if (event.kind !== "fan") continue;
     const when = new Date(event.at);
@@ -881,17 +972,25 @@ export function buildDropperReport(input: {
       const accounts = input.accountsByPerson.get(person.id) ?? [];
       const account = accounts.find((candidate) => candidate.modelId === event.modelId);
       if (!account) continue;
-      const actualShift = findMatchingActualShift(person.id, account, whenMs);
+      const actualShift = findMatchingShiftForFan(person.id, account, whenMs);
       if (actualShift) {
         actualShift.liveFans += 1;
         actualShift.subscriptionsCount = actualShift.liveFans;
+        chartFanEvents.push({ dropperId: person.id, at: event.at, count: 1 });
         continue;
       }
-      if (inRange(whenMs)) {
-        const scheduledShift = ensureScheduledShift(person, account, when, false);
+      const window = shiftWindow(when, input.slotsByPerson.get(person.id) ?? [], input.timeZone, true);
+      const windowOverlapsRange =
+        window !== null &&
+        (rangeStartMs === null
+          ? window.start < rangeEndMs
+          : window.start < rangeEndMs && window.fanEnd > rangeStartMs);
+      if (inRange(whenMs) || windowOverlapsRange) {
+        const scheduledShift = ensureScheduledShift(person, account, when, false, true);
         if (scheduledShift) {
           scheduledShift.liveFans += 1;
           scheduledShift.subscriptionsCount = scheduledShift.liveFans;
+          chartFanEvents.push({ dropperId: person.id, at: event.at, count: 1 });
         }
       }
     }
@@ -925,7 +1024,7 @@ export function buildDropperReport(input: {
         existing.scheduleLabel = stored.scheduleLabel;
       }
     } else {
-      ensureSummary(person.id, person.name, matchedAccount);
+      ensureDropperAccount(person.id, person.name, matchedAccount);
       shiftEntries.set(key, {
         id: key,
         shiftId: stored.shiftId,
@@ -942,66 +1041,241 @@ export function buildDropperReport(input: {
         isActualShift: !stored.shiftId.startsWith("sched:") && !stored.shiftId.startsWith("day:"),
         startMs,
         endMs,
+        slotStartMs: null,
+        slotEndMs: null,
+        fanSlotEndMs: null,
         livePosts: 0,
         liveFans: 0,
       });
     }
   }
 
-  // 5. Roll up shift records into per-dropper+account summary rows & ensure chart reflects persisted counts.
+  // 5. Roll up shift records into per-dropper summaries, grouped shift records, and chart buckets.
   const orderedShifts = [...shiftEntries.values()].sort(
-    (left, right) => right.startMs - left.startMs || left.dropperName.localeCompare(right.dropperName, "es"),
+    (left, right) =>
+      right.startMs - left.startMs ||
+      left.dropperName.localeCompare(right.dropperName, "es") ||
+      left.accountName.localeCompare(right.accountName, "es"),
   );
+
+  type MutableShiftGroup = {
+    id: string;
+    shiftId: string;
+    dropperUserId: string;
+    dropperName: string;
+    shiftStart: string;
+    shiftEnd: string | null;
+    startMs: number;
+    endMs: number;
+    scheduleLabel: string;
+    status: "active" | "completed";
+    publicationsCount: number;
+    subscriptionsCount: number;
+    isActualShift: boolean;
+    models: Map<string, DropperModelBreakdown>;
+  };
+
+  const shiftGroupMap = new Map<string, MutableShiftGroup>();
 
   for (const shift of orderedShifts) {
     const account: AssignedAccount = {
       modelId: shift.modelId,
       name: shift.accountName,
     };
-    const summary = ensureSummary(shift.dropperUserId, shift.dropperName, account);
-    summary.posts += shift.publicationsCount;
-    summary.fans += shift.subscriptionsCount;
-    summary.shifts += 1;
-    const extraPersistedPosts = Math.max(0, shift.publicationsCount - shift.livePosts);
-    if (extraPersistedPosts > 0) {
-      const key = bucketKey(input.range, shift.shiftStart, input.timeZone);
-      if (key) {
-        chartPostKeys.push(key);
-        summary.byBucket.set(key, (summary.byBucket.get(key) ?? 0) + extraPersistedPosts);
+    const dropper = ensureDropperAccount(shift.dropperUserId, shift.dropperName, account);
+    dropper.posts += shift.publicationsCount;
+    dropper.fans += shift.subscriptionsCount;
+    dropper.shiftIds.add(shift.shiftId);
+    if (shift.modelId) {
+      const modelRow = dropper.models.get(shift.modelId);
+      if (modelRow) {
+        modelRow.posts += shift.publicationsCount;
+        modelRow.fans += shift.subscriptionsCount;
+      }
+    }
+
+    const extraPersistedFans = Math.max(0, shift.subscriptionsCount - shift.liveFans);
+    if (extraPersistedFans > 0) {
+      chartFanEvents.push({
+        dropperId: shift.dropperUserId,
+        at: shift.shiftStart,
+        count: extraPersistedFans,
+      });
+    }
+
+    const groupKey = `${shift.dropperUserId}:${shift.shiftId}`;
+    let group = shiftGroupMap.get(groupKey);
+    if (!group) {
+      group = {
+        id: groupKey,
+        shiftId: shift.shiftId,
+        dropperUserId: shift.dropperUserId,
+        dropperName: shift.dropperName,
+        shiftStart: shift.shiftStart,
+        shiftEnd: shift.shiftEnd,
+        startMs: shift.startMs,
+        endMs: shift.endMs,
+        scheduleLabel: shift.scheduleLabel,
+        status: shift.status,
+        publicationsCount: 0,
+        subscriptionsCount: 0,
+        isActualShift: shift.isActualShift,
+        models: new Map(),
+      };
+      shiftGroupMap.set(groupKey, group);
+    } else {
+      if (shift.startMs < group.startMs) {
+        group.startMs = shift.startMs;
+        group.shiftStart = shift.shiftStart;
+      }
+      if (shift.status === "active") {
+        group.status = "active";
+        group.shiftEnd = null;
+      } else if (group.status !== "active" && shift.shiftEnd && shift.endMs >= group.endMs) {
+        group.endMs = shift.endMs;
+        group.shiftEnd = shift.shiftEnd;
+      }
+      if ((!group.scheduleLabel || group.scheduleLabel === "Sin horario") && shift.scheduleLabel) {
+        group.scheduleLabel = shift.scheduleLabel;
+      }
+      group.isActualShift = group.isActualShift || shift.isActualShift;
+    }
+
+    group.publicationsCount += shift.publicationsCount;
+    group.subscriptionsCount += shift.subscriptionsCount;
+
+    if (shift.modelId) {
+      const existingModel = group.models.get(shift.modelId);
+      if (existingModel) {
+        existingModel.publicationsCount += shift.publicationsCount;
+        existingModel.subscriptionsCount += shift.subscriptionsCount;
+        if (existingModel.accountName === "Cuenta" && shift.accountName !== "Cuenta") {
+          existingModel.accountName = shift.accountName;
+        }
+      } else {
+        group.models.set(shift.modelId, {
+          id: `${groupKey}:${shift.modelId}`,
+          modelId: shift.modelId,
+          accountName: shift.accountName,
+          publicationsCount: shift.publicationsCount,
+          subscriptionsCount: shift.subscriptionsCount,
+        });
       }
     }
   }
 
-  const buckets = collectBuckets(input.range, chartPostKeys, input.timeZone);
-  const ranked = [...summaryRows.values()]
-    .filter((row) => row.posts > 0)
-    .sort((a, b) => b.posts - a.posts || b.fans - a.fans || a.account.localeCompare(b.account, "es"));
-  const series = ranked.slice(0, 3).map((row) => ({
-    id: row.id,
-    name: `${row.name} · ${row.account}`,
-    values: buckets.map((bucket) => row.byBucket.get(bucket.key) ?? 0),
-  }));
-  const table = [...summaryRows.values()].sort(
-    (a, b) => b.posts - a.posts || b.fans - a.fans || a.name.localeCompare(b.name, "es") || a.account.localeCompare(b.account, "es"),
+  const sortModelBreakdowns = (models: DropperModelBreakdown[]) =>
+    models.sort(
+      (a, b) =>
+        b.subscriptionsCount - a.subscriptionsCount ||
+        b.publicationsCount - a.publicationsCount ||
+        a.accountName.localeCompare(b.accountName, "es"),
+    );
+
+  const shiftGroups: DropperShiftGroup[] = [...shiftGroupMap.values()]
+    .sort((left, right) => right.startMs - left.startMs || left.dropperName.localeCompare(right.dropperName, "es"))
+    .map((group) => {
+      const models = sortModelBreakdowns([...group.models.values()]);
+      return {
+        id: group.id,
+        shiftId: group.shiftId,
+        dropperUserId: group.dropperUserId,
+        dropperName: group.dropperName,
+        shiftStart: group.shiftStart,
+        shiftEnd: group.shiftEnd,
+        scheduleLabel: group.scheduleLabel,
+        status: group.status,
+        publicationsCount: group.publicationsCount,
+        subscriptionsCount: group.subscriptionsCount,
+        accountsCount: models.length,
+        isActualShift: group.isActualShift,
+        models,
+      };
+    });
+
+  const granularity = resolveBucketGranularity(
+    input.range,
+    chartFanEvents.map((event) => event.at),
+    input.timeZone,
   );
+  const chartFanKeys: string[] = [];
+  for (const event of chartFanEvents) {
+    const key = bucketKeyFor(granularity, event.at, input.timeZone);
+    if (!key) continue;
+    chartFanKeys.push(key);
+    const dropper = dropperSummaries.get(event.dropperId);
+    if (dropper) {
+      dropper.byBucket.set(key, (dropper.byBucket.get(key) ?? 0) + event.count);
+    }
+  }
+
+  const buckets = collectBuckets(input.range, chartFanKeys, input.timeZone, granularity, now);
+  const rankedDroppers = [...dropperSummaries.values()]
+    .filter((row) => row.fans > 0 || row.posts > 0)
+    .sort((a, b) => b.fans - a.fans || b.posts - a.posts || a.name.localeCompare(b.name, "es"));
+
+  const series = rankedDroppers
+    .filter((row) => row.fans > 0)
+    .slice(0, 3)
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      values: buckets.map((bucket) => row.byBucket.get(bucket.key) ?? 0),
+    }));
+
+  const ranking: DropperRankingEntry[] = rankedDroppers.map((row) => ({
+    id: row.id,
+    name: row.name,
+    fans: row.fans,
+    posts: row.posts,
+    shifts: row.shiftIds.size,
+  }));
+
+  const rows: DropperSummaryRow[] = [...dropperSummaries.values()]
+    .sort((a, b) => b.fans - a.fans || b.posts - a.posts || a.name.localeCompare(b.name, "es"))
+    .map((row) => {
+      const models = sortModelBreakdowns(
+        [...row.models.values()].map((model) => ({
+          id: `${row.id}:${model.modelId}`,
+          modelId: model.modelId,
+          accountName: model.accountName,
+          publicationsCount: model.posts,
+          subscriptionsCount: model.fans,
+        })),
+      );
+      return {
+        id: row.id,
+        name: row.name,
+        schedule: row.schedule,
+        posts: row.posts,
+        fans: row.fans,
+        shifts: row.shiftIds.size,
+        modelsCount: models.length,
+        models,
+      };
+    });
 
   return {
     labels: buckets.map((bucket) => bucket.label),
     series,
-    ranking: series.map((item) => ({ id: item.id, name: item.name })),
-    totalPosts: table.reduce((sum, row) => sum + row.posts, 0),
-    totalFans: table.reduce((sum, row) => sum + row.fans, 0),
-    totalShifts: orderedShifts.length,
-    rows: table.map(({ id, name, account, schedule, posts, fans, shifts }) => ({
-      id,
-      name,
-      account,
-      schedule,
-      posts,
-      fans,
-      shifts,
-    })),
-    shiftRecords: orderedShifts.map(({ startMs: _s, endMs: _e, livePosts: _lp, liveFans: _lf, ...entry }) => entry),
+    ranking,
+    totalPosts: rows.reduce((sum, row) => sum + row.posts, 0),
+    totalFans: rows.reduce((sum, row) => sum + row.fans, 0),
+    totalShifts: shiftGroups.length,
+    rows,
+    shiftGroups,
+    shiftRecords: orderedShifts.map(
+      ({
+        startMs: _s,
+        endMs: _e,
+        slotStartMs: _ss,
+        slotEndMs: _se,
+        fanSlotEndMs: _fse,
+        livePosts: _lp,
+        liveFans: _lf,
+        ...entry
+      }) => entry,
+    ),
   };
 }
 
@@ -1029,11 +1303,44 @@ function droppersForPublication(
   return assigned.length === 1 ? assigned : [];
 }
 
+const NIGHT_DROPPER_START_MINUTES = 18 * 60;
+const NIGHT_DROPPER_END_MINUTES = 2 * 60;
+const NIGHT_DROPPER_FAN_END_MINUTES = 4 * 60;
+
+function fanEndMinutesForSlot(slot: ScheduleSlot): number {
+  if (slot.start === NIGHT_DROPPER_START_MINUTES && slot.end === NIGHT_DROPPER_END_MINUTES) {
+    return NIGHT_DROPPER_FAN_END_MINUTES;
+  }
+  return slot.end;
+}
+
+function findShiftScheduleWindow(
+  startMs: number,
+  endMs: number,
+  slots: ScheduleSlot[],
+  timeZone: string,
+): { start: number; end: number; fanEnd: number; label: string } | null {
+  const atStart = shiftWindow(new Date(startMs), slots, timeZone);
+  if (atStart) return atStart;
+  const earlyGraceMs = 90 * 60_000;
+  const upcoming = shiftWindow(new Date(startMs + earlyGraceMs), slots, timeZone);
+  if (upcoming && upcoming.start >= startMs && upcoming.start - startMs <= earlyGraceMs) {
+    return upcoming;
+  }
+  if (endMs > startMs) {
+    const atMid = shiftWindow(new Date(Math.round((startMs + endMs) / 2)), slots, timeZone);
+    if (atMid) return atMid;
+    return shiftWindow(new Date(endMs), slots, timeZone);
+  }
+  return null;
+}
+
 function shiftWindow(
   when: Date,
   slots: ScheduleSlot[],
   timeZone: string,
-): { start: number; end: number; label: string } | null {
+  forFans = false,
+): { start: number; end: number; fanEnd: number; label: string } | null {
   const parts = zonedParts(when, timeZone);
   const day = (new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay() + 6) % 7;
   const minutes = parts.hour * 60 + parts.minute;
@@ -1041,24 +1348,27 @@ function shiftWindow(
   for (const slot of slots) {
     if (slot.start === slot.end) continue;
     const label = formatSlotLabel(slot);
-    if (slot.start < slot.end && slot.day === day && minutes >= slot.start && minutes < slot.end) {
-      return {
-        start: atMinutes(parts, slot.start, timeZone).getTime(),
-        end: atMinutes(parts, slot.end, timeZone).getTime(),
-        label,
-      };
+    const fanEndMinutes = fanEndMinutesForSlot(slot);
+    const matchEndMinutes = forFans ? fanEndMinutes : slot.end;
+    if (slot.start < slot.end && slot.day === day && minutes >= slot.start && minutes < matchEndMinutes) {
+      const start = atMinutes(parts, slot.start, timeZone).getTime();
+      const end = atMinutes(parts, slot.end, timeZone).getTime();
+      const fanEnd = atMinutes(parts, fanEndMinutes, timeZone).getTime();
+      return { start, end, fanEnd, label };
     }
     if (slot.start > slot.end && slot.day === day && minutes >= slot.start) {
       const start = atMinutes(parts, slot.start, timeZone);
       const nextDay = zonedParts(addZonedDays(parts, 1, timeZone), timeZone);
       const end = atMinutes(nextDay, slot.end, timeZone);
-      return { start: start.getTime(), end: end.getTime(), label };
+      const fanEnd = atMinutes(nextDay, fanEndMinutes, timeZone);
+      return { start: start.getTime(), end: end.getTime(), fanEnd: fanEnd.getTime(), label };
     }
-    if (slot.start > slot.end && slot.day === previous && minutes < slot.end) {
+    if (slot.start > slot.end && slot.day === previous && minutes < matchEndMinutes) {
       const prevDay = zonedParts(addZonedDays(parts, -1, timeZone), timeZone);
       const start = atMinutes(prevDay, slot.start, timeZone);
       const end = atMinutes(parts, slot.end, timeZone);
-      return { start: start.getTime(), end: end.getTime(), label };
+      const fanEnd = atMinutes(parts, fanEndMinutes, timeZone);
+      return { start: start.getTime(), end: end.getTime(), fanEnd: fanEnd.getTime(), label };
     }
   }
   return null;
@@ -1100,7 +1410,7 @@ async function listDropperActivity(range: ReportRangeId, timeZone: string): Prom
     .from("publications")
     .select("model_id,created_at,author_user_id")
     .lt("created_at", to)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(5000);
   if (bufferedFrom) pubQuery = pubQuery.gte("created_at", bufferedFrom);
 
@@ -1108,7 +1418,7 @@ async function listDropperActivity(range: ReportRangeId, timeZone: string): Prom
     .from("fan_arrivals")
     .select("model_id,arrived_at")
     .lt("arrived_at", to)
-    .order("arrived_at", { ascending: true })
+    .order("arrived_at", { ascending: false })
     .limit(5000);
   if (bufferedFrom) fanQuery = fanQuery.gte("arrived_at", bufferedFrom);
 
@@ -1380,8 +1690,8 @@ async function listChatterSales(
   throw new Error("Hay demasiadas ventas para sumarlas en una sola consulta");
 }
 
-function queryWindow(range: ReportRangeId, timeZone: string): { from: string | null; to: string } {
-  const today = zonedParts(new Date(), timeZone);
+function queryWindow(range: ReportRangeId, timeZone: string, now = new Date()): { from: string | null; to: string } {
+  const today = zonedParts(now, timeZone);
   const tomorrow = addZonedDays(today, 1, timeZone).toISOString();
   if (range === "all") return { from: null, to: tomorrow };
   if (range === "today") {
@@ -1425,18 +1735,132 @@ function previousQueryWindow(range: ReportRangeId, timeZone: string): { from: st
   return { from: start.toISOString(), to: end.toISOString() };
 }
 
-function collectBuckets(range: ReportRangeId, saleKeys: string[], timeZone: string): Bucket[] {
-  const keys = new Set(baseKeys(range, timeZone));
-  for (const key of saleKeys) keys.add(key);
-  const sorted = [...keys].sort();
-  const withYear = new Set(sorted.map((key) => key.slice(0, 4))).size > 1;
-  return sorted.map((key) => ({ key, label: labelForKey(key, withYear) }));
+type BucketGranularity = "hour" | "day" | "month";
+
+function resolveBucketGranularity(
+  range: ReportRangeId,
+  timestamps: string[],
+  timeZone: string,
+): BucketGranularity {
+  if (range === "today") return "hour";
+  if (range === "month") return "day";
+  if (range === "days90" || range === "year") return "month";
+
+  // For "all", pick a granularity that matches the actual span of data so charts never collapse into a single dot.
+  let minMs = Number.POSITIVE_INFINITY;
+  let maxMs = Number.NEGATIVE_INFINITY;
+  const distinctDays = new Set<string>();
+  for (const iso of timestamps) {
+    const date = new Date(iso);
+    const ms = date.getTime();
+    if (!Number.isFinite(ms)) continue;
+    if (ms < minMs) minMs = ms;
+    if (ms > maxMs) maxMs = ms;
+    distinctDays.add(dayKeyFromParts(zonedParts(date, timeZone)));
+  }
+  if (!Number.isFinite(minMs)) return "month";
+  const spanHours = (maxMs - minMs) / 3_600_000;
+  if (distinctDays.size <= 1 || spanHours <= 36) return "hour";
+  if (spanHours <= 60 * 24) return "day";
+  return "month";
 }
 
-function baseKeys(range: ReportRangeId, timeZone: string): string[] {
-  const today = zonedParts(new Date(), timeZone);
+function collectBuckets(
+  range: ReportRangeId,
+  saleKeys: string[],
+  timeZone: string,
+  granularity?: BucketGranularity,
+  now = new Date(),
+): Bucket[] {
+  const effective: BucketGranularity =
+    granularity ?? (range === "today" ? "hour" : range === "month" ? "day" : "month");
+  const keys = new Set(baseKeys(range, timeZone, effective, now));
+  for (const key of saleKeys) keys.add(key);
+  const filled = fillBucketGaps([...keys].sort(), effective, timeZone);
+  const withYear = new Set(filled.map((key) => key.slice(0, 4))).size > 1;
+  return filled.map((key) => ({ key, label: labelForKey(key, withYear) }));
+}
+
+function fillBucketGaps(sorted: string[], granularity: BucketGranularity, timeZone: string): string[] {
+  if (sorted.length === 0) return [];
+  if (granularity === "hour") {
+    const startMs = parseHourKeyMs(sorted[0], timeZone);
+    const endMs = parseHourKeyMs(sorted[sorted.length - 1], timeZone);
+    if (startMs === null || endMs === null) return sorted;
+    const minEndMs = Math.max(endMs, startMs + 3_600_000);
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (let ms = startMs, guard = 0; ms <= minEndMs && guard < 72; ms += 3_600_000, guard += 1) {
+      const key = hourKeyFromParts(zonedParts(new Date(ms), timeZone));
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(key);
+      }
+    }
+    return result;
+  }
+  if (granularity === "day") {
+    const [sy, sm, sd] = sorted[0].split("-").map(Number);
+    const [ey, em, ed] = sorted[sorted.length - 1].split("-").map(Number);
+    if (!sy || !sm || !sd || !ey || !em || !ed) return sorted;
+    const startParts: ZonedParts = { year: sy, month: sm, day: sd, hour: 0, minute: 0, second: 0 };
+    const endKey = sorted[sorted.length - 1];
+    const result: string[] = [];
+    for (let offset = 0; offset < 90; offset += 1) {
+      const next = zonedParts(addZonedDays(startParts, offset, timeZone), timeZone);
+      const key = dayKeyFromParts(next);
+      result.push(key);
+      if (key >= endKey) break;
+    }
+    return result;
+  }
+  const [sy, sm] = sorted[0].split("-").map(Number);
+  const [ey, em] = sorted[sorted.length - 1].split("-").map(Number);
+  if (!sy || !sm || !ey || !em) return sorted;
+  const result: string[] = [];
+  let year = sy;
+  let month = sm;
+  while ((year < ey || (year === ey && month <= em)) && result.length < 48) {
+    result.push(`${year}-${String(month).padStart(2, "0")}`);
+    month += 1;
+    if (month === 13) {
+      month = 1;
+      year += 1;
+    }
+  }
+  return result;
+}
+
+function parseHourKeyMs(key: string, timeZone: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})$/.exec(key);
+  if (!match) return null;
+  return zonedDate(
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    Number(match[4]),
+    0,
+    0,
+    timeZone,
+  ).getTime();
+}
+
+function baseKeys(
+  range: ReportRangeId,
+  timeZone: string,
+  granularity: BucketGranularity,
+  now = new Date(),
+): string[] {
+  const today = zonedParts(now, timeZone);
   if (range === "all") return [];
-  if (range === "today") return [dayKeyFromParts(today)];
+  if (range === "today" || granularity === "hour") {
+    const maxHour = Math.min(23, Math.max(today.hour, 1));
+    const keys: string[] = [];
+    for (let hour = 0; hour <= maxHour; hour += 1) {
+      keys.push(hourKeyFromParts({ ...today, hour }));
+    }
+    return keys;
+  }
   if (range === "month") {
     const keys: string[] = [];
     for (let day = 1; day <= today.day && keys.length < 40; day += 1) {
@@ -1460,11 +1884,17 @@ function baseKeys(range: ReportRangeId, timeZone: string): string[] {
   return keys;
 }
 
-function bucketKey(range: ReportRangeId, iso: string, timeZone: string): string | null {
+function bucketKeyFor(granularity: BucketGranularity, iso: string, timeZone: string): string | null {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
   const parts = zonedParts(date, timeZone);
-  return range === "today" || range === "month" ? dayKeyFromParts(parts) : `${parts.year}-${String(parts.month).padStart(2, "0")}`;
+  if (granularity === "hour") return hourKeyFromParts(parts);
+  if (granularity === "day") return dayKeyFromParts(parts);
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}`;
+}
+
+function hourKeyFromParts(parts: ZonedParts): string {
+  return `${dayKeyFromParts(parts)}T${String(parts.hour).padStart(2, "0")}`;
 }
 
 function dayKeyFromParts(parts: ZonedParts): string {
@@ -1472,6 +1902,14 @@ function dayKeyFromParts(parts: ZonedParts): string {
 }
 
 function labelForKey(key: string, withYear: boolean): string {
+  const hourMatch = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})$/.exec(key);
+  if (hourMatch) {
+    const hour = Number(hourMatch[4]);
+    if (hour === 0) return "12 a.m.";
+    if (hour < 12) return `${hour} a.m.`;
+    if (hour === 12) return "12 p.m.";
+    return `${hour - 12} p.m.`;
+  }
   const [year, month, day] = key.split("-").map(Number);
   const date = new Date(year, (month || 1) - 1, day || 1);
   if (day) return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);

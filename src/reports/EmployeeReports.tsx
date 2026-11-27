@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { errorMessage, type EarningsBasis } from "../api";
 import {
+  CARD,
   EmptyNote,
   Hairline,
   INK,
@@ -68,6 +69,7 @@ export function EmployeeReportView({ report }: { report: EmployeeReport }) {
   });
   const max = Math.max(0, ...report.series.flatMap((series) => series.values));
   const axis = moneyAxis(max);
+  const singlePoint = chartRows.length === 1;
 
   return (
     <div className="flex flex-col gap-7">
@@ -106,7 +108,7 @@ export function EmployeeReportView({ report }: { report: EmployeeReport }) {
                       name={series.name}
                       stroke={SERIES[index] ?? INK}
                       strokeWidth={2}
-                      dot={false}
+                      dot={singlePoint ? { r: 3.5, strokeWidth: 2, fill: CARD } : false}
                       activeDot={{ r: 3, strokeWidth: 0 }}
                       isAnimationActive={false}
                     />
