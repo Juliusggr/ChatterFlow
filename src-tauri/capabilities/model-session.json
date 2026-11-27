@@ -7,5 +7,5 @@
   "remote": {
     "urls": ["https://onlyfans.com/*", "https://*.onlyfans.com/*"]
   },
-  "permissions": ["allow-ingest-of-response", "allow-fan-selected", "allow-download-vault-media"]
+  "permissions": ["allow-ingest-of-response", "allow-fan-selected", "allow-download-vault-media", "allow-of-api-bridge-reply"]
 }

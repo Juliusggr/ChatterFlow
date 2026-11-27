@@ -20,6 +20,7 @@ fn main() {
                 "delete_model",
                 "sync_model_data",
                 "ingest_of_response",
+                "of_api_bridge_reply",
                 "list_vault_media",
                 "download_vault_media",
             ]),

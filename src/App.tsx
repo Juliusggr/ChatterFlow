@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, onAction, requestPermission } from "@tauri-apps/plugin-notification";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
   getMessageTabs,
@@ -21,11 +21,11 @@ import {
   openMessages,
   openModelSession,
   setMessageBarPlacement,
-  type AppNotification,
   type MessageBarPlacement,
   type MessageTabsState,
 } from "./api";
-import { isManager, modelExternalKey, recordSale, signOut, type AgencyProfile } from "./agency";
+import { isManager, signOut, type AgencyProfile } from "./agency";
+import { startSaleRecording } from "./saleRecording";
 import { AuthGate } from "./AuthGate";
 import { AnalyticsView } from "./AnalyticsView";
 import { DashboardView } from "./DashboardView";
@@ -107,6 +107,8 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
   const [barPlacement, setBarPlacement] = useState<MessageBarPlacement>("top");
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [loginBanners, setLoginBanners] = useState<ToastBanner[]>([]);
+  const modelsRef = useRef(models);
+  modelsRef.current = models;
 
   const reload = useCallback(async () => {
     try {
@@ -160,23 +162,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
     if (profile.role === "dropper") return;
     let alive = true;
     let stop = () => {};
-    void listen<AppNotification>("cf-notification", (event) => {
-      const item = event.payload;
-      if (!item || (item.kind !== "ppv" && item.kind !== "tip") || item.amount == null) return;
-      const model = models.find((candidate) => candidate.id === item.modelId);
-      if (!model) return;
-      const gross = item.amount;
-      const net = item.netAmount ?? gross * 0.8;
-      void recordSale({
-        externalKey: modelExternalKey(model),
-        fanPlatformId: item.ofFanId,
-        amountGross: gross,
-        amountNet: net,
-        category: item.kind,
-        recordedAt: item.createdAt,
-        sourceId: item.id,
-      }).catch(() => undefined);
-    }).then((unlisten) => {
+    void startSaleRecording(() => modelsRef.current).then((unlisten) => {
       if (alive) stop = unlisten;
       else unlisten();
     });
@@ -184,7 +170,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       alive = false;
       stop();
     };
-  }, [models, profile.role]);
+  }, [profile.role]);
 
   useEffect(() => {
     let alive = true;

@@ -16,6 +16,7 @@ pub enum CaptureKind {
     Transactions,
     Chat,
     Subscriber,
+    Notifications,
     LiveEvent,
     Publication,
     CreatorPosts,
@@ -60,6 +61,11 @@ pub fn classify_url(url: &str) -> Option<CaptureKind> {
     }
     if path == "/api2/v2/users/list" {
         return Some(CaptureKind::Subscriber);
+    }
+    if path == "/api2/v2/users/notifications"
+        || path.starts_with("/api2/v2/users/notifications/")
+    {
+        return Some(CaptureKind::Notifications);
     }
     if path.contains("/api2/v2/chats/") && path.contains("/messages") {
         return Some(CaptureKind::Chat);
@@ -164,6 +170,15 @@ pub async fn ingest_body(
             .and_then(|model| model.of_user_id);
         let candidates =
             crate::notifications::parse_live_ws_payload(creator_of_id.as_deref(), body);
+        let ws_sub_arrivals = extract_live_ws_sub_arrivals(creator_of_id.as_deref(), body);
+        let arrival_added = if ws_sub_arrivals.is_empty() {
+            false
+        } else {
+            store
+                .record_fan_arrivals_batch(model_id, &ws_sub_arrivals)
+                .await
+                .unwrap_or(false)
+        };
         return Ok(Some(IngestOutcome {
             kind,
             unauthorized: false,
@@ -173,7 +188,7 @@ pub async fn ingest_body(
                 source: BatchSource::WebSocket,
                 candidates,
             },
-            dropper_activity_changed: false,
+            dropper_activity_changed: arrival_added,
             model_data_changed: false,
         }));
     }
@@ -367,6 +382,28 @@ pub async fn ingest_body(
                 model_data_changed: false,
             }
         }
+        CaptureKind::Notifications => {
+            let arrival_added =
+                save_subscription_notifications(store, model_id, url, &value).await?;
+            let sale_candidates = crate::notifications::extract_sales_from_notifications_payload(&value);
+            let notifications = if sale_candidates.is_empty() {
+                NotificationBatch::empty()
+            } else {
+                NotificationBatch {
+                    source: BatchSource::WebSocket,
+                    candidates: sale_candidates,
+                }
+            };
+            IngestOutcome {
+                kind,
+                unauthorized: false,
+                earnings: None,
+                fan_id: None,
+                notifications,
+                dropper_activity_changed: arrival_added,
+                model_data_changed: false,
+            }
+        }
         CaptureKind::Publication | CaptureKind::CreatorPosts | CaptureKind::LiveEvent => {
             unreachable!()
         }
@@ -422,6 +459,8 @@ async fn apply_subscriber_payload(
 ) -> Result<(Option<String>, bool), DbError> {
     if let Some(list) = value
         .get("list")
+        .or_else(|| value.get("users"))
+        .or_else(|| value.get("items"))
         .and_then(Value::as_array)
         .or_else(|| value.as_array())
     {
@@ -475,12 +514,22 @@ async fn apply_subscribers_batch(
     let mut arrivals = Vec::new();
     let mut last_id = None;
 
+    let creator_of_id = store
+        .get_model(model_id)
+        .await
+        .ok()
+        .and_then(|model| model.of_user_id)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+
     for value in values {
         let Some((fan, arrived)) = extract_subscriber_upsert(value) else {
             continue;
         };
         if let Some(arrived_at) = arrived {
-            arrivals.push((fan.of_fan_id.clone(), arrived_at));
+            if creator_of_id.as_deref() != Some(fan.of_fan_id.as_str()) {
+                arrivals.push((fan.of_fan_id.clone(), arrived_at));
+            }
         }
         last_id = Some(fan.of_fan_id.clone());
         fans.push(fan);
@@ -588,8 +637,10 @@ fn extract_subscriber_upsert(value: &Value) -> Option<(FanUpsertOwned, Option<St
             messages_summ: official.messages,
             tips_summ: official.tips,
             official_spend: official.present,
-            last_spend_at: None,
-            highest_spend: None,
+            last_spend_at: spend_stamp(object, data),
+            highest_spend: data.and_then(|item| {
+                first_number(item, &["highestSumm", "maxSumm", "biggestSumm", "highestPurchase"])
+            }),
         },
         arrived,
     ))
@@ -1033,10 +1084,17 @@ fn fan_arrived_at(object: &serde_json::Map<String, Value>) -> Option<String> {
         "subscribeDate",
         "startDate",
         "subscribedOnDate",
+        "renewedAt",
     ];
     let stamp = |source: &serde_json::Map<String, Value>| {
         KEYS.iter()
             .find_map(|key| source.get(*key).and_then(timestamp_from_value))
+    };
+    let entry_stamp = |source: &serde_json::Map<String, Value>| {
+        stamp(source)
+            .or_else(|| source.get("date").and_then(timestamp_from_value))
+            .or_else(|| source.get("createdAt").and_then(timestamp_from_value))
+            .or_else(|| source.get("created_at").and_then(timestamp_from_value))
     };
     for blob_key in ["subscribedByData", "subscribedOnData", "subscribedOn"] {
         if let Some(blob) = object.get(blob_key).and_then(Value::as_object) {
@@ -1044,11 +1102,18 @@ fn fan_arrived_at(object: &serde_json::Map<String, Value>) -> Option<String> {
                 return Some(found);
             }
             if let Some(subs) = blob.get("subscribes").and_then(Value::as_array) {
+                if let Some(current) = subs.iter().filter_map(Value::as_object).find_map(|entry| {
+                    if entry.get("isCurrent").and_then(bool_value) == Some(true) {
+                        entry_stamp(entry)
+                    } else {
+                        None
+                    }
+                }) {
+                    return Some(current);
+                }
                 for entry in subs {
                     if let Some(entry_obj) = entry.as_object() {
-                        if let Some(found) = stamp(entry_obj)
-                            .or_else(|| entry_obj.get("createdAt").and_then(timestamp_from_value))
-                        {
+                        if let Some(found) = entry_stamp(entry_obj) {
                             return Some(found);
                         }
                     }
@@ -1057,6 +1122,251 @@ fn fan_arrived_at(object: &serde_json::Map<String, Value>) -> Option<String> {
         }
     }
     stamp(object)
+}
+
+fn is_subscription_notification(
+    item: &serde_json::Map<String, Value>,
+    subscribed_tab: bool,
+) -> bool {
+    let mut kind_parts = Vec::new();
+    for key in ["type", "subType", "category"] {
+        if let Some(text) = item.get(key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                kind_parts.push(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+    let kind_str = kind_parts.join(" ");
+    let raw_text = item
+        .get("text")
+        .or_else(|| item.get("replacedText"))
+        .or_else(|| item.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text_str = crate::notifications::strip_html_preview(raw_text).to_lowercase();
+
+    let is_negative = kind_str.contains("unsubscrib")
+        || kind_str.contains("expir")
+        || kind_str.contains("cancel")
+        || kind_str.contains("renew_off")
+        || text_str.contains("unsubscribed")
+        || text_str.contains("expired")
+        || text_str.contains("expirad")
+        || text_str.contains("cancel");
+    if is_negative {
+        return false;
+    }
+
+    if kind_str.contains("subscrib") || kind_str.contains("suscri") {
+        return true;
+    }
+    if text_str.contains("subscribed to your")
+        || text_str.contains("has subscribed")
+        || text_str.contains("resubscribed")
+        || text_str.contains("suscrito a tu")
+        || text_str.contains("suscritos a su")
+        || text_str.contains("se ha suscrito")
+        || text_str.contains("se suscribió")
+        || text_str.contains("se suscribio")
+    {
+        return true;
+    }
+    if subscribed_tab {
+        let clearly_other = kind_str.contains("like")
+            || kind_str.contains("comment")
+            || kind_str.contains("mention")
+            || kind_str.contains("favorite")
+            || kind_str.contains("tip")
+            || kind_str.contains("message")
+            || kind_str.contains("purchase")
+            || kind_str.contains("stream");
+        return !clearly_other;
+    }
+    false
+}
+
+fn notification_fan_id(item: &serde_json::Map<String, Value>) -> Option<String> {
+    let raw = item
+        .get("user")
+        .and_then(Value::as_object)
+        .and_then(|user| user.get("id"))
+        .and_then(value_id)
+        .or_else(|| {
+            item.get("fromUser")
+                .and_then(Value::as_object)
+                .and_then(|user| user.get("id"))
+                .and_then(value_id)
+        })
+        .or_else(|| {
+            item.get("subscriber")
+                .and_then(Value::as_object)
+                .and_then(|user| user.get("id"))
+                .and_then(value_id)
+        })
+        .or_else(|| item.get("user_id").and_then(value_id))
+        .or_else(|| item.get("userId").and_then(value_id))
+        .or_else(|| item.get("fromUserId").and_then(value_id))
+        .or_else(|| item.get("subscriberId").and_then(value_id))?;
+    Some(numeric_id(&raw).unwrap_or(raw))
+}
+
+fn notification_arrived_at(item: &serde_json::Map<String, Value>) -> Option<String> {
+    ["createdAt", "created_at", "date", "sentAt"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(timestamp_from_value))
+        .or_else(|| {
+            item.get("user")
+                .and_then(Value::as_object)
+                .and_then(fan_arrived_at)
+        })
+}
+
+fn extract_subscription_notification_arrivals(
+    creator_of_id: Option<&str>,
+    url: &str,
+    value: &Value,
+) -> (Vec<(String, String)>, Vec<FanUpsertOwned>) {
+    let subscribed_tab = query_value(url, "type")
+        .map(|kind| {
+            let lower = kind.to_ascii_lowercase();
+            lower == "subscribed" || lower == "subscribes" || lower == "subscriptions"
+        })
+        .unwrap_or(false);
+    let Some(list) = value
+        .get("list")
+        .or_else(|| value.get("items"))
+        .or_else(|| value.get("notifications"))
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let creator_id = creator_of_id.map(str::trim).filter(|id| !id.is_empty());
+    let mut arrivals = Vec::new();
+    let mut fans = Vec::new();
+    for entry in list {
+        let Some(item) = entry.as_object() else {
+            continue;
+        };
+        if !is_subscription_notification(item, subscribed_tab) {
+            continue;
+        }
+        let Some(fan_id) = notification_fan_id(item) else {
+            continue;
+        };
+        if creator_id == Some(fan_id.as_str()) {
+            continue;
+        }
+        let Some(arrived_at) = notification_arrived_at(item) else {
+            continue;
+        };
+        arrivals.push((fan_id, arrived_at));
+        if let Some(user_val) = item.get("user").filter(|u| u.is_object()) {
+            if let Some((fan, _)) = extract_subscriber_upsert(user_val) {
+                if creator_id != Some(fan.of_fan_id.as_str()) {
+                    fans.push(fan);
+                }
+            }
+        }
+    }
+    (arrivals, fans)
+}
+
+async fn save_subscription_notifications(
+    store: &SupabaseStore,
+    model_id: &str,
+    url: &str,
+    value: &Value,
+) -> Result<bool, DbError> {
+    let creator_of_id = store
+        .get_model(model_id)
+        .await
+        .ok()
+        .and_then(|model| model.of_user_id);
+    let (arrivals, fans) =
+        extract_subscription_notification_arrivals(creator_of_id.as_deref(), url, value);
+    if arrivals.is_empty() && fans.is_empty() {
+        return Ok(false);
+    }
+    let (arrival_res, fan_res) = tokio::join!(
+        store.record_fan_arrivals_batch(model_id, &arrivals),
+        store.upsert_fans_batch(model_id, &fans)
+    );
+    let _ = fan_res;
+    Ok(arrival_res.unwrap_or(false))
+}
+
+fn extract_live_ws_sub_arrivals(
+    creator_of_id: Option<&str>,
+    body: &str,
+) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(root) = value.as_object() else {
+        return Vec::new();
+    };
+    let creator_id = creator_of_id.map(str::trim).filter(|id| !id.is_empty());
+    let mut out = Vec::new();
+    let inspect = |obj: &serde_json::Map<String, Value>, force_sub: bool| -> Option<(String, String)> {
+        if !force_sub && !is_subscription_notification(obj, false) {
+            return None;
+        }
+        let fan_id = notification_fan_id(obj).or_else(|| {
+            if force_sub {
+                obj.get("id")
+                    .and_then(value_id)
+                    .map(|id| numeric_id(&id).unwrap_or(id))
+            } else {
+                None
+            }
+        })?;
+        if creator_id == Some(fan_id.as_str()) {
+            return None;
+        }
+        let arrived_at =
+            notification_arrived_at(obj).unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        Some((fan_id, arrived_at))
+    };
+
+    for key in ["new_notification", "notification", "toast"] {
+        if let Some(obj) = root.get(key).and_then(Value::as_object) {
+            if let Some(found) = inspect(obj, false) {
+                out.push(found);
+            }
+        }
+    }
+    for key in ["new_subscriber", "subscribed"] {
+        if let Some(obj) = root.get(key).and_then(Value::as_object) {
+            if let Some(found) = inspect(obj, true) {
+                out.push(found);
+            }
+        }
+    }
+    if out.is_empty() && is_subscription_notification(root, false) {
+        if let Some(found) = inspect(root, false) {
+            out.push(found);
+        }
+    }
+    out
+}
+
+fn spend_stamp(
+    object: &serde_json::Map<String, Value>,
+    data: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    const KEYS: &[&str] = &["lastSpendAt", "lastPurchaseAt", "lastTransactionAt"];
+    for source in [Some(object), data] {
+        let Some(source) = source else { continue };
+        if let Some(found) = KEYS
+            .iter()
+            .find_map(|key| source.get(*key).and_then(timestamp_from_value))
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn publication_objects(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
@@ -1854,6 +2164,94 @@ mod tests {
         assert_eq!(
             fan_arrived_at(fan.as_object().unwrap()).as_deref(),
             Some("2026-11-26T06:40:00+00:00")
+        );
+    }
+
+    #[test]
+    fn classifies_and_extracts_subscription_notifications_and_ws_events() {
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/users/notifications?limit=50&type=subscribed"),
+            Some(CaptureKind::Notifications)
+        );
+        let payload = json!({
+            "list": [
+                {
+                    "id": "900001",
+                    "type": "subscribed",
+                    "subType": "subscribed",
+                    "text": "suscritos a su perfil!",
+                    "createdAt": "2026-11-27T04:30:00+00:00",
+                    "user": {
+                        "id": 404982216,
+                        "name": "John99",
+                        "username": "u404982216"
+                    }
+                },
+                {
+                    "id": "900002",
+                    "type": "favorited",
+                    "text": "me ha gustado tu post",
+                    "createdAt": "2026-11-27T04:20:00+00:00",
+                    "user": {
+                        "id": 604129243,
+                        "name": "Raul",
+                        "username": "u604129243"
+                    }
+                },
+                {
+                    "id": "900003",
+                    "type": "subscribed",
+                    "createdAt": "2026-11-27T00:15:00+00:00",
+                    "user_id": 777001
+                }
+            ]
+        });
+        let (arrivals, fans) = extract_subscription_notification_arrivals(
+            Some("100"),
+            "https://onlyfans.com/api2/v2/users/notifications?limit=50&type=all",
+            &payload,
+        );
+        assert_eq!(arrivals.len(), 2);
+        assert_eq!(arrivals[0].0, "404982216");
+        assert_eq!(arrivals[0].1, "2026-11-27T04:30:00+00:00");
+        assert_eq!(arrivals[1].0, "777001");
+        assert_eq!(arrivals[1].1, "2026-11-27T00:15:00+00:00");
+        assert_eq!(fans.len(), 1);
+        assert_eq!(fans[0].of_fan_id, "404982216");
+
+        let ws_body = json!({
+            "new_notification": {
+                "id": "900099",
+                "type": "subscribed",
+                "text": "subscribed to your profile!",
+                "createdAt": "2026-11-27T04:31:00+00:00",
+                "user": { "id": 404982216, "username": "u404982216" }
+            }
+        })
+        .to_string();
+        let ws_arrivals = extract_live_ws_sub_arrivals(Some("100"), &ws_body);
+        assert_eq!(ws_arrivals.len(), 1);
+        assert_eq!(ws_arrivals[0].0, "404982216");
+        assert_eq!(ws_arrivals[0].1, "2026-11-27T04:31:00+00:00");
+    }
+
+    #[test]
+    fn extracts_fan_arrival_from_subscribes_date_field() {
+        let fan = json!({
+            "id": 404982216,
+            "username": "u404982216",
+            "subscribedOnData": {
+                "subscribes": [
+                    {
+                        "date": "2026-11-27T04:30:00+00:00",
+                        "isCurrent": true
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            fan_arrived_at(fan.as_object().unwrap()).as_deref(),
+            Some("2026-11-27T04:30:00+00:00")
         );
     }
 }

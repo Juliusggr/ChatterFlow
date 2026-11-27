@@ -644,6 +644,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]

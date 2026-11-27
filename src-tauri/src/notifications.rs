@@ -379,7 +379,16 @@ impl NotificationBus {
             }
         }
         if matches!(batch.source, BatchSource::Transactions) && !row.transactions_seeded {
-            let keys: Vec<String> = candidates
+            let mut live = Vec::new();
+            let mut parked = Vec::new();
+            for cand in candidates.drain(..) {
+                if sale_within_recent_window(&cand) {
+                    live.push(cand);
+                } else {
+                    parked.push(cand);
+                }
+            }
+            let keys: Vec<String> = parked
                 .iter()
                 .map(|cand| event_key(model_id, cand))
                 .collect();
@@ -389,7 +398,10 @@ impl NotificationBus {
             row.transactions_seeded = true;
             self.persist_notify_row_if_changed(store, model_id, &initial_row, &row)
                 .await;
-            return Vec::new();
+            if live.is_empty() {
+                return Vec::new();
+            }
+            candidates = live;
         }
         if let BatchSource::ChatThread { .. } = batch.source {
             if !row.inbox_seeded {
@@ -479,9 +491,31 @@ impl NotificationBus {
         }
 
         if let Some(app) = app {
+            let external_key = if model.partition_id.trim().is_empty() {
+                String::new()
+            } else {
+                format!("partition:{}", model.partition_id.trim())
+            };
             for item in &emitted {
                 let _ = app.emit("cf-notification", item);
                 self.queue_os_toast(app, item);
+                if matches!(item.kind, NotificationKind::Ppv | NotificationKind::Tip) {
+                    if let (Some(gross), Some(net)) = (item.amount, item.net_amount) {
+                        let category = item.kind.as_str();
+                        let _ = store
+                            .record_employee_sale(
+                                &external_key,
+                                &item.of_fan_id,
+                                gross,
+                                net,
+                                category,
+                                &item.created_at,
+                                &item.id,
+                                "America/Caracas",
+                            )
+                            .await;
+                    }
+                }
             }
             if unread_changed {
                 let counts = self.unread_counts(store).await;
@@ -866,6 +900,79 @@ fn candidate_is_fresh(cand: &CandidateEvent) -> bool {
     age < chrono::Duration::seconds(FRESH_WINDOW_SECS) && age > chrono::Duration::seconds(-600)
 }
 
+fn sale_within_recent_window(cand: &CandidateEvent) -> bool {
+    let CandidateEvent::Sale { created_at, .. } = cand else {
+        return false;
+    };
+    let Ok(stamp) = chrono::DateTime::parse_from_rfc3339(created_at.trim()) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(stamp.with_timezone(&chrono::Utc));
+    age < chrono::Duration::hours(36) && age > chrono::Duration::seconds(-600)
+}
+
+pub fn extract_sales_from_notifications_payload(value: &Value) -> Vec<CandidateEvent> {
+    let list = value
+        .get("list")
+        .or_else(|| value.get("items"))
+        .or_else(|| value.get("notifications"))
+        .and_then(Value::as_array);
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in list {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        if let Some(ev) = sale_from_notification_object(obj) {
+            out.push(ev);
+        }
+    }
+    out
+}
+
+fn sale_kind_from_notification_object(obj: &serde_json::Map<String, Value>) -> Option<SaleKind> {
+    let kind_str = obj
+        .get("type")
+        .or_else(|| obj.get("subType"))
+        .or_else(|| obj.get("category"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let text = obj
+        .get("text")
+        .or_else(|| obj.get("description"))
+        .or_else(|| obj.get("replacedText"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let lower_text = text.to_lowercase();
+    if kind_str.contains("tip")
+        || lower_text.contains("sent you a tip")
+        || lower_text.contains("propina")
+        || lower_text.contains("te pagó una propina")
+        || lower_text.contains("paid you a tip")
+    {
+        return Some(SaleKind::Tip);
+    }
+    if kind_str.contains("purchas")
+        || (kind_str.contains("message")
+            && (kind_str.contains("pay") || lower_text.contains("comprado")))
+        || lower_text.contains("ha comprado")
+        || lower_text.contains("purchased")
+        || lower_text.contains("paid for")
+        || lower_text.contains("message para")
+    {
+        return Some(SaleKind::Ppv);
+    }
+    None
+}
+
+fn sale_from_notification_object(obj: &serde_json::Map<String, Value>) -> Option<CandidateEvent> {
+    let sale_kind = sale_kind_from_notification_object(obj)?;
+    sale_from_ws_object(obj, sale_kind)
+}
+
 fn max_candidate_id(candidates: &[CandidateEvent]) -> u64 {
     candidates
         .iter()
@@ -1212,6 +1319,14 @@ fn sale_from_ws_object(obj: &serde_json::Map<String, Value>, sale_kind: SaleKind
     let fan_id = user_id
         .or_else(|| json_id(obj.get("userId")))
         .unwrap_or_default();
+    let created_at = obj
+        .get("createdAt")
+        .or_else(|| obj.get("created_at"))
+        .or_else(|| obj.get("date"))
+        .and_then(Value::as_str)
+        .filter(|stamp| !stamp.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(utc_now);
     Some(CandidateEvent::Sale {
         sale_kind,
         of_event_id: ev_id,
@@ -1220,8 +1335,8 @@ fn sale_from_ws_object(obj: &serde_json::Map<String, Value>, sale_kind: SaleKind
         gross_amount: amount,
         net_amount: (amount * ONLYFANS_NET_RATIO * 100.0).round() / 100.0,
         preview: text.to_owned(),
-        created_at: utc_now(),
-        live_transition: true,
+        created_at,
+        live_transition: false,
     })
 }
 
@@ -1324,5 +1439,40 @@ mod tests {
         });
         let sale_events = parse_live_ws_payload(Some("100"), &ppv.to_string());
         assert_eq!(sale_events.len(), 1);
+    }
+
+    #[test]
+    fn extracts_spanish_purchase_and_tip_notification_rows() {
+        let payload = json!({
+            "list": [
+                {
+                    "id": "9010",
+                    "type": "paided_message",
+                    "text": "Dan ha comprado su message para $21.99!",
+                    "createdAt": "2026-11-27T12:48:00+00:00",
+                    "user": { "id": 69342824, "username": "u69342824" }
+                },
+                {
+                    "id": "9011",
+                    "text": "Carlos te pagó una propina de $25",
+                    "createdAt": "2026-11-27T16:05:00+00:00",
+                    "user": { "id": 525027223, "username": "carlos" }
+                }
+            ]
+        });
+        let sales = extract_sales_from_notifications_payload(&payload);
+        assert_eq!(sales.len(), 2);
+        match &sales[0] {
+            CandidateEvent::Sale {
+                sale_kind: SaleKind::Ppv,
+                gross_amount,
+                created_at,
+                ..
+            } => {
+                assert!((*gross_amount - 21.99).abs() < 0.01);
+                assert_eq!(created_at.as_str(), "2026-11-27T12:48:00+00:00");
+            }
+            _ => panic!("expected ppv"),
+        }
     }
 }
