@@ -54,11 +54,12 @@ export function zonedDate(
   second: number,
   timeZone: string,
 ): Date {
-  let utc = Date.UTC(year, month - 1, day, hour, minute, second);
+  const target = Date.UTC(year, month - 1, day, hour, minute, second);
+  let utc = target;
   for (let pass = 0; pass < 3; pass += 1) {
     const shown = zonedParts(new Date(utc), timeZone);
     const shownUtc = Date.UTC(shown.year, shown.month - 1, shown.day, shown.hour, shown.minute, shown.second);
-    const delta = shownUtc - utc;
+    const delta = shownUtc - target;
     if (delta === 0) break;
     utc -= delta;
   }

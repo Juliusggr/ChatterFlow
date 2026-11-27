@@ -690,6 +690,48 @@ export async function recordSale(input: {
   }
 }
 
+export type FanSpendBreakdown = {
+  ppvSpent: number;
+  tipSpent: number;
+  subSpent: number;
+  otherSpent: number;
+  totalSpendGross: number;
+  totalEarnedNet: number;
+  lastSpendAt: string | null;
+  highestSpend: number;
+};
+
+export async function loadFanSpend(
+  modelId: string,
+  fanPlatformId: string,
+): Promise<FanSpendBreakdown | null> {
+  const { data, error } = await supabase.rpc("fan_spend_breakdown", {
+    p_model_id: modelId,
+    p_of_fan_id: fanPlatformId,
+  });
+  if (error) {
+    if (/could not find the function|PGRST202/i.test(error.message)) return null;
+    throw error;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object") return null;
+  const record = row as Record<string, unknown>;
+  const number = (key: string) => {
+    const value = Number(record[key]);
+    return Number.isFinite(value) ? value : 0;
+  };
+  return {
+    ppvSpent: number("ppv_spent"),
+    tipSpent: number("tip_spent"),
+    subSpent: number("sub_spent"),
+    otherSpent: number("other_spent"),
+    totalSpendGross: number("total_spend_gross"),
+    totalEarnedNet: number("total_earned_net"),
+    lastSpendAt: typeof record.last_spend_at === "string" ? record.last_spend_at : null,
+    highestSpend: number("highest_spend"),
+  };
+}
+
 export async function loadFanNote(modelId: string, fanPlatformId: string): Promise<string> {
   const { data, error } = await supabase
     .from("fan_notes")

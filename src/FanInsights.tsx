@@ -3,11 +3,12 @@ import { FileText, PanelRightClose, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 import { errorMessage, openIncomingChat, setInsightsOpen } from "./api";
 import { NotificationToastStack } from "./Notifications";
-import { loadFanNote, saveFanNote, subscribeFanNote } from "./agency";
+import { loadFanNote, loadFanSpend, saveFanNote, subscribeFanNote, type FanSpendBreakdown } from "./agency";
 
 export function FanInsightsPanel({ modelId }: { modelId: string }) {
   const [ofFanId, setOfFanId] = useState("");
   const [notes, setNotes] = useState("");
+  const [spend, setSpend] = useState<FanSpendBreakdown | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedNoteSuccess, setSavedNoteSuccess] = useState(false);
 
@@ -32,7 +33,10 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
 
   useEffect(() => {
     if (!modelId || !ofFanId) {
-      if (!ofFanId) setNotes("");
+      if (!ofFanId) {
+        setNotes("");
+        setSpend(null);
+      }
       return;
     }
     let alive = true;
@@ -41,6 +45,15 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
         if (alive) setNotes(remote);
       })
       .catch(() => undefined);
+    void loadFanSpend(modelId, ofFanId)
+      .then((next) => {
+        if (!alive) return;
+        if (next && (next.totalSpendGross > 0 || next.totalEarnedNet > 0 || next.lastSpendAt)) setSpend(next);
+        else setSpend(null);
+      })
+      .catch(() => {
+        if (alive) setSpend(null);
+      });
     return () => {
       alive = false;
     };
@@ -54,6 +67,7 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
   useEffect(() => {
     setOfFanId("");
     setNotes("");
+    setSpend(null);
   }, [modelId]);
 
   async function persistNotes() {
@@ -135,6 +149,32 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
           void persistNotes();
         }}
       >
+        {spend ? (
+          <div
+            className="rounded-lg px-3 py-2.5 text-xs leading-relaxed"
+            style={{ background: "var(--bg-subtle)", border: "1px solid var(--border)" }}
+          >
+            <p>
+              <span className="font-semibold">Gastó el fan (bruto): </span>
+              {money(spend.totalSpendGross)}
+            </p>
+            {spend.ppvSpent > 0 ? <p>PPV: {money(spend.ppvSpent)}</p> : null}
+            {spend.tipSpent > 0 ? <p>Propinas: {money(spend.tipSpent)}</p> : null}
+            {spend.subSpent > 0 ? <p>Suscripciones: {money(spend.subSpent)}</p> : null}
+            {spend.otherSpent > 0 ? <p>Otros: {money(spend.otherSpent)}</p> : null}
+            {spend.highestSpend > 0 ? <p>Compra más alta: {money(spend.highestSpend)}</p> : null}
+            {spend.lastSpendAt ? <p>Última compra: {when(spend.lastSpendAt)}</p> : null}
+            {spend.totalEarnedNet > 0 ? (
+              <p>
+                <span className="font-semibold">Ingreso neto: </span>
+                {money(spend.totalEarnedNet)}
+              </p>
+            ) : null}
+            <p style={{ color: "var(--text-tertiary)" }}>
+              El bruto es lo que pagó el fan. El neto es lo que quedó en las transacciones después de la comisión de OnlyFans.
+            </p>
+          </div>
+        ) : null}
         <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-tertiary)" }}>
           <FileText size={14} strokeWidth={2} style={{ color: "var(--brand-500)" }} />
           Notas del fan
@@ -165,4 +205,14 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
       </form>
     </aside>
   );
+}
+
+function money(amount: number) {
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(amount);
+}
+
+function when(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("es", { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
