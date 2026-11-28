@@ -2122,19 +2122,20 @@ fn earning_from_item(value: &Value) -> Option<EarningDraft> {
         .or_else(|| object.get("created_at"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())?;
+    let type_text = object
+        .get("type")
+        .or_else(|| object.get("paymentType"))
+        .or_else(|| object.get("transactionType"))
+        .or_else(|| object.get("category"))
+        .and_then(Value::as_str);
+    let desc_text = object
+        .get("description")
+        .or_else(|| object.get("descriptionText"))
+        .and_then(Value::as_str);
+    if is_non_earning_transaction(type_text, desc_text) {
+        return None;
+    }
     let amounts_object = object.get("amounts").and_then(Value::as_object);
-    let kind = transaction_kind(
-        object
-            .get("type")
-            .or_else(|| object.get("paymentType"))
-            .or_else(|| object.get("transactionType"))
-            .or_else(|| object.get("category"))
-            .and_then(Value::as_str),
-        object
-            .get("description")
-            .or_else(|| object.get("descriptionText"))
-            .and_then(Value::as_str),
-    )?;
     let amount = object
         .get("amount")
         .and_then(number_value)
@@ -2155,6 +2156,17 @@ fn earning_from_item(value: &Value) -> Option<EarningDraft> {
             .and_then(number_value)
     });
     let (gross_amount, net_amount) = amounts(amount, net, fee)?;
+    if !gross_amount.is_finite() || gross_amount <= 0.0 || net_amount < 0.0 {
+        return None;
+    }
+    let kind = transaction_kind(type_text, desc_text).unwrap_or_else(|| {
+        let lower_desc = desc_text.unwrap_or("").to_lowercase();
+        if lower_desc.contains("/chats/") || lower_desc.contains("chat") {
+            TransactionType::Message
+        } else {
+            TransactionType::Post
+        }
+    });
     let user = object.get("user").and_then(Value::as_object);
     let fan_of_id = user.and_then(|user| user.get("id")).and_then(value_id);
     let fan_username = user
@@ -2171,6 +2183,29 @@ fn earning_from_item(value: &Value) -> Option<EarningDraft> {
         net_amount,
         created_at: created_at.to_owned(),
     })
+}
+
+fn is_non_earning_transaction(type_name: Option<&str>, description: Option<&str>) -> bool {
+    for candidate in [type_name, description].into_iter().flatten() {
+        let lower = candidate.to_lowercase();
+        if lower.contains("chargeback")
+            || lower.contains("refund")
+            || lower.contains("reversal")
+            || lower.contains("withdrawal")
+            || lower.contains("payout")
+            || lower.contains("reembolso")
+            || lower.contains("retiro")
+            || lower.contains("contracargo")
+            || lower.contains("devolucion")
+            || lower.contains("devolución")
+            || lower.contains("reverso")
+            || lower.contains("canceled")
+            || lower.contains("cancelled")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn net_from_gross(gross: f64) -> f64 {
@@ -2200,18 +2235,30 @@ fn transaction_kind(type_name: Option<&str>, description: Option<&str>) -> Optio
 }
 
 fn kind_from_text(value: &str) -> Option<TransactionType> {
-    let value = value.to_ascii_lowercase();
+    let value = value.to_lowercase();
     if value.contains("tip") || value.contains("propina") {
         Some(TransactionType::Tip)
     } else if value.contains("message")
         || value.contains("chat")
         || value.contains("mensaje")
         || value.contains("ppv")
+        || value.contains("/my/chats/")
     {
         Some(TransactionType::Message)
-    } else if value.contains("subscri") || value.contains("suscrip") {
+    } else if value.contains("subscri")
+        || value.contains("suscrip")
+        || value.contains("rebill")
+        || value.contains("renovaci")
+        || value.contains("trial")
+    {
         Some(TransactionType::Sub)
-    } else if value.contains("post") || value.contains("public") {
+    } else if value.contains("post")
+        || value.contains("public")
+        || value.contains("story")
+        || value.contains("historia")
+        || value.contains("bundle")
+        || value.contains("paquete")
+    {
         Some(TransactionType::Post)
     } else if value.contains("stream") || value.contains("transmis") {
         Some(TransactionType::Stream)

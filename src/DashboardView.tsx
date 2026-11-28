@@ -75,23 +75,29 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
 
   useEffect(() => {
     let alive = true;
-    let stop = () => {};
+    let stopModels = () => {};
+    let stopNotifs = () => {};
     let timer: number | undefined;
     const scheduleRefresh = () => {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         if (alive) setRefresh((current) => current + 1);
-      }, 200);
+      }, 250);
     };
     void listen("models-changed", scheduleRefresh).then((unlisten) => {
-      if (alive) stop = unlisten;
+      if (alive) stopModels = unlisten;
+      else unlisten();
+    });
+    void listen("cf-notification", scheduleRefresh).then((unlisten) => {
+      if (alive) stopNotifs = unlisten;
       else unlisten();
     });
     const stopShifts = subscribeActiveShifts(scheduleRefresh);
     return () => {
       alive = false;
       if (timer !== undefined) window.clearTimeout(timer);
-      stop();
+      stopModels();
+      stopNotifs();
       stopShifts();
     };
   }, []);

@@ -264,9 +264,10 @@ export async function loadCreatorReport(range: ReportRangeId, basis: EarningsBas
     .order("handle", { ascending: true })
     .order("id", { ascending: true });
 
-  // For "today", use row-level query so we can render hourly buckets immediately without requiring an RPC migration.
+  // For "today" and "month", use row-level query so real timestamped transactions (00:00–23:59 local)
+  // always override coarse UTC 'chart:' rows even before SQL view migration is applied.
   const aggPromise =
-    range === "today"
+    range === "today" || range === "month"
       ? Promise.resolve({ data: null, error: null })
       : supabase.rpc("creator_report_agg", {
           p_from: currentWin.from,
@@ -298,7 +299,7 @@ export async function loadCreatorReport(range: ReportRangeId, basis: EarningsBas
           : prevWin.from
         : currentWin.from;
     const maxTo = prevWin && prevWin.to > currentWin.to ? prevWin.to : currentWin.to;
-    const allRows = await listModelEarnings(minFrom, maxTo);
+    const allRows = await listModelEarnings(minFrom, maxTo, timeZone);
     const curStart = currentWin.from ? new Date(currentWin.from).getTime() : null;
     const curEnd = new Date(currentWin.to).getTime();
     const prevStart = prevWin ? new Date(prevWin.from).getTime() : null;
@@ -504,13 +505,27 @@ function percentChange(current: number, previous: number): number | null {
   return roundMoney(((current - previous) / previous) * 100);
 }
 
-async function listModelEarnings(from: string | null, to: string): Promise<ModelEarningRow[]> {
+async function listModelEarnings(
+  from: string | null,
+  to: string,
+  timeZone = DEFAULT_TIME_ZONE,
+): Promise<ModelEarningRow[]> {
   const pageSize = 1000;
-  const rows: ModelEarningRow[] = [];
+  const rawRows: {
+    modelId: string;
+    txId: string;
+    type: string;
+    gross: number;
+    net: number;
+    at: string;
+    dayKey: string;
+  }[] = [];
+
   for (let page = 0; page < 50; page += 1) {
     let query = supabase
-      .from("model_earnings")
-      .select("id,model_id,type,gross_amount,net_amount,created_at")
+      .from("model_transactions")
+      .select("id,model_id,of_transaction_id,type,gross_amount,net_amount,created_at")
+      .neq("created_at", "1970-01-01T00:00:00Z")
       .order("created_at", { ascending: true })
       .order("id", { ascending: true })
       .range(page * pageSize, page * pageSize + pageSize - 1);
@@ -520,17 +535,49 @@ async function listModelEarnings(from: string | null, to: string): Promise<Model
     if (error) throw error;
     const batch = data ?? [];
     for (const row of batch) {
-      rows.push({
+      const at = row.created_at as string;
+      const date = new Date(at);
+      if (Number.isNaN(date.getTime())) continue;
+      const parts = zonedParts(date, timeZone);
+      rawRows.push({
         modelId: row.model_id as string,
+        txId: String(row.of_transaction_id ?? ""),
         type: String(row.type ?? ""),
         gross: Number(row.gross_amount ?? 0),
         net: Number(row.net_amount ?? 0),
-        at: row.created_at as string,
+        at,
+        dayKey: dayKeyFromParts(parts),
       });
     }
-    if (batch.length < pageSize) return rows;
+    if (batch.length < pageSize) break;
   }
-  return rows;
+
+  const realModelTypeDays = new Set<string>();
+  for (const row of rawRows) {
+    if (!row.txId.startsWith("chart:")) {
+      realModelTypeDays.add(`${row.modelId}:${row.type}:${row.dayKey}`);
+    }
+  }
+
+  const nowParts = zonedParts(new Date(), timeZone);
+  const todayKey = dayKeyFromParts(nowParts);
+  const yesterdayKey = dayKeyFromParts(zonedParts(addZonedDays(nowParts, -1, timeZone), timeZone));
+
+  const out: ModelEarningRow[] = [];
+  for (const row of rawRows) {
+    if (row.txId.startsWith("chart:")) {
+      if (row.dayKey === todayKey || row.dayKey === yesterdayKey) continue;
+      if (realModelTypeDays.has(`${row.modelId}:${row.type}:${row.dayKey}`)) continue;
+    }
+    out.push({
+      modelId: row.modelId,
+      type: row.type,
+      gross: row.gross,
+      net: row.net,
+      at: row.at,
+    });
+  }
+  return out;
 }
 
 export type DropperShiftRecord = {

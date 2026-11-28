@@ -3055,12 +3055,34 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       if (needTx) {{
         window.__CF_LAST_TX_AT = Date.now();
         try {{
-          const txUrl = "https://onlyfans.com/api2/v2/payouts/transactions?limit=50";
-          const res = await client.get(txUrl);
-          if (res && res.data) {{
+          const maxPages = window.__CF_TX_BACKFILLED ? 1 : 5;
+          const cutoffMs = Date.now() - 7 * 86400 * 1000;
+          let marker = "";
+          let gotAny = false;
+          for (let page = 0; page < maxPages; page += 1) {{
+            const txUrl = marker
+              ? "https://onlyfans.com/api2/v2/payouts/transactions?limit=50&marker=" + encodeURIComponent(marker)
+              : "https://onlyfans.com/api2/v2/payouts/transactions?limit=50";
+            const res = await client.get(txUrl);
+            if (!res || !res.data) break;
+            gotAny = true;
+            const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
             const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
             deliver(txUrl, res.status || 200, text);
+            const list = Array.isArray(data) ? data : ((data && (data.list || data.items || data.transactions)) || []);
+            const hasMore = !!(data && data.hasMore);
+            const nextMarker = data && data.nextMarker != null ? String(data.nextMarker) : "";
+            if (!hasMore || !nextMarker || nextMarker === marker || !Array.isArray(list) || list.length === 0) break;
+            const lastItem = list[list.length - 1];
+            const lastStamp = lastItem && (lastItem.createdAt || lastItem.created_at);
+            const lastMs = lastStamp ? Date.parse(String(lastStamp)) : NaN;
+            if (Number.isFinite(lastMs) && lastMs < cutoffMs) break;
+            marker = nextMarker;
+            if (page + 1 < maxPages) {{
+              await new Promise((resolve) => setTimeout(resolve, 250));
+            }}
           }}
+          if (gotAny) window.__CF_TX_BACKFILLED = true;
         }} catch (e) {{}}
       }}
       if (needSubs) {{
