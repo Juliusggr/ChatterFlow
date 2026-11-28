@@ -945,9 +945,11 @@ async function dashboardChannelsAndRevenue(
  * Fetches the entire Dashboard dataset in a single parallel wave (exact 00:00–23:59 day bounds),
  * returning both Net and Gross series so toggling Neto/Bruto in the UI is instantaneous (0ms).
  */
-export async function loadDashboardSnapshot(range: DashboardRange): Promise<DashboardSnapshot> {
+export async function loadDashboardSnapshot(
+  range: DashboardRange,
+  timeZone = getDashboardTimeZone(),
+): Promise<DashboardSnapshot> {
   const profile = await loadMyProfile();
-  const timeZone = getDashboardTimeZone();
   const { from, to } = rangeBounds(range, timeZone);
   const hourly = range === "today" || range === "yesterday";
 

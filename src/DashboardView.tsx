@@ -35,6 +35,7 @@ import {
   type DashboardSnapshot,
 } from "./agency";
 import { syncDropperShiftRecords } from "./reports/data";
+import { DEFAULT_TIME_ZONE, TIME_ZONES } from "./reports/timeZone";
 import { formatCheckout, formatMoney, formatShiftDate, formatShiftTime } from "./types";
 
 const RANGES: { id: TimeRange; label: string }[] = [
@@ -55,6 +56,7 @@ const CARD_RADIUS = 20;
 
 export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: boolean }) {
   const [range, setRange] = useState<TimeRange>("today");
+  const [timeZone, setTimeZone] = useState(() => localStorage.getItem("cf-report-tz") || DEFAULT_TIME_ZONE);
   const [basis, setBasis] = useState<EarningsBasis>("gross");
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [clockBusy, setClockBusy] = useState(false);
@@ -105,7 +107,7 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    loadDashboardSnapshot(range)
+    loadDashboardSnapshot(range, timeZone)
       .then((next) => {
         if (!alive) return;
         setSnapshot(next);
@@ -121,7 +123,7 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
     return () => {
       alive = false;
     };
-  }, [range, refresh]);
+  }, [range, timeZone, refresh]);
 
   async function removeShift(id: string) {
     setDeletingId(id);
@@ -195,6 +197,26 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
               Neto
             </BasisButton>
           </div>
+          <select
+            aria-label="Zona horaria"
+            value={timeZone}
+            className="rounded-full px-3 py-1.5 text-sm font-medium outline-none"
+            style={{
+              background: "var(--header-chip)",
+              color: "var(--header-chip-text)",
+              border: "1px solid var(--border)",
+            }}
+            onChange={(event) => {
+              setTimeZone(event.target.value);
+              localStorage.setItem("cf-report-tz", event.target.value);
+            }}
+          >
+            {TIME_ZONES.map((zone) => (
+              <option key={zone.id} value={zone.id} style={{ background: "var(--bg-elevated)", color: "var(--text-primary)" }}>
+                {zone.label}
+              </option>
+            ))}
+          </select>
           <div
             className="inline-flex gap-0.5 rounded-full p-1"
             style={{ background: "var(--header-chip)" }}
@@ -459,9 +481,9 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
                   style={index > 0 ? { borderTop: "1px solid var(--border-muted)" } : undefined}
                 >
                   <ShiftField label="Usuario" value={shift.employeeName} />
-                  <ShiftField label="Fecha" value={formatShiftDate(shift.startTime)} />
-                  <ShiftField label="Hora del check-in" value={formatShiftTime(shift.startTime)} />
-                  <ShiftField label="Hora del check-out" value={formatCheckout(shift.startTime, shift.endTime)} />
+                  <ShiftField label="Fecha" value={formatShiftDate(shift.startTime, timeZone)} />
+                  <ShiftField label="Hora del check-in" value={formatShiftTime(shift.startTime, timeZone)} />
+                  <ShiftField label="Hora del check-out" value={formatCheckout(shift.startTime, shift.endTime, timeZone)} />
                   {canDeleteShifts ? (
                     <ShiftDelete
                       pending={pendingDeleteId === shift.id}

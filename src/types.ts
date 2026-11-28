@@ -125,22 +125,26 @@ export function formatStamp(value: string | null): string {
   }).format(date);
 }
 
-export function formatShiftDate(value: string): string {
+export function formatShiftDate(value: string, timeZone?: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("es", { dateStyle: "medium" }).format(date);
+  return new Intl.DateTimeFormat("es", { dateStyle: "medium", ...(timeZone ? { timeZone } : {}) }).format(date);
 }
 
-export function formatShiftTime(value: string): string {
+export function formatShiftTime(value: string, timeZone?: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("es", { timeStyle: "short" }).format(date);
+  return new Intl.DateTimeFormat("es", { timeStyle: "short", ...(timeZone ? { timeZone } : {}) }).format(date);
 }
 
-export function sameLocalDay(a: string, b: string): boolean {
+export function sameLocalDay(a: string, b: string, timeZone?: string): boolean {
   const left = new Date(a);
   const right = new Date(b);
   if (Number.isNaN(left.getTime()) || Number.isNaN(right.getTime())) return false;
+  if (timeZone) {
+    const fmt = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+    return fmt.format(left) === fmt.format(right);
+  }
   return (
     left.getFullYear() === right.getFullYear() &&
     left.getMonth() === right.getMonth() &&
@@ -148,10 +152,10 @@ export function sameLocalDay(a: string, b: string): boolean {
   );
 }
 
-export function formatCheckout(start: string, end: string | null): string {
+export function formatCheckout(start: string, end: string | null, timeZone?: string): string {
   if (!end) return "Abierto";
-  const time = formatShiftTime(end);
-  return sameLocalDay(start, end) ? time : `${formatShiftDate(end)} · ${time}`;
+  const time = formatShiftTime(end, timeZone);
+  return sameLocalDay(start, end, timeZone) ? time : `${formatShiftDate(end, timeZone)} · ${time}`;
 }
 
 export function formatMoney(value: number): string {
