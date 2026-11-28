@@ -227,6 +227,22 @@ pub fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Minimum valid dropper timestamp: 2026-11-26 00:00:00 America/Caracas (2026-11-26T04:00:00Z).
+pub fn dropper_cutoff_unix() -> i64 {
+    chrono::NaiveDate::from_ymd_opt(2026, 11, 26)
+        .and_then(|d| d.and_hms_opt(4, 0, 0))
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or(0)
+}
+
+/// Minimum valid chatter timestamp: 2026-11-27 00:00:00 America/Caracas (2026-11-27T04:00:00Z).
+pub fn chatter_cutoff_unix() -> i64 {
+    chrono::NaiveDate::from_ymd_opt(2026, 11, 27)
+        .and_then(|d| d.and_hms_opt(4, 0, 0))
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or(0)
+}
+
 pub fn unix_seconds(text: &str) -> Option<i64> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -911,10 +927,11 @@ impl SupabaseStore {
         if items.is_empty() {
             return Ok(false);
         }
+        let min_unix = dropper_cutoff_unix();
         let has_author = author_user_id.is_some_and(|a| !a.trim().is_empty());
         let mut pending = Vec::new();
         {
-            let seen = self
+            let mut seen = self
                 .seen_publications
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
@@ -928,6 +945,10 @@ impl SupabaseStore {
                         && seen.contains(&(model_id.to_owned(), clean_id.to_owned(), false)));
                 if !already {
                     let norm = normalize_timestamp_rfc3339(created_at).unwrap_or_else(utc_now);
+                    if unix_seconds(&norm).is_some_and(|ts| ts < min_unix) {
+                        seen.insert((model_id.to_owned(), clean_id.to_owned(), true));
+                        continue;
+                    }
                     pending.push((clean_id.to_owned(), norm));
                 }
             }
@@ -1001,10 +1022,11 @@ impl SupabaseStore {
         if items.is_empty() {
             return Ok(false);
         }
+        let min_unix = dropper_cutoff_unix();
         let mut pending = Vec::new();
         let mut local_dedup = HashSet::new();
         {
-            let seen = self
+            let mut seen = self
                 .seen_arrivals
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
@@ -1015,6 +1037,10 @@ impl SupabaseStore {
                 }
                 if !seen.contains(&(model_id.to_owned(), clean_id.to_owned())) {
                     let norm = normalize_timestamp_rfc3339(arrived_at).unwrap_or_else(utc_now);
+                    if unix_seconds(&norm).is_some_and(|ts| ts < min_unix) {
+                        seen.insert((model_id.to_owned(), clean_id.to_owned()));
+                        continue;
+                    }
                     pending.push((clean_id.to_owned(), norm));
                 }
             }
@@ -1820,6 +1846,9 @@ impl SupabaseStore {
             return Ok(());
         }
         if external_key.trim().is_empty() || source_id.trim().is_empty() {
+            return Ok(());
+        }
+        if unix_seconds(recorded_at).is_some_and(|ts| ts < chatter_cutoff_unix()) {
             return Ok(());
         }
         let req = self

@@ -60,6 +60,11 @@ export type DashboardSnapshot = {
 const WEEKDAY_BY_INDEX: Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const PROFILE_CACHE_TTL_MS = 60_000;
 
+/** Hard start cutoffs (America/Caracas UTC-4): no dropper data <= 2026-11-25, no chatter data <= 2026-11-26. */
+export const DROPPER_MIN_CARACAS_ISO = "2026-11-26T04:00:00.000Z";
+export const CHATTER_MIN_CARACAS_ISO = "2026-11-27T04:00:00.000Z";
+const CHATTER_MIN_CARACAS_MS = Date.parse(CHATTER_MIN_CARACAS_ISO);
+
 let cachedProfile: AgencyProfile | null = null;
 let cachedProfileUserId: string | null = null;
 let cachedProfileAt = 0;
@@ -543,11 +548,20 @@ export type ShiftSummary = {
 
 async function listMyShiftsForProfile(profile: AgencyProfile | null, from: string, to: string): Promise<ShiftSummary[]> {
   if (!profile) return [];
+  const roleCutoff =
+    profile.role === "chatter"
+      ? CHATTER_MIN_CARACAS_ISO
+      : profile.role === "dropper"
+        ? DROPPER_MIN_CARACAS_ISO
+        : null;
+  const effectiveFrom =
+    roleCutoff && new Date(from).getTime() < new Date(roleCutoff).getTime() ? roleCutoff : from;
+  if (new Date(effectiveFrom).getTime() >= new Date(to).getTime()) return [];
   const { data: shifts, error } = await supabase
     .from("shifts")
     .select("id,clock_in,clock_out")
     .eq("user_id", profile.id)
-    .gte("clock_in", from)
+    .gte("clock_in", effectiveFrom)
     .lt("clock_in", to)
     .order("clock_in", { ascending: false });
   if (error) throw error;
@@ -571,24 +585,29 @@ type SaleRow = {
 };
 
 async function listSales(from: string, to: string): Promise<SaleRow[]> {
+  const effectiveFrom =
+    new Date(from).getTime() < CHATTER_MIN_CARACAS_MS ? CHATTER_MIN_CARACAS_ISO : from;
+  if (new Date(effectiveFrom).getTime() >= new Date(to).getTime()) return [];
   const { data, error } = await supabase
     .from("sales")
     .select("employee_id,category,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
-    .gte("recorded_at", from)
+    .gte("recorded_at", effectiveFrom)
     .lt("recorded_at", to);
   if (error) throw error;
-  return (data ?? []).map((row) => {
-    const profile = firstRelation(row.profiles);
-    return {
-      employeeId: (row.employee_id as string | null) ?? "",
-      name: profile?.full_name || profile?.username || "Empleado",
-      role: typeof profile?.role === "string" ? profile.role : null,
-      category: typeof row.category === "string" ? row.category : "",
-      gross: Number(row.amount_gross),
-      net: Number(row.amount_net),
-      at: new Date(row.recorded_at as string).getTime(),
-    };
-  });
+  return (data ?? [])
+    .map((row) => {
+      const profile = firstRelation(row.profiles);
+      return {
+        employeeId: (row.employee_id as string | null) ?? "",
+        name: profile?.full_name || profile?.username || "Empleado",
+        role: typeof profile?.role === "string" ? profile.role : null,
+        category: typeof row.category === "string" ? row.category : "",
+        gross: Number(row.amount_gross),
+        net: Number(row.amount_net),
+        at: new Date(row.recorded_at as string).getTime(),
+      };
+    })
+    .filter((row) => Number.isFinite(row.at) && row.at >= CHATTER_MIN_CARACAS_MS);
 }
 
 export type RevenueBar = {
@@ -916,6 +935,10 @@ export async function recordSale(input: {
   recordedAt: string;
   sourceId: string;
 }): Promise<void> {
+  const recordedMs = Date.parse(input.recordedAt);
+  if (Number.isFinite(recordedMs) && recordedMs < CHATTER_MIN_CARACAS_MS) {
+    return;
+  }
   const timeZone =
     typeof localStorage !== "undefined"
       ? localStorage.getItem("cf-report-tz") || "America/Caracas"

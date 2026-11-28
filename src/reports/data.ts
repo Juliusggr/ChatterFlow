@@ -80,6 +80,32 @@ type Bucket = { key: string; label: string };
 
 const REPORT_CACHE_TTL_MS = 8_000;
 
+/**
+ * Hard launch cutoffs:
+ * - Droppers: nothing on or before 2026-11-25 (only >= 2026-11-26 00:00:00 in the report timezone).
+ * - Chatters: nothing on or before 2026-11-26 (only >= 2026-11-27 00:00:00 in the report timezone).
+ */
+function dropperMinDate(timeZone: string): Date {
+  return zonedDate(2026, 11, 26, 0, 0, 0, timeZone);
+}
+
+function chatterMinDate(timeZone: string): Date {
+  return zonedDate(2026, 11, 27, 0, 0, 0, timeZone);
+}
+
+function clampMinIso(from: string | null, minDate: Date): string {
+  if (!from) return minDate.toISOString();
+  const fromMs = new Date(from).getTime();
+  if (!Number.isFinite(fromMs) || fromMs < minDate.getTime()) {
+    return minDate.toISOString();
+  }
+  return from;
+}
+
+function isShiftUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
 let employeeCache: {
   key: string;
   at: number;
@@ -125,7 +151,12 @@ export function buildEmployeeReport(input: {
   chatters: { id: string; name: string }[];
   sales: SalePoint[];
 }): EmployeeReport {
-  const salesByChatter = input.sales.filter((sale) => sale.role === "chatter" && Number.isFinite(new Date(sale.at).getTime()));
+  const minChatterMs = chatterMinDate(input.timeZone).getTime();
+  const salesByChatter = input.sales.filter((sale) => {
+    if (sale.role !== "chatter") return false;
+    const ms = new Date(sale.at).getTime();
+    return Number.isFinite(ms) && ms >= minChatterMs;
+  });
   const granularity = resolveBucketGranularity(
     input.range,
     salesByChatter.map((sale) => sale.at),
@@ -694,40 +725,26 @@ export function buildDropperReport(input: {
 }): DropperReport {
   const now = input.now ?? new Date();
   const nowMs = now.getTime();
+  const minDropperMs = dropperMinDate(input.timeZone).getTime();
   const { from, to } = queryWindow(input.range, input.timeZone, now);
-  const rangeStartMs = from ? new Date(from).getTime() : null;
+  const rawRangeStartMs = from ? new Date(from).getTime() : null;
+  const rangeStartMs =
+    rawRangeStartMs === null ? minDropperMs : Math.max(rawRangeStartMs, minDropperMs);
   const rangeEndMs = new Date(to).getTime();
-  const inRange = (ms: number) => (rangeStartMs === null || ms >= rangeStartMs) && ms < rangeEndMs;
 
   const dismissedKeySet = new Set<string>();
-  const dismissedWindowsByUser = new Map<string, { startMs: number; endMs: number }[]>();
   for (const dismissed of input.dismissedShifts ?? []) {
     if (!dismissed.dropperUserId || !dismissed.shiftKey) continue;
     dismissedKeySet.add(`${dismissed.dropperUserId}:${dismissed.shiftKey}`);
-    const wStart = dismissed.windowStart ? new Date(dismissed.windowStart).getTime() : Number.NaN;
-    const wEnd = dismissed.windowEnd ? new Date(dismissed.windowEnd).getTime() : wStart + 3_600_000;
-    if (Number.isFinite(wStart) && Number.isFinite(wEnd)) {
-      const list = dismissedWindowsByUser.get(dismissed.dropperUserId) ?? [];
-      list.push({ startMs: wStart, endMs: Math.max(wEnd, wStart + 60_000) });
-      dismissedWindowsByUser.set(dismissed.dropperUserId, list);
-    }
   }
-  const isShiftDismissed = (
-    dropperUserId: string,
-    shiftId: string,
-    startMs: number,
-    endMs: number,
-    synthetic: boolean,
-  ): boolean => {
-    if (dismissedKeySet.has(`${dropperUserId}:${shiftId}`)) return true;
-    if (!synthetic) return false;
-    const windows = dismissedWindowsByUser.get(dropperUserId);
-    if (!windows || windows.length === 0) return false;
-    return windows.some((win) => startMs < win.endMs && endMs > win.startMs);
-  };
+  const isShiftDismissed = (dropperUserId: string, shiftId: string): boolean =>
+    dismissedKeySet.has(`${dropperUserId}:${shiftId}`);
 
   const peopleById = new Map(input.people.map((person) => [person.id, person]));
-  const counted = input.activity.filter((event) => Number.isFinite(new Date(event.at).getTime()));
+  const counted = input.activity.filter((event) => {
+    const ms = new Date(event.at).getTime();
+    return Number.isFinite(ms) && ms >= minDropperMs;
+  });
 
   const dropperSummaries = new Map<
     string,
@@ -817,15 +834,17 @@ export function buildDropperReport(input: {
     return entry;
   };
 
-  // 1. Seed one record per actual shift × assigned account.
+  // 1. Seed one record per actual check-in shift × assigned account (never invent past unclocked shifts).
   for (const shift of input.shifts ?? []) {
     const person = peopleById.get(shift.userId);
     if (!person) continue;
     const startMs = new Date(shift.clockIn).getTime();
-    if (!Number.isFinite(startMs)) continue;
+    if (!Number.isFinite(startMs) || startMs < minDropperMs) continue;
     const rawEndMs = shift.clockOut ? new Date(shift.clockOut).getTime() : null;
     const endMs = rawEndMs && Number.isFinite(rawEndMs) ? rawEndMs : Math.max(nowMs, startMs);
-    if (isShiftDismissed(person.id, shift.id, startMs, endMs, false)) continue;
+    if (startMs >= rangeEndMs) continue;
+    if (shift.status !== "active" && endMs < rangeStartMs) continue;
+    if (isShiftDismissed(person.id, shift.id)) continue;
     const slots = input.slotsByPerson.get(person.id) ?? [];
     const slotMatch = findShiftScheduleWindow(startMs, endMs, slots, input.timeZone);
     const scheduleLabel = slotMatch?.label || summarizeSlots(slots);
@@ -904,81 +923,27 @@ export function buildDropperReport(input: {
     return bySchedule[0];
   };
 
-  const ensureScheduledShift = (
-    person: { id: string; name: string },
+  const findMatchingShiftForPost = (
+    personId: string,
     account: AssignedAccount,
-    when: Date,
-    allowUnscheduledFallback: boolean,
-    forFans = false,
+    whenMs: number,
   ): MutableShiftEntry | null => {
-    const slots = input.slotsByPerson.get(person.id) ?? [];
-    const window = shiftWindow(when, slots, input.timeZone, forFans);
-    if (window) {
-      const startIso = new Date(window.start).toISOString();
-      const endIso = new Date(window.end).toISOString();
-      const shiftId = `sched:${person.id}:${startIso}`;
-      if (isShiftDismissed(person.id, shiftId, window.start, window.end, true)) {
-        return null;
-      }
-      const id = `${shiftId}:${account.modelId || "unassigned"}`;
-      return registerShiftEntry({
-        id,
-        shiftId,
-        dropperUserId: person.id,
-        dropperName: person.name,
-        modelId: account.modelId,
-        accountName: account.name,
-        shiftStart: startIso,
-        shiftEnd: window.end <= nowMs ? endIso : null,
-        scheduleLabel: window.label,
-        status: window.end <= nowMs ? "completed" : "active",
-        publicationsCount: 0,
-        subscriptionsCount: 0,
-        isActualShift: false,
-        startMs: window.start,
-        endMs: window.end,
-        slotStartMs: window.start,
-        slotEndMs: window.end,
-        fanSlotEndMs: window.fanEnd,
-        livePosts: 0,
-        liveFans: 0,
-      });
-    }
-    if (!allowUnscheduledFallback) return null;
-    const parts = zonedParts(when, input.timeZone);
-    const dayStart = zonedDate(parts.year, parts.month, parts.day, 0, 0, 0, input.timeZone);
-    const dayEnd = addZonedDays(parts, 1, input.timeZone);
-    const dayKey = dayKeyFromParts(parts);
-    const shiftId = `day:${person.id}:${dayKey}`;
-    if (isShiftDismissed(person.id, shiftId, dayStart.getTime(), dayEnd.getTime(), true)) {
-      return null;
-    }
-    const id = `${shiftId}:${account.modelId || "unassigned"}`;
-    return registerShiftEntry({
-      id,
-      shiftId,
-      dropperUserId: person.id,
-      dropperName: person.name,
-      modelId: account.modelId,
-      accountName: account.name,
-      shiftStart: when.toISOString(),
-      shiftEnd: dayEnd.getTime() <= nowMs ? dayEnd.toISOString() : null,
-      scheduleLabel: summarizeSlots(slots),
-      status: dayEnd.getTime() <= nowMs ? "completed" : "active",
-      publicationsCount: 0,
-      subscriptionsCount: 0,
-      isActualShift: false,
-      startMs: dayStart.getTime(),
-      endMs: dayEnd.getTime(),
-      slotStartMs: null,
-      slotEndMs: null,
-      fanSlotEndMs: null,
-      livePosts: 0,
-      liveFans: 0,
-    });
+    const direct = findMatchingActualShift(personId, account, whenMs);
+    if (direct) return direct;
+    const bySchedule = (actualShiftsByPerson.get(personId) ?? []).filter(
+      (entry) =>
+        entry.modelId === account.modelId &&
+        entry.slotStartMs !== null &&
+        entry.slotEndMs !== null &&
+        whenMs >= entry.slotStartMs &&
+        whenMs <= Math.max(entry.slotEndMs, entry.endMs) + 60_000,
+    );
+    if (bySchedule.length === 0) return null;
+    bySchedule.sort((a, b) => a.startMs - b.startMs);
+    return bySchedule[0];
   };
 
-  // 2. Attribute publications to shifts.
+  // 2. Attribute publications ONLY to real check-in shifts (never synthesize unclocked shifts).
   for (const event of counted) {
     if (event.kind !== "post") continue;
     const when = new Date(event.at);
@@ -1000,26 +965,15 @@ export function buildDropperReport(input: {
       if (!person) continue;
       const account = resolveAccountForEvent(authorId, event.modelId);
       ensureDropperAccount(authorId, person.name, account);
-      const actualShift = findMatchingActualShift(authorId, account, whenMs);
+      const actualShift = findMatchingShiftForPost(authorId, account, whenMs);
       if (actualShift) {
         actualShift.livePosts += 1;
         actualShift.publicationsCount = actualShift.livePosts;
-      } else if (inRange(whenMs)) {
-        const scheduledShift = ensureScheduledShift(
-          person,
-          account,
-          when,
-          event.authorUserId === authorId,
-        );
-        if (scheduledShift) {
-          scheduledShift.livePosts += 1;
-          scheduledShift.publicationsCount = scheduledShift.livePosts;
-        }
       }
     }
   }
 
-  // 3. Attribute fan subscriptions arriving during a dropper's active/completed shift or scheduled hours & chart timestamps.
+  // 3. Attribute fan subscriptions ONLY to real check-in shifts & chart timestamps.
   const chartFanEvents: { dropperId: string; at: string; count: number }[] = [];
   for (const event of counted) {
     if (event.kind !== "fan") continue;
@@ -1034,41 +988,23 @@ export function buildDropperReport(input: {
         actualShift.liveFans += 1;
         actualShift.subscriptionsCount = actualShift.liveFans;
         chartFanEvents.push({ dropperId: person.id, at: event.at, count: 1 });
-        continue;
-      }
-      const window = shiftWindow(when, input.slotsByPerson.get(person.id) ?? [], input.timeZone, true);
-      const windowOverlapsRange =
-        window !== null &&
-        (rangeStartMs === null
-          ? window.start < rangeEndMs
-          : window.start < rangeEndMs && window.fanEnd > rangeStartMs);
-      if (inRange(whenMs) || windowOverlapsRange) {
-        const scheduledShift = ensureScheduledShift(person, account, when, false, true);
-        if (scheduledShift) {
-          scheduledShift.liveFans += 1;
-          scheduledShift.subscriptionsCount = scheduledShift.liveFans;
-          chartFanEvents.push({ dropperId: person.id, at: event.at, count: 1 });
-        }
       }
     }
   }
 
-  // 4. Merge persisted shift records from Supabase so saved shifts are never lost.
+  // 4. Merge persisted real shift records from Supabase (>= 2026-11-26 only).
   for (const stored of input.storedRecords ?? []) {
     if (!peopleById.has(stored.dropperUserId)) continue;
+    if (!isShiftUuid(stored.shiftId)) continue;
     const person = peopleById.get(stored.dropperUserId)!;
     const startMs = new Date(stored.shiftStart).getTime();
-    if (!Number.isFinite(startMs)) continue;
+    if (!Number.isFinite(startMs) || startMs < minDropperMs) continue;
     const endMs = stored.shiftEnd ? new Date(stored.shiftEnd).getTime() : Math.max(nowMs, startMs);
-    const isSyntheticStored =
-      stored.shiftId.startsWith("sched:") || stored.shiftId.startsWith("day:");
-    if (isShiftDismissed(person.id, stored.shiftId, startMs, endMs, isSyntheticStored)) {
+    if (isShiftDismissed(person.id, stored.shiftId)) {
       continue;
     }
     const overlapsRange =
-      rangeStartMs === null
-        ? startMs < rangeEndMs
-        : startMs < rangeEndMs && (stored.status === "active" || endMs >= rangeStartMs);
+      startMs < rangeEndMs && (stored.status === "active" || endMs >= rangeStartMs);
     if (!overlapsRange) continue;
 
     const assignedAccounts = input.accountsByPerson.get(person.id) ?? [];
@@ -1465,24 +1401,27 @@ function minutesOf(value: string): number {
 }
 
 async function listDropperActivity(range: ReportRangeId, timeZone: string): Promise<ActivityEvent[]> {
+  const minDropper = dropperMinDate(timeZone);
   const { from, to } = queryWindow(range, timeZone);
-  const bufferedFrom = from ? new Date(new Date(from).getTime() - 24 * 3_600_000).toISOString() : null;
+  if (new Date(to).getTime() <= minDropper.getTime()) return [];
+  const rawBuffered = from ? new Date(new Date(from).getTime() - 24 * 3_600_000).toISOString() : null;
+  const bufferedFrom = clampMinIso(rawBuffered, minDropper);
 
-  let pubQuery = supabase
+  const pubQuery = supabase
     .from("publications")
     .select("model_id,created_at,author_user_id")
+    .gte("created_at", bufferedFrom)
     .lt("created_at", to)
     .order("created_at", { ascending: false })
     .limit(5000);
-  if (bufferedFrom) pubQuery = pubQuery.gte("created_at", bufferedFrom);
 
-  let fanQuery = supabase
+  const fanQuery = supabase
     .from("fan_arrivals")
     .select("model_id,arrived_at")
+    .gte("arrived_at", bufferedFrom)
     .lt("arrived_at", to)
     .order("arrived_at", { ascending: false })
     .limit(5000);
-  if (bufferedFrom) fanQuery = fanQuery.gte("arrived_at", bufferedFrom);
 
   const [pubRes, fanRes] = await Promise.all([pubQuery, fanQuery]);
   const events: ActivityEvent[] = [];
@@ -1516,16 +1455,19 @@ async function listDropperShifts(
   timeZone: string,
 ): Promise<DropperShiftRow[]> {
   if (ids.length === 0) return [];
+  const minDropper = dropperMinDate(timeZone);
+  const minIso = minDropper.toISOString();
   const { from, to } = queryWindow(range, timeZone);
-  let query = supabase
+  if (new Date(to).getTime() <= minDropper.getTime()) return [];
+  const effectiveFrom = clampMinIso(from, minDropper);
+  const query = supabase
     .from("shifts")
     .select("id,user_id,clock_in,clock_out,status")
     .in("user_id", ids)
+    .gte("clock_in", minIso)
     .lt("clock_in", to)
+    .or(`clock_out.gte.${effectiveFrom},status.eq.active,clock_in.gte.${effectiveFrom}`)
     .order("clock_in", { ascending: false });
-  if (from) {
-    query = query.or(`clock_out.gte.${from},status.eq.active`);
-  }
   const { data, error } = await query;
   if (error) throw error;
   return (data ?? []).map((row) => ({
@@ -1544,18 +1486,21 @@ async function listRemoteDropperShiftRecords(
 ): Promise<DropperShiftRecord[]> {
   if (ids.length === 0) return [];
   try {
+    const minDropper = dropperMinDate(timeZone);
+    const minIso = minDropper.toISOString();
     const { from, to } = queryWindow(range, timeZone);
-    let query = supabase
+    if (new Date(to).getTime() <= minDropper.getTime()) return [];
+    const effectiveFrom = clampMinIso(from, minDropper);
+    const query = supabase
       .from("dropper_shift_reports")
       .select(
         "id,shift_id,dropper_user_id,model_id,shift_start,shift_end,schedule_label,status,publications_count,subscriptions_count,updated_at,models(name,handle),profiles(full_name,username)",
       )
       .in("dropper_user_id", ids)
+      .gte("shift_start", minIso)
       .lt("shift_start", to)
+      .or(`shift_end.gte.${effectiveFrom},status.eq.active,shift_start.gte.${effectiveFrom}`)
       .order("shift_start", { ascending: false });
-    if (from) {
-      query = query.or(`shift_end.gte.${from},status.eq.active,shift_start.gte.${from}`);
-    }
     const { data, error } = await query;
     if (error || !data) return [];
     return data.map((row) => {
@@ -1750,19 +1695,22 @@ async function listChatterSales(
   timeZone: string,
   onlyEmployeeId: string | null,
 ): Promise<SalePoint[]> {
+  const minChatter = chatterMinDate(timeZone);
   const { from, to } = queryWindow(range, timeZone);
+  const effectiveFrom = clampMinIso(from, minChatter);
+  if (new Date(effectiveFrom).getTime() >= new Date(to).getTime()) return [];
   const pageSize = 1000;
   const rows: SalePoint[] = [];
   for (let page = 0; page < 50; page += 1) {
     let query = supabase
       .from("sales")
       .select("id,employee_id,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
+      .gte("recorded_at", effectiveFrom)
+      .lt("recorded_at", to)
       .order("recorded_at", { ascending: true })
       .order("id", { ascending: true })
       .range(page * pageSize, page * pageSize + pageSize - 1);
     if (onlyEmployeeId) query = query.eq("employee_id", onlyEmployeeId);
-    if (from) query = query.gte("recorded_at", from);
-    if (to) query = query.lt("recorded_at", to);
     const { data, error } = await query;
     if (error) throw error;
     const batch = data ?? [];
