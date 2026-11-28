@@ -11,30 +11,63 @@ import { supabase } from "../supabase";
 import { roundMoney } from "./format";
 import { addZonedDays, DEFAULT_TIME_ZONE, zonedDate, zonedParts, type ZonedParts } from "./timeZone";
 
-export type ReportRangeId = "today" | "month" | "days90" | "year" | "all";
+export type ReportRangeId = "today" | "yesterday" | "week" | "month" | "days90" | "year" | "all";
 
 export const REPORT_RANGES: { id: ReportRangeId; label: string }[] = [
   { id: "today", label: "Hoy" },
-  { id: "month", label: "This month" },
-  { id: "days90", label: "90 days" },
-  { id: "year", label: "This year" },
-  { id: "all", label: "All" },
+  { id: "yesterday", label: "Ayer" },
+  { id: "week", label: "Esta semana" },
+  { id: "month", label: "Este mes" },
+  { id: "days90", label: "90 días" },
+  { id: "year", label: "Este año" },
+  { id: "all", label: "Todo" },
 ];
+
+export type ChatterModelBreakdown = {
+  id: string;
+  modelId: string;
+  accountName: string;
+  sales: number;
+  salesCount: number;
+};
+
+export type ChatterSummaryRow = {
+  id: string;
+  name: string;
+  schedule: string;
+  sales: number;
+  salesCount: number;
+  shifts: number;
+  workedMinutes: number;
+  modelsCount: number;
+  models: ChatterModelBreakdown[];
+};
+
+export type ChatterShiftGroup = {
+  id: string;
+  shiftId: string;
+  chatterUserId: string;
+  chatterName: string;
+  shiftStart: string;
+  shiftEnd: string | null;
+  scheduleLabel: string;
+  status: "active" | "completed";
+  sales: number;
+  salesCount: number;
+  workedMinutes: number;
+  accountsCount: number;
+  models: ChatterModelBreakdown[];
+};
 
 export type EmployeeReport = {
   labels: string[];
   series: { id: string; name: string; values: number[] }[];
   ranking: { id: string; name: string; amount: number }[];
   totalSales: number;
-  unlockRate: null;
-  averageReplySeconds: null;
-  scheduledHours: null;
-  rows: {
-    id: string;
-    name: string;
-    sales: number;
-    unlockRatio: null;
-  }[];
+  totalWorkedMinutes: number;
+  totalShifts: number;
+  rows: ChatterSummaryRow[];
+  shiftGroups: ChatterShiftGroup[];
 };
 
 export type CreatorReport = {
@@ -63,6 +96,20 @@ type SalePoint = {
   employeeId: string;
   name: string;
   role: string | null;
+  gross: number;
+  net: number;
+  at: string;
+  modelId?: string;
+  fanId?: string;
+  category?: string;
+  sourceId?: string | null;
+};
+
+type ModelSaleTxRow = {
+  modelId: string;
+  txId: string;
+  fanId: string;
+  category: "ppv" | "tip";
   gross: number;
   net: number;
   at: string;
@@ -109,9 +156,16 @@ function isShiftUuid(value: string): boolean {
 let employeeCache: {
   key: string;
   at: number;
+  inputs: EmployeeReportInputs;
+} | null = null;
+
+type EmployeeReportInputs = {
   chatters: { id: string; name: string }[];
   sales: SalePoint[];
-} | null = null;
+  slotsByChatter: Map<string, ScheduleSlot[]>;
+  accountsByChatter: Map<string, AssignedAccount[]>;
+  shifts: DropperShiftRow[];
+};
 
 let creatorCache: {
   key: string;
@@ -126,22 +180,103 @@ export async function loadEmployeeReport(range: ReportRangeId, basis: EarningsBa
   if (!profile) throw new Error("No hay una sesión activa");
   const cacheKey = `${profile.id}:${range}:${timeZone}`;
   if (employeeCache && employeeCache.key === cacheKey && Date.now() - employeeCache.at < REPORT_CACHE_TTL_MS) {
-    return buildEmployeeReport({
-      range,
-      basis,
-      timeZone,
-      chatters: employeeCache.chatters,
-      sales: employeeCache.sales,
-    });
+    return buildEmployeeReport({ range, basis, timeZone, ...employeeCache.inputs });
   }
 
   const manager = isManager(profile.role);
-  const [chatters, sales] = await Promise.all([
-    manager ? listActiveChatters() : Promise.resolve([]),
+  const chatters = manager
+    ? await listActiveChatters()
+    : profile.role === "chatter"
+      ? [{ id: profile.id, name: displayName(profile.full_name, profile.username) }]
+      : [];
+  const chatterIds = chatters.map((chatter) => chatter.id);
+
+  const [recordedSales, slotsByChatter, accountsByChatter, chatterShifts, modelSaleTx] = await Promise.all([
     listChatterSales(range, timeZone, manager ? null : profile.id),
+    listScheduleSlots(chatterIds),
+    listAssignedAccounts(chatterIds),
+    listChatterShifts(chatterIds, range, timeZone),
+    chatterIds.length > 0 ? listModelSaleTransactions(range, timeZone) : Promise.resolve([]),
   ]);
-  employeeCache = { key: cacheKey, at: Date.now(), chatters, sales };
-  return buildEmployeeReport({ range, basis, timeZone, chatters, sales });
+
+  const sales = mergeAttributedModelSales({
+    chatters,
+    recordedSales,
+    modelSaleTx,
+    slotsByChatter,
+    accountsByChatter,
+    shifts: chatterShifts,
+    timeZone,
+  });
+
+  const inputs: EmployeeReportInputs = {
+    chatters,
+    sales,
+    slotsByChatter,
+    accountsByChatter,
+    shifts: chatterShifts,
+  };
+  employeeCache = { key: cacheKey, at: Date.now(), inputs };
+  return buildEmployeeReport({ range, basis, timeZone, ...inputs });
+}
+
+export function invalidateEmployeeReportCache(): void {
+  employeeCache = null;
+}
+
+export async function deleteChatterShift(group: ChatterShiftGroup): Promise<void> {
+  await deleteShift(group.shiftId);
+  employeeCache = null;
+}
+
+/**
+ * Chatter ranking for an arbitrary window (used by the Dashboard "Empleados" card).
+ * Merges recorded public.sales with real model_transactions attributed through
+ * assignment + schedule + check-in, so it matches Employee Reports.
+ */
+export async function loadChatterRankings(
+  window: { from: string; to: string },
+  timeZone: string,
+): Promise<{ net: { employeeId: string; name: string; amount: number }[]; gross: { employeeId: string; name: string; amount: number }[] }> {
+  const profile = await loadMyProfile();
+  if (!profile) return { net: [], gross: [] };
+  const manager = isManager(profile.role);
+  const chatters = manager
+    ? await listActiveChatters()
+    : profile.role === "chatter"
+      ? [{ id: profile.id, name: displayName(profile.full_name, profile.username) }]
+      : [];
+  const chatterIds = chatters.map((chatter) => chatter.id);
+  const [recordedSales, slotsByChatter, accountsByChatter, chatterShifts, modelSaleTx] = await Promise.all([
+    listChatterSales(window, timeZone, manager ? null : profile.id),
+    listScheduleSlots(chatterIds),
+    listAssignedAccounts(chatterIds),
+    listChatterShifts(chatterIds, window, timeZone),
+    chatterIds.length > 0 ? listModelSaleTransactions(window, timeZone) : Promise.resolve([]),
+  ]);
+  const sales = mergeAttributedModelSales({
+    chatters,
+    recordedSales,
+    modelSaleTx,
+    slotsByChatter,
+    accountsByChatter,
+    shifts: chatterShifts,
+    timeZone,
+  });
+  const totals = new Map<string, { name: string; gross: number; net: number }>();
+  for (const sale of sales) {
+    if (sale.role !== "chatter") continue;
+    const current = totals.get(sale.employeeId) ?? { name: sale.name, gross: 0, net: 0 };
+    current.gross = roundMoney(current.gross + (Number.isFinite(sale.gross) ? sale.gross : 0));
+    current.net = roundMoney(current.net + (Number.isFinite(sale.net) ? sale.net : 0));
+    totals.set(sale.employeeId, current);
+  }
+  const rank = (pick: "gross" | "net") =>
+    [...totals.entries()]
+      .map(([employeeId, row]) => ({ employeeId, name: row.name, amount: row[pick] }))
+      .filter((row) => row.amount > 0)
+      .sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name, "es"));
+  return { net: rank("net"), gross: rank("gross") };
 }
 
 export function buildEmployeeReport(input: {
@@ -150,12 +285,24 @@ export function buildEmployeeReport(input: {
   timeZone: string;
   chatters: { id: string; name: string }[];
   sales: SalePoint[];
+  slotsByChatter?: Map<string, ScheduleSlot[]>;
+  accountsByChatter?: Map<string, AssignedAccount[]>;
+  shifts?: DropperShiftRow[];
+  now?: Date;
 }): EmployeeReport {
+  const now = input.now ?? new Date();
+  const nowMs = now.getTime();
+  const slotsByChatter = input.slotsByChatter ?? new Map<string, ScheduleSlot[]>();
+  const accountsByChatter = input.accountsByChatter ?? new Map<string, AssignedAccount[]>();
   const minChatterMs = chatterMinDate(input.timeZone).getTime();
+  const { from, to } = queryWindow(input.range, input.timeZone, now);
+  const rangeStartMs = Math.max(from ? new Date(from).getTime() : minChatterMs, minChatterMs);
+  const rangeEndMs = new Date(to).getTime();
+
   const salesByChatter = input.sales.filter((sale) => {
     if (sale.role !== "chatter") return false;
     const ms = new Date(sale.at).getTime();
-    return Number.isFinite(ms) && ms >= minChatterMs;
+    return Number.isFinite(ms) && ms >= minChatterMs && ms >= rangeStartMs && ms < rangeEndMs;
   });
   const granularity = resolveBucketGranularity(
     input.range,
@@ -165,24 +312,133 @@ export function buildEmployeeReport(input: {
   const keys = salesByChatter
     .map((sale) => bucketKeyFor(granularity, sale.at, input.timeZone))
     .filter((key): key is string => Boolean(key));
-  const buckets = collectBuckets(input.range, keys, input.timeZone, granularity);
-  const byEmployee = new Map<string, { name: string; total: number; byBucket: Map<string, number> }>();
+  const buckets = collectBuckets(input.range, keys, input.timeZone, granularity, now);
 
-  for (const chatter of input.chatters) {
-    byEmployee.set(chatter.id, { name: chatter.name, total: 0, byBucket: new Map() });
+  const modelNames = new Map<string, string>();
+  for (const accounts of accountsByChatter.values()) {
+    for (const account of accounts) modelNames.set(account.modelId, account.name);
   }
+  const modelName = (modelId: string | undefined) => (modelId ? modelNames.get(modelId) : undefined) ?? "Cuenta";
+
+  type Agg = {
+    name: string;
+    total: number;
+    count: number;
+    byBucket: Map<string, number>;
+    byModel: Map<string, { sales: number; count: number }>;
+  };
+  const byEmployee = new Map<string, Agg>();
+  const ensure = (id: string, name: string): Agg => {
+    const existing = byEmployee.get(id);
+    if (existing) {
+      if (name) existing.name = name;
+      return existing;
+    }
+    const created: Agg = { name, total: 0, count: 0, byBucket: new Map(), byModel: new Map() };
+    byEmployee.set(id, created);
+    return created;
+  };
+  for (const chatter of input.chatters) ensure(chatter.id, chatter.name);
+
+  // Real check-in shifts that overlap the range.
+  const shiftsInRange = (input.shifts ?? [])
+    .map((shift) => {
+      const startMs = new Date(shift.clockIn).getTime();
+      const endRaw = shift.clockOut ? new Date(shift.clockOut).getTime() : nowMs;
+      return { shift, startMs, endMs: Number.isFinite(endRaw) ? endRaw : nowMs };
+    })
+    .filter(({ startMs, endMs }) => Number.isFinite(startMs) && startMs >= minChatterMs && endMs > rangeStartMs && startMs < rangeEndMs);
+
+  type ShiftAgg = {
+    shift: DropperShiftRow;
+    startMs: number;
+    endMs: number;
+    windowStart: number | null;
+    windowEnd: number | null;
+    scheduleLabel: string;
+    sales: number;
+    count: number;
+    byModel: Map<string, { sales: number; count: number }>;
+  };
+  const shiftAggs: ShiftAgg[] = shiftsInRange.map(({ shift, startMs, endMs }) => {
+    const win = findShiftScheduleWindow(startMs, endMs, slotsByChatter.get(shift.userId) ?? [], input.timeZone);
+    return {
+      shift,
+      startMs,
+      endMs,
+      windowStart: win?.start ?? null,
+      windowEnd: win?.end ?? null,
+      scheduleLabel: win?.label ?? summarizeSlots(slotsByChatter.get(shift.userId) ?? []),
+      sales: 0,
+      count: 0,
+      byModel: new Map(),
+    };
+  });
+  const shiftsByUser = new Map<string, ShiftAgg[]>();
+  for (const agg of shiftAggs) {
+    const list = shiftsByUser.get(agg.shift.userId) ?? [];
+    list.push(agg);
+    shiftsByUser.set(agg.shift.userId, list);
+  }
+
+  const addModel = (map: Map<string, { sales: number; count: number }>, modelId: string, amount: number) => {
+    const current = map.get(modelId) ?? { sales: 0, count: 0 };
+    current.sales = roundMoney(current.sales + amount);
+    current.count += 1;
+    map.set(modelId, current);
+  };
 
   for (const sale of salesByChatter) {
     const raw = input.basis === "net" ? sale.net : sale.gross;
     if (!Number.isFinite(raw)) continue;
     const amount = roundMoney(raw);
+    const saleMs = new Date(sale.at).getTime();
     const key = bucketKeyFor(granularity, sale.at, input.timeZone);
-    const current = byEmployee.get(sale.employeeId) ?? { name: sale.name, total: 0, byBucket: new Map() };
-    current.name = sale.name || current.name;
+    const current = ensure(sale.employeeId, sale.name);
     current.total = roundMoney(current.total + amount);
+    current.count += 1;
     if (key) current.byBucket.set(key, roundMoney((current.byBucket.get(key) ?? 0) + amount));
-    byEmployee.set(sale.employeeId, current);
+    const modelKey = sale.modelId || "unassigned";
+    addModel(current.byModel, modelKey, amount);
+
+    const userShifts = shiftsByUser.get(sale.employeeId) ?? [];
+    const target =
+      userShifts.find((agg) => saleMs >= agg.startMs - 60_000 && saleMs <= agg.endMs + 60_000) ??
+      userShifts.find(
+        (agg) => agg.windowStart !== null && agg.windowEnd !== null && saleMs >= agg.windowStart && saleMs < agg.windowEnd,
+      );
+    if (target) {
+      target.sales = roundMoney(target.sales + amount);
+      target.count += 1;
+      addModel(target.byModel, modelKey, amount);
+    }
   }
+
+  const workedMinutesOf = (agg: ShiftAgg) => {
+    const start = Math.max(agg.startMs, rangeStartMs);
+    const end = Math.min(agg.endMs, rangeEndMs, nowMs);
+    return end > start ? Math.round((end - start) / 60_000) : 0;
+  };
+
+  const toBreakdown = (
+    map: Map<string, { sales: number; count: number }>,
+    prefix: string,
+    assigned: AssignedAccount[] = [],
+  ): ChatterModelBreakdown[] => {
+    const ids = new Set<string>([...assigned.map((account) => account.modelId), ...map.keys()]);
+    return [...ids]
+      .map((modelId) => {
+        const totals = map.get(modelId) ?? { sales: 0, count: 0 };
+        return {
+          id: `${prefix}:${modelId}`,
+          modelId,
+          accountName: modelId === "unassigned" ? "Sin cuenta" : modelName(modelId),
+          sales: totals.sales,
+          salesCount: totals.count,
+        };
+      })
+      .sort((a, b) => b.sales - a.sales || a.accountName.localeCompare(b.accountName, "es"));
+  };
 
   const ranked = [...byEmployee.entries()]
     .filter(([, row]) => row.total > 0)
@@ -194,24 +450,55 @@ export function buildEmployeeReport(input: {
     values: buckets.map((bucket) => row.byBucket.get(bucket.key) ?? 0),
   }));
 
-  const rows = [...byEmployee.entries()]
-    .map(([id, row]) => ({
-      id,
-      name: row.name,
-      sales: row.total,
-      unlockRatio: null,
-    }))
-    .sort((a, b) => b.sales - a.sales || a.name.localeCompare(b.name, "es"));
+  const rows: ChatterSummaryRow[] = [...byEmployee.entries()]
+    .map(([id, row]) => {
+      const userShifts = shiftsByUser.get(id) ?? [];
+      const assigned = accountsByChatter.get(id) ?? [];
+      const models = toBreakdown(row.byModel, id, assigned);
+      return {
+        id,
+        name: row.name,
+        schedule: summarizeSlots(slotsByChatter.get(id) ?? []),
+        sales: row.total,
+        salesCount: row.count,
+        shifts: userShifts.length,
+        workedMinutes: userShifts.reduce((sum, agg) => sum + workedMinutesOf(agg), 0),
+        modelsCount: assigned.length,
+        models,
+      };
+    })
+    .sort((a, b) => b.sales - a.sales || b.workedMinutes - a.workedMinutes || a.name.localeCompare(b.name, "es"));
+
+  const shiftGroups: ChatterShiftGroup[] = shiftAggs
+    .map((agg) => {
+      const assigned = accountsByChatter.get(agg.shift.userId) ?? [];
+      return {
+        id: agg.shift.id,
+        shiftId: agg.shift.id,
+        chatterUserId: agg.shift.userId,
+        chatterName: byEmployee.get(agg.shift.userId)?.name ?? "Chatter",
+        shiftStart: agg.shift.clockIn,
+        shiftEnd: agg.shift.clockOut,
+        scheduleLabel: agg.scheduleLabel,
+        status: agg.shift.status,
+        sales: agg.sales,
+        salesCount: agg.count,
+        workedMinutes: workedMinutesOf(agg),
+        accountsCount: assigned.length,
+        models: toBreakdown(agg.byModel, agg.shift.id, assigned),
+      };
+    })
+    .sort((a, b) => new Date(b.shiftStart).getTime() - new Date(a.shiftStart).getTime());
 
   return {
     labels: buckets.map((bucket) => bucket.label),
     series,
     ranking: ranked.slice(0, 3).map(([id, row]) => ({ id, name: row.name, amount: row.total })),
     totalSales: roundMoney(rows.reduce((sum, row) => sum + row.sales, 0)),
-    unlockRate: null,
-    averageReplySeconds: null,
-    scheduledHours: null,
+    totalWorkedMinutes: rows.reduce((sum, row) => sum + row.workedMinutes, 0),
+    totalShifts: shiftGroups.length,
     rows,
+    shiftGroups,
   };
 }
 
@@ -255,7 +542,7 @@ export async function loadCreatorReport(range: ReportRangeId, basis: EarningsBas
 
   const currentWin = queryWindow(range, timeZone);
   const prevWin = previousQueryWindow(range, timeZone);
-  const bucketKind = range === "today" || range === "month" ? "day" : "month";
+  const bucketKind = range === "today" || range === "yesterday" || range === "week" || range === "month" ? "day" : "month";
 
   const modelsPromise = supabase
     .from("models")
@@ -267,7 +554,7 @@ export async function loadCreatorReport(range: ReportRangeId, basis: EarningsBas
   // For "today" and "month", use row-level query so real timestamped transactions (00:00–23:59 local)
   // always override coarse UTC 'chart:' rows even before SQL view migration is applied.
   const aggPromise =
-    range === "today" || range === "month"
+    range === "today" || range === "yesterday" || range === "week" || range === "month"
       ? Promise.resolve({ data: null, error: null })
       : supabase.rpc("creator_report_agg", {
           p_from: currentWin.from,
@@ -1737,13 +2024,19 @@ async function listActiveByRole(role: "chatter" | "dropper"): Promise<{ id: stri
   }));
 }
 
+type ReportWindow = ReportRangeId | { from: string | null; to: string };
+
+function resolveWindow(range: ReportWindow, timeZone: string): { from: string | null; to: string } {
+  return typeof range === "string" ? queryWindow(range, timeZone) : range;
+}
+
 async function listChatterSales(
-  range: ReportRangeId,
+  range: ReportWindow,
   timeZone: string,
   onlyEmployeeId: string | null,
 ): Promise<SalePoint[]> {
   const minChatter = chatterMinDate(timeZone);
-  const { from, to } = queryWindow(range, timeZone);
+  const { from, to } = resolveWindow(range, timeZone);
   const effectiveFrom = clampMinIso(from, minChatter);
   if (new Date(effectiveFrom).getTime() >= new Date(to).getTime()) return [];
   const pageSize = 1000;
@@ -1751,7 +2044,7 @@ async function listChatterSales(
   for (let page = 0; page < 50; page += 1) {
     let query = supabase
       .from("sales")
-      .select("id,employee_id,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
+      .select("id,model_id,employee_id,fan_platform_id,category,source_id,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
       .gte("recorded_at", effectiveFrom)
       .lt("recorded_at", to)
       .order("recorded_at", { ascending: true })
@@ -1771,6 +2064,10 @@ async function listChatterSales(
         gross: Number(row.amount_gross),
         net: Number(row.amount_net),
         at: row.recorded_at as string,
+        modelId: (row.model_id as string | null) ?? undefined,
+        fanId: normalizeFanId(row.fan_platform_id as string | null),
+        category: String(row.category ?? "").toLowerCase() || undefined,
+        sourceId: (row.source_id as string | null) ?? null,
       });
     }
     if (batch.length < pageSize) return rows;
@@ -1778,12 +2075,279 @@ async function listChatterSales(
   throw new Error("Hay demasiadas ventas para sumarlas en una sola consulta");
 }
 
+async function listChatterShifts(
+  ids: string[],
+  range: ReportWindow,
+  timeZone: string,
+): Promise<DropperShiftRow[]> {
+  if (ids.length === 0) return [];
+  const minCaracas = chatterMinDate(DEFAULT_TIME_ZONE);
+  const minLocal = chatterMinDate(timeZone);
+  const minStart = new Date(Math.min(minCaracas.getTime(), minLocal.getTime()));
+  const { from, to } = resolveWindow(range, timeZone);
+  if (new Date(to).getTime() <= minStart.getTime()) return [];
+  const bufferedFrom = from
+    ? clampMinIso(new Date(new Date(from).getTime() - 24 * 3_600_000).toISOString(), minStart)
+    : minStart.toISOString();
+  const { data, error } = await supabase
+    .from("shifts")
+    .select("id,user_id,clock_in,clock_out,status")
+    .in("user_id", ids)
+    .gte("clock_in", minStart.toISOString())
+    .lt("clock_in", to)
+    .or(`clock_out.gte.${bufferedFrom},status.eq.active,clock_in.gte.${bufferedFrom}`)
+    .order("clock_in", { ascending: false });
+  if (error) return [];
+  return (data ?? []).map((row) => ({
+    id: row.id as string,
+    userId: row.user_id as string,
+    clockIn: row.clock_in as string,
+    clockOut: (row.clock_out as string | null) ?? null,
+    status: row.status === "completed" ? "completed" : "active",
+  }));
+}
+
+async function listModelSaleTransactions(
+  range: ReportWindow,
+  timeZone: string,
+): Promise<ModelSaleTxRow[]> {
+  const minChatter = chatterMinDate(timeZone);
+  const { from, to } = resolveWindow(range, timeZone);
+  const effectiveFrom = clampMinIso(from, minChatter);
+  if (new Date(effectiveFrom).getTime() >= new Date(to).getTime()) return [];
+  const pageSize = 1000;
+  const rows: ModelSaleTxRow[] = [];
+  for (let page = 0; page < 50; page += 1) {
+    const { data, error } = await supabase
+      .from("model_transactions")
+      .select("id,model_id,of_transaction_id,of_fan_id,type,gross_amount,net_amount,created_at")
+      .in("type", ["message", "tip"])
+      .not("of_transaction_id", "like", "chart:%")
+      .neq("created_at", "1970-01-01T00:00:00Z")
+      .gte("created_at", effectiveFrom)
+      .lt("created_at", to)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(page * pageSize, page * pageSize + pageSize - 1);
+    if (error) return rows;
+    const batch = data ?? [];
+    for (const row of batch) {
+      const txId = String(row.of_transaction_id ?? "").trim();
+      if (!txId || txId.startsWith("chart:")) continue;
+      const type = String(row.type ?? "").toLowerCase();
+      if (type !== "message" && type !== "tip") continue;
+      const gross = Number(row.gross_amount ?? 0);
+      const net = Number(row.net_amount ?? 0);
+      if (!Number.isFinite(gross) || gross <= 0) continue;
+      rows.push({
+        modelId: String(row.model_id ?? ""),
+        txId,
+        fanId: normalizeFanId(row.of_fan_id as string | null),
+        category: type === "message" ? "ppv" : "tip",
+        gross,
+        net: Number.isFinite(net) && net > 0 ? net : roundMoney(gross * 0.8),
+        at: String(row.created_at ?? ""),
+      });
+    }
+    if (batch.length < pageSize) break;
+  }
+  return rows;
+}
+
+function normalizeFanId(value: string | null | undefined): string {
+  return String(value ?? "").trim().replace(/^[uU]/, "");
+}
+
+function normalizeSaleCategory(value: string | undefined): string {
+  if (!value) return "";
+  const lower = value.toLowerCase();
+  return lower === "message" ? "ppv" : lower;
+}
+
+function chatterAllowedAt(
+  atMs: number,
+  slots: ScheduleSlot[],
+  shifts: DropperShiftRow[],
+  timeZone: string,
+  nowMs: number,
+): { allowed: boolean; inClockSpan: boolean } {
+  const minCaracasMs = chatterMinDate(DEFAULT_TIME_ZONE).getTime();
+  const minLocalMs = chatterMinDate(timeZone).getTime();
+  if (!Number.isFinite(atMs) || atMs < minCaracasMs || atMs < minLocalMs) {
+    return { allowed: false, inClockSpan: false };
+  }
+
+  let inClockSpan = false;
+  for (const shift of shifts) {
+    const startMs = new Date(shift.clockIn).getTime();
+    if (!Number.isFinite(startMs) || startMs < minCaracasMs) continue;
+    const endMs = shift.clockOut ? new Date(shift.clockOut).getTime() : nowMs;
+    if (atMs >= startMs - 60_000 && atMs <= (Number.isFinite(endMs) ? endMs : nowMs) + 60_000) {
+      inClockSpan = true;
+    }
+  }
+
+  if (slots.length === 0) {
+    return { allowed: inClockSpan, inClockSpan };
+  }
+
+  const win = shiftWindow(new Date(atMs), slots, timeZone);
+  if (!win) {
+    return { allowed: false, inClockSpan };
+  }
+
+  // Same scheduled occurrence as a real check-in. A sale at 00:21 belongs to the
+  // overnight window that started the previous evening, not to a shift that
+  // clocks in at 21:00 later that calendar day.
+  const allowed = shifts.some((shift) => {
+    const startMs = new Date(shift.clockIn).getTime();
+    if (!Number.isFinite(startMs) || startMs < minCaracasMs) return false;
+    const endRaw = shift.clockOut ? new Date(shift.clockOut).getTime() : nowMs;
+    const shiftWin = findShiftScheduleWindow(startMs, Number.isFinite(endRaw) ? endRaw : nowMs, slots, timeZone);
+    return shiftWin !== null && shiftWin.start === win.start;
+  });
+  return { allowed, inClockSpan };
+}
+
+function mergeAttributedModelSales(input: {
+  chatters: { id: string; name: string }[];
+  recordedSales: SalePoint[];
+  modelSaleTx: ModelSaleTxRow[];
+  slotsByChatter: Map<string, ScheduleSlot[]>;
+  accountsByChatter: Map<string, AssignedAccount[]>;
+  shifts: DropperShiftRow[];
+  timeZone: string;
+}): SalePoint[] {
+  const nowMs = Date.now();
+  const shiftsByChatter = new Map<string, DropperShiftRow[]>();
+  for (const shift of input.shifts) {
+    const list = shiftsByChatter.get(shift.userId) ?? [];
+    list.push(shift);
+    shiftsByChatter.set(shift.userId, list);
+  }
+
+  const chatterSales = input.recordedSales.filter((sale) => {
+    if (sale.role !== "chatter") return false;
+    return chatterAllowedAt(
+      new Date(sale.at).getTime(),
+      input.slotsByChatter.get(sale.employeeId) ?? [],
+      shiftsByChatter.get(sale.employeeId) ?? [],
+      input.timeZone,
+      nowMs,
+    ).allowed;
+  });
+  if (input.modelSaleTx.length === 0 || input.chatters.length === 0) {
+    return chatterSales;
+  }
+
+  const chattersByModel = new Map<string, { id: string; name: string }[]>();
+  const chatterById = new Map(input.chatters.map((c) => [c.id, c]));
+  for (const [chatterId, accounts] of input.accountsByChatter.entries()) {
+    const chatter = chatterById.get(chatterId);
+    if (!chatter) continue;
+    for (const acc of accounts) {
+      const list = chattersByModel.get(acc.modelId) ?? [];
+      if (!list.some((item) => item.id === chatter.id)) {
+        list.push(chatter);
+      }
+      chattersByModel.set(acc.modelId, list);
+    }
+  }
+
+  const sourceIdSet = new Set<string>();
+  const recordedIndex = chatterSales.map((sale) => {
+    if (sale.sourceId) sourceIdSet.add(sale.sourceId);
+    return {
+      sale,
+      ms: new Date(sale.at).getTime(),
+      gross: roundMoney(sale.gross),
+      category: normalizeSaleCategory(sale.category),
+      fanId: normalizeFanId(sale.fanId),
+      consumed: false,
+    };
+  });
+
+  const merged: SalePoint[] = [...chatterSales];
+
+  for (const tx of input.modelSaleTx) {
+    const txMs = new Date(tx.at).getTime();
+    if (!Number.isFinite(txMs)) continue;
+    const txSourceA = `tx:${tx.modelId}:${tx.txId}`;
+    const txSourceB = `sale:${tx.category}:${tx.modelId}:${tx.txId}`;
+    if (sourceIdSet.has(txSourceA) || sourceIdSet.has(txSourceB)) {
+      continue;
+    }
+
+    const txGross = roundMoney(tx.gross);
+    const existing = recordedIndex.find((entry) => {
+      if (entry.consumed) return false;
+      if (entry.sale.modelId && entry.sale.modelId !== tx.modelId) return false;
+      if (entry.category && entry.category !== tx.category) return false;
+      if (Math.abs(entry.gross - txGross) > 0.01) return false;
+      if (tx.fanId && entry.fanId && tx.fanId !== entry.fanId) return false;
+      return Math.abs(entry.ms - txMs) <= 5 * 60_000;
+    });
+    if (existing) {
+      existing.consumed = true;
+      continue;
+    }
+
+    const candidates = chattersByModel.get(tx.modelId) ?? [];
+    if (candidates.length === 0) continue;
+
+    let chosen: { id: string; name: string } | null = null;
+    let chosenInClockSpan = false;
+    for (const chatter of candidates) {
+      const check = chatterAllowedAt(
+        txMs,
+        input.slotsByChatter.get(chatter.id) ?? [],
+        shiftsByChatter.get(chatter.id) ?? [],
+        input.timeZone,
+        nowMs,
+      );
+      if (!check.allowed) continue;
+      if (
+        !chosen ||
+        (check.inClockSpan && !chosenInClockSpan) ||
+        (check.inClockSpan === chosenInClockSpan && chatter.id < chosen.id)
+      ) {
+        chosen = chatter;
+        chosenInClockSpan = check.inClockSpan;
+      }
+    }
+
+    if (chosen) {
+      merged.push({
+        employeeId: chosen.id,
+        name: chosen.name,
+        role: "chatter",
+        gross: tx.gross,
+        net: tx.net,
+        at: tx.at,
+        modelId: tx.modelId,
+        fanId: tx.fanId,
+        category: tx.category,
+        sourceId: txSourceA,
+      });
+    }
+  }
+
+  return merged;
+}
+
 function queryWindow(range: ReportRangeId, timeZone: string, now = new Date()): { from: string | null; to: string } {
   const today = zonedParts(now, timeZone);
   const tomorrow = addZonedDays(today, 1, timeZone).toISOString();
+  const todayStart = zonedDate(today.year, today.month, today.day, 0, 0, 0, timeZone).toISOString();
   if (range === "all") return { from: null, to: tomorrow };
   if (range === "today") {
-    return { from: zonedDate(today.year, today.month, today.day, 0, 0, 0, timeZone).toISOString(), to: tomorrow };
+    return { from: todayStart, to: tomorrow };
+  }
+  if (range === "yesterday") {
+    return { from: addZonedDays(today, -1, timeZone).toISOString(), to: todayStart };
+  }
+  if (range === "week") {
+    return { from: addZonedDays(today, -daysSinceMonday(today), timeZone).toISOString(), to: tomorrow };
   }
   if (range === "month") {
     return { from: zonedDate(today.year, today.month, 1, 0, 0, 0, timeZone).toISOString(), to: tomorrow };
@@ -1798,9 +2362,24 @@ function queryWindow(range: ReportRangeId, timeZone: string, now = new Date()): 
   return { from: start.toISOString(), to: tomorrow };
 }
 
+function daysSinceMonday(parts: ZonedParts): number {
+  return (new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay() + 6) % 7;
+}
+
 function previousQueryWindow(range: ReportRangeId, timeZone: string): { from: string; to: string } | null {
   if (range === "all") return null;
   const today = zonedParts(new Date(), timeZone);
+  if (range === "yesterday") {
+    const start = addZonedDays(today, -2, timeZone);
+    const end = addZonedDays(today, -1, timeZone);
+    return { from: start.toISOString(), to: end.toISOString() };
+  }
+  if (range === "week") {
+    const monday = -daysSinceMonday(today);
+    const start = addZonedDays(today, monday - 7, timeZone);
+    const end = addZonedDays(today, monday, timeZone);
+    return { from: start.toISOString(), to: end.toISOString() };
+  }
   if (range === "today") {
     const start = addZonedDays(today, -1, timeZone);
     const end = zonedDate(today.year, today.month, today.day, 0, 0, 0, timeZone);
@@ -1830,8 +2409,8 @@ function resolveBucketGranularity(
   timestamps: string[],
   timeZone: string,
 ): BucketGranularity {
-  if (range === "today") return "hour";
-  if (range === "month") return "day";
+  if (range === "today" || range === "yesterday") return "hour";
+  if (range === "month" || range === "week") return "day";
   if (range === "days90" || range === "year") return "month";
 
   // For "all", pick a granularity that matches the actual span of data so charts never collapse into a single dot.
@@ -1861,7 +2440,8 @@ function collectBuckets(
   now = new Date(),
 ): Bucket[] {
   const effective: BucketGranularity =
-    granularity ?? (range === "today" ? "hour" : range === "month" ? "day" : "month");
+    granularity ??
+    (range === "today" || range === "yesterday" ? "hour" : range === "month" || range === "week" ? "day" : "month");
   const keys = new Set(baseKeys(range, timeZone, effective, now));
   for (const key of saleKeys) keys.add(key);
   const filled = fillBucketGaps([...keys].sort(), effective, timeZone);
@@ -1941,6 +2521,22 @@ function baseKeys(
 ): string[] {
   const today = zonedParts(now, timeZone);
   if (range === "all") return [];
+  if (range === "yesterday") {
+    const yesterday = zonedParts(addZonedDays(today, -1, timeZone), timeZone);
+    const keys: string[] = [];
+    for (let hour = 0; hour <= 23; hour += 1) {
+      keys.push(hourKeyFromParts({ ...yesterday, hour }));
+    }
+    return keys;
+  }
+  if (range === "week") {
+    const keys: string[] = [];
+    const back = daysSinceMonday(today);
+    for (let offset = -back; offset <= 0; offset += 1) {
+      keys.push(dayKeyFromParts(zonedParts(addZonedDays(today, offset, timeZone), timeZone)));
+    }
+    return keys;
+  }
   if (range === "today" || granularity === "hour") {
     const maxHour = Math.min(23, Math.max(today.hour, 1));
     const keys: string[] = [];
