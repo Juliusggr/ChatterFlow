@@ -124,9 +124,12 @@ export function EmployeeReportView({ report }: { report: EmployeeReport }) {
             return (
               <li key={person.id} className="flex items-center gap-3">
                 <PersonAvatar name={person.name} size={36} />
-                <span className="text-[15px] font-medium" style={{ color: INK }}>{person.name}</span>
+                <span className="min-w-0 truncate text-[15px] font-medium" style={{ color: INK }}>{person.name}</span>
+                <span className="ml-auto text-[15px] font-semibold tabular-nums" style={{ color: INK }}>
+                  {formatReportMoney(person.amount)}
+                </span>
                 <span
-                  className="ml-auto flex h-[34px] w-7 items-center justify-center rounded-lg text-sm font-medium tabular-nums"
+                  className="flex h-[34px] w-7 items-center justify-center rounded-lg text-sm font-medium tabular-nums"
                   style={{ background: rank.background, color: rank.color }}
                 >
                   {index + 1}

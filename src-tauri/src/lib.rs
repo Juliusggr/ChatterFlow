@@ -21,14 +21,16 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let tauri::WindowEvent::Destroyed = event {
-                    window.app_handle().exit(0);
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    sessions::shutdown_secondary_windows(window.app_handle());
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             commands::set_supabase_session,
             commands::get_models,
+            commands::refresh_models,
+            commands::set_app_theme,
             commands::open_model_session,
             commands::open_messages,
             commands::get_message_tabs,

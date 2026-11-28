@@ -261,6 +261,17 @@ export function MessagesTabBar() {
             {pickerOpen ? <X size={16} /> : <Plus size={16} />}
           </button>
         ) : null}
+        <button
+          type="button"
+          title="Ocultar barra lateral"
+          aria-label="Ocultar barra lateral"
+          onClick={() => changePlacement("top")}
+          className="mb-2 flex w-12 flex-col items-center gap-0.5 rounded-lg px-1 py-1.5 text-[10px] font-semibold leading-none"
+          style={{ background: "var(--brand-500)", color: "#fff" }}
+        >
+          <PanelTop size={14} strokeWidth={2.25} />
+          Ocultar
+        </button>
       </aside>
     );
   }

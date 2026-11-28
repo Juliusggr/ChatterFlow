@@ -4,6 +4,8 @@ fn main() {
             tauri_build::AppManifest::new().commands(&[
                 "set_supabase_session",
                 "get_models",
+                "refresh_models",
+                "set_app_theme",
                 "open_model_session",
                 "open_messages",
                 "get_message_tabs",

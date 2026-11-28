@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Trash2 } from "lucide-react";
 import { Fragment, useEffect, useState } from "react";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { subscribeDropperTables } from "../agency";
@@ -22,6 +22,7 @@ import {
   TRACK,
 } from "./chrome";
 import {
+  deleteDropperShiftGroup,
   loadDropperReport,
   type DropperModelBreakdown,
   type DropperReport,
@@ -38,7 +39,15 @@ const RANKS = [
   { background: "var(--report-rank-3)", color: "var(--report-rank-3-ink)" },
 ] as const;
 
-export function DropperReports({ range, timeZone }: { range: ReportRangeId; timeZone: string }) {
+export function DropperReports({
+  range,
+  timeZone,
+  canDeleteShifts = false,
+}: {
+  range: ReportRangeId;
+  timeZone: string;
+  canDeleteShifts?: boolean;
+}) {
   const [report, setReport] = useState<DropperReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -93,12 +102,46 @@ export function DropperReports({ range, timeZone }: { range: ReportRangeId; time
 
   if (loading) return <ReportLoading />;
   if (error || !report) return <ReportError message={error ?? "No se pudo cargar el reporte"} />;
-  return <DropperReportView report={report} timeZone={timeZone} />;
+  return (
+    <DropperReportView
+      report={report}
+      timeZone={timeZone}
+      canDeleteShifts={canDeleteShifts}
+      onShiftDeleted={() => setRefresh((current) => current + 1)}
+    />
+  );
 }
 
-function DropperReportView({ report, timeZone }: { report: DropperReport; timeZone: string }) {
+function DropperReportView({
+  report,
+  timeZone,
+  canDeleteShifts,
+  onShiftDeleted,
+}: {
+  report: DropperReport;
+  timeZone: string;
+  canDeleteShifts: boolean;
+  onShiftDeleted: () => void;
+}) {
   const [expandedDroppers, setExpandedDroppers] = useState<Set<string>>(() => new Set());
   const [expandedShifts, setExpandedShifts] = useState<Set<string>>(() => new Set());
+  const [pendingDeleteShiftId, setPendingDeleteShiftId] = useState<string | null>(null);
+  const [deletingShiftId, setDeletingShiftId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  async function handleDeleteShift(group: DropperShiftGroup) {
+    setDeletingShiftId(group.id);
+    setDeleteError(null);
+    try {
+      await deleteDropperShiftGroup(group);
+      setPendingDeleteShiftId(null);
+      onShiftDeleted();
+    } catch (caught) {
+      setDeleteError(errorMessage(caught));
+    } finally {
+      setDeletingShiftId(null);
+    }
+  }
 
   const toggleDropper = (id: string) => {
     setExpandedDroppers((current) => {
@@ -270,21 +313,26 @@ function DropperReportView({ report, timeZone }: { report: DropperReport; timeZo
             Historial guardado por cada turno
           </span>
         </div>
+        {deleteError ? (
+          <p role="alert" className="mb-3 text-xs font-medium" style={{ color: "var(--danger, #dc2626)" }}>
+            {deleteError}
+          </p>
+        ) : null}
         {report.shiftGroups.length === 0 ? (
           <EmptyNote>No hay turnos registrados en este rango.</EmptyNote>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[780px] table-fixed border-collapse text-left">
+            <table className="w-full min-w-[820px] table-fixed border-collapse text-left">
               <thead>
                 <tr className="text-[13px] font-normal" style={{ color: MUTED }}>
-                  <th className="w-[17%] pb-3 font-normal">Dropper</th>
-                  <th className="w-[14%] pb-3 font-normal">Cuentas utilizadas</th>
+                  <th className="w-[16%] pb-3 font-normal">Dropper</th>
+                  <th className="w-[13%] pb-3 font-normal">Cuentas utilizadas</th>
                   <th className="w-[12%] pb-3 font-normal">Fecha</th>
-                  <th className="w-[23%] pb-3 font-normal">Turno</th>
-                  <th className="w-[11%] pb-3 font-normal">Publicaciones</th>
-                  <th className="w-[11%] pb-3 font-normal">Suscripciones</th>
-                  <th className="w-[12%] pb-3 text-right font-normal">
-                    <span className="sr-only">Modelos</span>
+                  <th className="w-[21%] pb-3 font-normal">Turno</th>
+                  <th className="w-[10%] pb-3 font-normal">Publicaciones</th>
+                  <th className="w-[10%] pb-3 font-normal">Suscripciones</th>
+                  <th className="w-[18%] pb-3 text-right font-normal">
+                    <span className="sr-only">Acciones</span>
                   </th>
                 </tr>
               </thead>
@@ -295,6 +343,12 @@ function DropperReportView({ report, timeZone }: { report: DropperReport; timeZo
                     group={group}
                     timeZone={timeZone}
                     expanded={expandedShifts.has(group.id)}
+                    canDelete={canDeleteShifts}
+                    confirmingDelete={pendingDeleteShiftId === group.id}
+                    deleting={deletingShiftId === group.id}
+                    onRequestDelete={() => setPendingDeleteShiftId(group.id)}
+                    onCancelDelete={() => setPendingDeleteShiftId(null)}
+                    onConfirmDelete={() => void handleDeleteShift(group)}
                     onToggle={() => toggleShift(group.id)}
                   />
                 ))}
@@ -372,11 +426,23 @@ function ShiftGroupRow({
   group,
   timeZone,
   expanded,
+  canDelete,
+  confirmingDelete,
+  deleting,
+  onRequestDelete,
+  onCancelDelete,
+  onConfirmDelete,
   onToggle,
 }: {
   group: DropperShiftGroup;
   timeZone: string;
   expanded: boolean;
+  canDelete: boolean;
+  confirmingDelete: boolean;
+  deleting: boolean;
+  onRequestDelete: () => void;
+  onCancelDelete: () => void;
+  onConfirmDelete: () => void;
   onToggle: () => void;
 }) {
   const dateLabel = formatZonedDate(group.shiftStart, timeZone);
@@ -433,21 +499,80 @@ function ShiftGroupRow({
         <td className="py-3 tabular-nums font-medium">{formatCount(group.publicationsCount)}</td>
         <td className="py-3 tabular-nums font-medium">{formatCount(group.subscriptionsCount)}</td>
         <td className="py-3 text-right">
-          {canExpand ? (
-            <ExpandModelsButton
-              expanded={expanded}
-              label={
-                expanded
-                  ? `Ocultar modelos del turno de ${group.dropperName}`
-                  : `Expandir modelos del turno de ${group.dropperName}`
-              }
-              withText
-              onClick={(event) => {
-                event.stopPropagation();
-                onToggle();
-              }}
-            />
-          ) : null}
+          <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+            {canExpand ? (
+              <ExpandModelsButton
+                expanded={expanded}
+                label={
+                  expanded
+                    ? `Ocultar modelos del turno de ${group.dropperName}`
+                    : `Expandir modelos del turno de ${group.dropperName}`
+                }
+                withText
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggle();
+                }}
+              />
+            ) : null}
+            {canDelete ? (
+              confirmingDelete ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    className="cursor-pointer whitespace-nowrap rounded-lg px-2 py-1 text-xs font-medium"
+                    style={{
+                      background: "var(--danger, #dc2626)",
+                      color: "#fff",
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onConfirmDelete();
+                    }}
+                  >
+                    {deleting ? "Eliminando…" : "Confirmar"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    className="cursor-pointer whitespace-nowrap rounded-lg px-2 py-1 text-xs font-medium"
+                    style={{
+                      background: "var(--report-control)",
+                      color: INK,
+                      border: `1px solid ${LINE}`,
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCancelDelete();
+                    }}
+                  >
+                    Cancelar
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  disabled={deleting}
+                  title={`Eliminar turno de ${group.dropperName}`}
+                  aria-label={`Eliminar turno de ${group.dropperName}`}
+                  className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-xs font-medium transition-colors"
+                  style={{
+                    background: "var(--report-control)",
+                    color: "var(--danger, #dc2626)",
+                    border: `1px solid ${LINE}`,
+                  }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onRequestDelete();
+                  }}
+                >
+                  <Trash2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>Eliminar</span>
+                </button>
+              )
+            ) : null}
+          </div>
         </td>
       </tr>
       {expanded && canExpand ? (

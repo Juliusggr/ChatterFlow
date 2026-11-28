@@ -273,7 +273,7 @@ export function ModelsView({
                       Pendiente {formatMoney(model.pending_balance)}
                     </span>
                     <span className="block text-xs" style={{ color: "var(--text-disabled)" }}>
-                      Sync {formatStamp(model.last_synced_at)}
+                      {model.last_synced_at ? `Sync ${formatStamp(model.last_synced_at)}` : "Sin sincronizar"}
                     </span>
                   </span>
 

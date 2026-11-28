@@ -68,10 +68,12 @@ fn default_insights_open() -> bool {
 const MESSAGES_WINDOW_LABEL: &str = "messages-hub";
 const MESSAGES_TABS_LABEL: &str = "messages-tabs";
 const TAB_BAR_HEIGHT: f64 = 44.0;
-const SIDEBAR_WIDTH: f64 = 72.0;
-const INSIGHTS_WIDTH: f64 = 360.0;
+const SIDEBAR_WIDTH: f64 = 60.0;
+const INSIGHTS_WIDTH: f64 = 300.0;
+static APP_DARK: AtomicBool = AtomicBool::new(false);
 const UI_PREFS_FILE: &str = "ui_preferences.json";
 static HUB_VISIBLE: AtomicBool = AtomicBool::new(false);
+static APP_QUITTING: AtomicBool = AtomicBool::new(false);
 static HUB_GATE: Mutex<()> = Mutex::new(());
 
 struct HubRest {
@@ -299,8 +301,46 @@ fn messages_insights_label(model_id: &str) -> String {
     format!("messages-{model_id}-insights")
 }
 
-fn tabs_script() -> &'static str {
-    "window.__CF_VIEW__ = \"messages-tabs\";"
+fn app_is_dark() -> bool {
+    APP_DARK.load(Ordering::Relaxed)
+}
+
+fn current_theme() -> tauri::Theme {
+    if app_is_dark() {
+        tauri::Theme::Dark
+    } else {
+        tauri::Theme::Light
+    }
+}
+
+pub fn apply_app_theme(app: &AppHandle, dark: bool) {
+    APP_DARK.store(dark, Ordering::Relaxed);
+    if let Some(window) = app.get_window("main") {
+        let _ = window.set_theme(Some(current_theme()));
+    }
+    let script = format!("window.__CF_APPLY_THEME && window.__CF_APPLY_THEME({dark});");
+    for (label, webview) in app.webviews() {
+        if label.contains("-of") || label.starts_with("model-") {
+            let _ = webview.eval(&script);
+        }
+    }
+    let _ = app.emit("theme-changed", dark);
+}
+
+fn theme_bootstrap() -> String {
+    let dark = app_is_dark();
+    let theme = if dark { "dark" } else { "light" };
+    let flag = if dark { "true" } else { "false" };
+    format!(
+        "try{{localStorage.setItem('cf-theme','{theme}');document.documentElement.classList.toggle('dark',{flag});}}catch(e){{}}"
+    )
+}
+
+fn tabs_script() -> String {
+    format!(
+        "window.__CF_VIEW__ = \"messages-tabs\";{}",
+        theme_bootstrap()
+    )
 }
 
 async fn emit_tabs_changed(app: &AppHandle) {
@@ -420,8 +460,19 @@ pub async fn open_model_session(
     };
     remember_model_id(&model.id);
     let _ = detach_model_from_hub(app, None, &model.id).await;
-    let window = open_or_focus(app, &model)?;
-    spawn_reader(app.clone(), window.label().to_string(), model.id.clone());
+    let remote_ua = if model.of_user_id.is_some() {
+        store
+            .fetch_model_session(&model.id)
+            .await
+            .ok()
+            .map(|s| s.user_agent)
+            .filter(|ua| !ua.is_empty())
+    } else {
+        None
+    };
+    let window = open_or_focus(app, &model, remote_ua.as_deref())?;
+    let label = window.label().to_string();
+    spawn_reader(app.clone(), label, model.id.clone());
     Ok(account(app, model))
 }
 
@@ -459,6 +510,14 @@ pub async fn delete_model_session(
     Ok(())
 }
 
+pub async fn revoke_model_access(app: &AppHandle, model_id: &str) {
+    let _ = detach_model_from_hub(app, None, model_id).await;
+    if let Some(window) = app.get_webview_window(&window_label(model_id)) {
+        let _ = window.destroy();
+    }
+    forget_model_id(model_id);
+}
+
 pub fn start_background_monitors(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -483,9 +542,12 @@ pub fn start_background_monitors(app: AppHandle) {
 }
 
 pub fn schedule_background_monitor(app: &AppHandle, model_id: String) {
+    if APP_QUITTING.load(Ordering::SeqCst) {
+        return;
+    }
     let app_async = app.clone();
     tauri::async_runtime::spawn(async move {
-        let model = {
+        let (model, remote_ua) = {
             let Some(store) = app_async.try_state::<SupabaseStore>() else {
                 return;
             };
@@ -498,16 +560,29 @@ pub fn schedule_background_monitor(app: &AppHandle, model_id: String) {
             if model.of_user_id.is_none() {
                 return;
             }
-            model
+            let ua = store
+                .fetch_model_session(&model.id)
+                .await
+                .ok()
+                .map(|s| s.user_agent)
+                .filter(|ua| !ua.is_empty());
+            (model, ua)
         };
         let app_inner = app_async.clone();
         let _ = app_async.run_on_main_thread(move || {
-            let _ = ensure_background_monitor_on_main(&app_inner, &model);
+            let _ = ensure_background_monitor_on_main(&app_inner, &model, remote_ua.as_deref());
         });
     });
 }
 
-fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(), String> {
+fn ensure_background_monitor_on_main(
+    app: &AppHandle,
+    model: &Model,
+    user_agent: Option<&str>,
+) -> Result<(), String> {
+    if APP_QUITTING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let _gate = HUB_GATE.lock().unwrap_or_else(|poison| poison.into_inner());
     if model.of_user_id.is_none() {
         return Ok(());
@@ -545,6 +620,11 @@ fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(
     .on_navigation(move |url| navigation_allowed(&nav_model_id, url))
     .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
     .focused(false);
+    let builder = if let Some(ua) = user_agent.filter(|ua| !ua.trim().is_empty()) {
+        builder.user_agent(ua)
+    } else {
+        builder
+    };
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
     let created = window
@@ -564,7 +644,8 @@ fn ensure_background_monitor_on_main(app: &AppHandle, model: &Model) -> Result<(
     if !is_active_visible {
         park_of_webview(&created);
     }
-    spawn_reader(app.clone(), of_label, model.id.clone());
+    spawn_reader(app.clone(), of_label.clone(), model.id.clone());
+    schedule_session_sync(app, model.id.clone(), of_label);
     Ok(())
 }
 
@@ -594,7 +675,9 @@ pub async fn sync_model_data(
         let window = app
             .get_webview_window(&window_label(model_id))
             .ok_or_else(|| "no se pudo abrir la ventana de OnlyFans".to_owned())?;
-        prime_window(&window, opened.model.of_user_id.is_some())?;
+        if opened.model.of_user_id.is_some() {
+            prime_window(&window, true)?;
+        }
         None
     };
     let webview = if let Some(guard) = &messages_sync {
@@ -613,14 +696,55 @@ pub async fn sync_model_data(
     } else {
         window_label(model_id)
     };
-    let _ = webview;
-    pull_model_api(app, store, bus, model_id, &capture_label).await?;
+    let _ = webview.eval("window.__CF_FORCE_LINK && window.__CF_FORCE_LINK(true)");
+    let mut last_err = String::new();
+    for attempt in 0..4 {
+        match pull_model_api(app, store, bus, model_id, &capture_label).await {
+            Ok(()) => {
+                last_err.clear();
+                break;
+            }
+            Err(err) if retryable_sync_error(&err) && attempt < 3 => {
+                last_err = err;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let _ = webview.eval("window.__CF_FORCE_LINK && window.__CF_FORCE_LINK(true)");
+            }
+            Err(err) => {
+                last_err = err;
+                break;
+            }
+        }
+    }
+    if !last_err.is_empty() {
+        let linked = store
+            .get_model(model_id)
+            .await
+            .map(|model| model.of_user_id.is_some())
+            .unwrap_or(false);
+        if !linked {
+            return Err(friendly_sync_error(&last_err));
+        }
+    }
     let _ = store.refresh_fan_spend_peaks(model_id).await;
     let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
     Ok(SyncReport {
         transactions_upserted: slot.upserted.load(Ordering::Relaxed),
         model: account(app, model),
     })
+}
+
+fn retryable_sync_error(err: &str) -> bool {
+    err.contains("CLIENT_NOT_READY") || err.contains("Timeout") || err.contains("no está lista")
+}
+
+fn friendly_sync_error(err: &str) -> String {
+    if err.contains("CLIENT_NOT_READY") || err.contains("Timeout") {
+        return "OnlyFans todavía no entregó la sesión. Deja la ventana abierta en el inicio de la cuenta y pulsa Sincronizar otra vez.".to_owned();
+    }
+    if err.contains("Sesión expirada") || err.contains("no autenticada") {
+        return "La ventana no tiene la sesión iniciada. Entra a la cuenta de OnlyFans y pulsa Sincronizar.".to_owned();
+    }
+    err.to_owned()
 }
 
 async fn pull_model_api(
@@ -911,6 +1035,8 @@ fn on_model_first_authenticated(app: &AppHandle, raw_window_model_id: &str, upda
         let _ = win.eval(&banner_js);
     }
     let _ = app.emit("model-login-completed", account(app, updated.clone()));
+    schedule_session_sync(app, updated.id.clone(), messages_of_label(&updated.id));
+    schedule_session_sync(app, updated.id.clone(), window_label(raw_window_model_id));
     schedule_background_monitor(app, updated.id.clone());
 }
 
@@ -994,6 +1120,7 @@ fn note(bus: &SyncBus, model_id: &str, outcome: &IngestOutcome) {
             }
         }
         crate::sync::CaptureKind::Subscriber
+        | crate::sync::CaptureKind::ChatMute
         | crate::sync::CaptureKind::Notifications
         | crate::sync::CaptureKind::LiveEvent
         | crate::sync::CaptureKind::Publication
@@ -1265,6 +1392,12 @@ pub async fn open_messages(
 ) -> Result<(), String> {
     let model = store.get_model(model_id).await.map_err(|err| err.to_string())?;
     remember_model_id(&model.id);
+    let remote_ua = store
+        .fetch_model_session(&model.id)
+        .await
+        .ok()
+        .map(|s| s.user_agent)
+        .filter(|ua| !ua.is_empty());
 
     let of_label = messages_of_label(model_id);
     let insights_label = messages_insights_label(model_id);
@@ -1302,6 +1435,11 @@ pub async fn open_messages(
                 .on_navigation(move |url| navigation_allowed(&nav_id, url))
                 .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
                 .focused(true);
+                let builder = if let Some(ua) = remote_ua.as_deref() {
+                    builder.user_agent(ua)
+                } else {
+                    builder
+                };
                 #[cfg(target_os = "windows")]
                 let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
                 match window.add_child(
@@ -1370,6 +1508,7 @@ pub async fn open_messages(
     update_hub_title(app, store, Some(model_id)).await;
     layout_messages_hub(app);
     spawn_reader(app.clone(), of_label.clone(), model_id.to_owned());
+    schedule_session_sync(app, model_id.to_owned(), of_label.clone());
     if let Some(of_view) = app.get_webview(&of_label) {
         let _ = of_view.set_focus();
     }
@@ -1418,11 +1557,20 @@ fn account(app: &AppHandle, model: Model) -> ModelAccount {
     ModelAccount { model, window_open }
 }
 
-fn open_or_focus(app: &AppHandle, model: &Model) -> Result<WebviewWindow, String> {
+fn open_or_focus(
+    app: &AppHandle,
+    model: &Model,
+    user_agent: Option<&str>,
+) -> Result<WebviewWindow, String> {
     let label = window_label(&model.id);
     if let Some(window) = app.get_webview_window(&label) {
         allow_small_onlyfans(&window);
         focus(&window)?;
+        schedule_session_sync(app, model.id.clone(), label.clone());
+        if model.of_user_id.is_none() {
+            schedule_profile_link(app, model.id.clone(), label);
+            let _ = window.eval("window.__CF_FORCE_LINK && window.__CF_FORCE_LINK(true)");
+        }
         return Ok(window);
     }
     let directory = partition_dir(app, &model.partition_id)?;
@@ -1447,12 +1595,21 @@ fn open_or_focus(app: &AppHandle, model: &Model) -> Result<WebviewWindow, String
             .background_color(tauri::window::Color(15, 23, 42, 255))
             .data_directory(directory.clone())
             .initialization_script(capture_script(&model.id, false));
+        let builder = if let Some(ua) = user_agent.filter(|ua| !ua.trim().is_empty()) {
+            builder.user_agent(ua)
+        } else {
+            builder
+        };
         #[cfg(target_os = "windows")]
         let builder = builder.additional_browser_args(FAST_WEBVIEW_ARGS);
         match builder.build() {
             Ok(window) => {
                 bind_close(&window, model.id.clone());
                 allow_small_onlyfans(&window);
+                schedule_session_sync(app, model.id.clone(), label.clone());
+                if model.of_user_id.is_none() {
+                    schedule_profile_link(app, model.id.clone(), label);
+                }
                 return Ok(window);
             }
             Err(err) => {
@@ -1498,6 +1655,31 @@ fn close_label(app: &AppHandle, label: &str) {
     }
     if let Some(window) = app.get_window(label) {
         let _ = window.destroy();
+    }
+}
+
+pub fn shutdown_secondary_windows(app: &AppHandle) {
+    APP_QUITTING.store(true, Ordering::SeqCst);
+    HUB_VISIBLE.store(false, Ordering::SeqCst);
+    let webview_labels: Vec<String> = app
+        .webviews()
+        .keys()
+        .filter(|label| label.as_str() != "main")
+        .cloned()
+        .collect();
+    for label in webview_labels {
+        if let Some(view) = app.get_webview(&label) {
+            let _ = view.close();
+        }
+    }
+    let window_labels: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|label| label.as_str() != "main")
+        .cloned()
+        .collect();
+    for label in window_labels {
+        close_label(app, &label);
     }
 }
 
@@ -1725,7 +1907,8 @@ fn insights_script(model_id: &str, partition_id: &str) -> String {
     let id = serde_json::to_string(model_id).unwrap_or_else(|_| "\"\"".to_string());
     let partition = serde_json::to_string(partition_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {id}; window.__CF_PARTITION_ID__ = {partition};"
+        "window.__CF_VIEW__ = \"insights\"; window.__CF_MODEL_ID__ = {id}; window.__CF_PARTITION_ID__ = {partition};{}",
+        theme_bootstrap()
     )
 }
 
@@ -1840,13 +2023,465 @@ fn begin_messages_sync(webview: &tauri::Webview, model_id: &str) -> Result<Messa
     Ok(guard)
 }
 
+fn session_sync_slots() -> &'static Mutex<HashSet<String>> {
+    static SLOTS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct SessionSyncSlot(String);
+
+impl Drop for SessionSyncSlot {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = session_sync_slots().lock() {
+            slots.remove(&self.0);
+        }
+    }
+}
+
+fn schedule_session_sync(app: &AppHandle, model_id: String, label: String) {
+    if APP_QUITTING.load(Ordering::SeqCst) || label.is_empty() {
+        return;
+    }
+    {
+        let mut slots = session_sync_slots()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !slots.insert(label.clone()) {
+            return;
+        }
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _slot = SessionSyncSlot(label.clone());
+        for delay in [2u64, 6, 15] {
+            if APP_QUITTING.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(delay));
+            if APP_QUITTING.load(Ordering::SeqCst) {
+                return;
+            }
+            let cookies = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_onlyfans_cookies(&app, &label)
+            }))
+            .ok()
+            .flatten();
+            let Some(cookies) = cookies else {
+                continue;
+            };
+            let app_http = app.clone();
+            let model_http = model_id.clone();
+            let label_http = label.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            tauri::async_runtime::spawn(async move {
+                let done = publish_or_restore_session(&app_http, &model_http, &label_http, cookies).await;
+                let _ = tx.send(done);
+            });
+            if rx.recv_timeout(Duration::from_secs(20)).unwrap_or(false) {
+                return;
+            }
+        }
+    });
+}
+
+fn read_onlyfans_cookies(app: &AppHandle, label: &str) -> Option<Vec<serde_json::Value>> {
+    let webview = app.get_webview(label)?;
+    let url = "https://onlyfans.com/".parse().ok()?;
+    let mut cookies = webview
+        .cookies()
+        .or_else(|_| webview.cookies_for_url(url))
+        .ok()?;
+    cookies.retain(|cookie| {
+        onlyfans_cookie(cookie)
+            && cookie.name().len() <= 128
+            && cookie.value().len() <= 4096
+    });
+    cookies.sort_by_key(|cookie| match cookie.name() {
+        "auth_id" => 0,
+        "sess" => 1,
+        "fp" => 2,
+        "st" => 3,
+        "csrf" => 4,
+        "auth_hash" => 5,
+        "ref_src" => 6,
+        _ => 10,
+    });
+    let values = cookies.iter().map(cookie_json).take(80).collect();
+    Some(values)
+}
+
+fn onlyfans_cookie(cookie: &tauri::webview::Cookie<'_>) -> bool {
+    match cookie.domain() {
+        Some(domain) => domain.contains("onlyfans.com"),
+        None => true,
+    }
+}
+
+fn has_authenticated_cookies(cookies: &[serde_json::Value]) -> bool {
+    let has_auth_id = cookies.iter().any(|cookie| {
+        cookie.get("name").and_then(|v| v.as_str()) == Some("auth_id")
+            && cookie
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_some_and(|v| !v.is_empty() && v != "0")
+    });
+    let has_sess = cookies.iter().any(|cookie| {
+        cookie.get("name").and_then(|v| v.as_str()) == Some("sess")
+            && cookie
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_some_and(|v| !v.is_empty())
+    });
+    has_auth_id && has_sess
+}
+
+fn cookie_fingerprint(
+    cookies: &[serde_json::Value],
+    local_storage: &HashMap<String, String>,
+    user_agent: &str,
+) -> String {
+    let mut pairs: Vec<String> = cookies
+        .iter()
+        .filter_map(|cookie| {
+            let name = cookie.get("name")?.as_str()?;
+            let value = cookie.get("value")?.as_str()?;
+            Some(format!("c:{name}={value}"))
+        })
+        .collect();
+    for (k, v) in local_storage {
+        pairs.push(format!("ls:{k}={v}"));
+    }
+    if !user_agent.trim().is_empty() {
+        pairs.push(format!("ua:{}", user_agent.trim()));
+    }
+    pairs.sort();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for pair in pairs {
+        for byte in pair.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+    }
+    format!("{hash:x}")
+}
+
+fn cookie_json(cookie: &tauri::webview::Cookie<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "name": cookie.name(),
+        "value": cookie.value(),
+        "domain": cookie.domain(),
+        "path": cookie.path().unwrap_or("/"),
+        "secure": cookie.secure().unwrap_or(true),
+        "httpOnly": cookie.http_only().unwrap_or(false),
+        "sameSite": cookie.same_site().map(|site| format!("{site:?}")).unwrap_or_default(),
+        "expires": cookie.expires_datetime().map(|when| when.unix_timestamp()),
+    })
+}
+
+fn cookie_from_stored(value: &serde_json::Value) -> Option<tauri::webview::Cookie<'static>> {
+    let name = value.get("name")?.as_str()?.trim();
+    let raw = value.get("value")?.as_str()?;
+    if name.is_empty()
+        || name.len() > 128
+        || raw.is_empty()
+        || raw.len() > 4096
+        || name.contains(';')
+        || name.contains('\n')
+        || raw.contains(';')
+        || raw.contains('\n')
+    {
+        return None;
+    }
+    let mut max_age: Option<i64> = None;
+    if let Some(expires) = value.get("expires").and_then(|item| item.as_i64()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        if expires > 0 {
+            if expires < now {
+                return None;
+            }
+            max_age = Some(expires - now);
+        }
+    }
+    let path = value.get("path").and_then(|item| item.as_str()).unwrap_or("/");
+    if !path.starts_with('/') || path.contains(';') {
+        return None;
+    }
+    let domain = value
+        .get("domain")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|domain| {
+            domain.contains("onlyfans.com") && !domain.contains(';') && !domain.contains(' ')
+        })
+        .unwrap_or(".onlyfans.com");
+    let mut header = format!("{name}={raw}; Path={path}; Domain={domain}");
+    if let Some(secs) = max_age {
+        header.push_str(&format!("; Max-Age={secs}"));
+    }
+    if value.get("secure").and_then(|item| item.as_bool()).unwrap_or(true) {
+        header.push_str("; Secure");
+    }
+    if value.get("httpOnly").and_then(|item| item.as_bool()).unwrap_or(false) {
+        header.push_str("; HttpOnly");
+    }
+    match value.get("sameSite").and_then(|item| item.as_str()) {
+        Some("None") => header.push_str("; SameSite=None"),
+        Some("Strict") => header.push_str("; SameSite=Strict"),
+        Some("Lax") => header.push_str("; SameSite=Lax"),
+        _ => {}
+    }
+    tauri::webview::Cookie::parse(header)
+        .ok()
+        .map(|cookie| cookie.into_owned())
+}
+
+async fn read_onlyfans_client_state(
+    app: &AppHandle,
+    label: &str,
+) -> (HashMap<String, String>, String) {
+    let Some(webview) = app.get_webview(label) else {
+        return (HashMap::new(), String::new());
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let script = r#"(() => {
+        try {
+            const out = {};
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i += 1) {
+                const k = localStorage.key(i);
+                if (!k || k === 'cf-theme' || k.length > 128) continue;
+                keys.push(k);
+            }
+            keys.sort((a, b) => {
+                const rank = (k) => k === 'bcTokenSha' ? 0 : /bc|auth|fp|token|user|device|init/i.test(k) ? 1 : 2;
+                return rank(a) - rank(b);
+            });
+            let count = 0;
+            for (const k of keys) {
+                if (count >= 40) break;
+                const v = localStorage.getItem(k);
+                if (typeof v === 'string' && v.length <= 4096) {
+                    out[k] = v;
+                    count += 1;
+                }
+            }
+            return { ls: out, ua: String(navigator.userAgent || '').slice(0, 512) };
+        } catch (e) {
+            return { ls: {}, ua: '' };
+        }
+    })()"#;
+    if webview
+        .eval_with_callback(script, move |raw| {
+            let _ = tx.try_send(raw);
+        })
+        .is_err()
+    {
+        return (HashMap::new(), String::new());
+    }
+    let Ok(Some(raw)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await else {
+        return (HashMap::new(), String::new());
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (HashMap::new(), String::new());
+    };
+    let ls = parsed
+        .get("ls")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ua = parsed
+        .get("ua")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    (ls, ua)
+}
+
+async fn publish_or_restore_session(
+    app: &AppHandle,
+    model_id: &str,
+    label: &str,
+    cookies: Vec<serde_json::Value>,
+) -> bool {
+    if APP_QUITTING.load(Ordering::SeqCst) {
+        return true;
+    }
+    let Some(store) = app.try_state::<SupabaseStore>() else {
+        return false;
+    };
+    let local_auth = has_authenticated_cookies(&cookies);
+    if local_auth {
+        let (local_storage, user_agent) = read_onlyfans_client_state(app, label).await;
+        let fingerprint = cookie_fingerprint(&cookies, &local_storage, &user_agent);
+        let remote = store.fetch_model_session(model_id).await.ok();
+        if remote.as_ref().is_some_and(|session| {
+            session.fingerprint == fingerprint && has_authenticated_cookies(&session.cookies)
+        }) {
+            return true;
+        }
+        return store
+            .save_model_cookies(model_id, &cookies, &fingerprint, &local_storage, &user_agent)
+            .await
+            .is_ok();
+    }
+
+    let Ok(remote) = store.fetch_model_session(model_id).await else {
+        return false;
+    };
+    if !has_authenticated_cookies(&remote.cookies) {
+        return false;
+    }
+    let Some(webview) = app.get_webview(label) else {
+        return true;
+    };
+    let mut applied = 0usize;
+    for value in &remote.cookies {
+        if let Some(cookie) = cookie_from_stored(value) {
+            if webview.set_cookie(cookie).is_ok() {
+                applied += 1;
+            }
+        }
+    }
+    if applied == 0 {
+        return false;
+    }
+    if !remote.local_storage.is_empty() {
+        if let Ok(ls_json) = serde_json::to_string(&remote.local_storage) {
+            let ls_script = format!(
+                "(() => {{ try {{ const items = {ls_json}; for (const [k, v] of Object.entries(items)) {{ localStorage.setItem(k, String(v)); }} }} catch (e) {{}} }})()"
+            );
+            let _ = webview.eval(&ls_script);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let target = if label.ends_with("-of") {
+        "https://onlyfans.com/my/chats"
+    } else {
+        "https://onlyfans.com/"
+    };
+    let _ = webview.eval(&format!("location.replace({})", js_string(target)));
+    true
+}
+
+fn eval_force_link(app: &AppHandle, label: &str) {
+    const SCRIPT: &str = "window.__CF_FORCE_LINK && window.__CF_FORCE_LINK(true)";
+    if let Some(webview) = app.get_webview(label) {
+        let _ = webview.eval(SCRIPT);
+    } else if let Some(window) = app.get_webview_window(label) {
+        let _ = window.eval(SCRIPT);
+    }
+}
+
+fn schedule_profile_link(app: &AppHandle, model_id: String, label: String) {
+    if APP_QUITTING.load(Ordering::SeqCst) || label.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        for delay in [1200_u64, 3000, 7000, 14000, 26000] {
+            if APP_QUITTING.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(delay));
+            let app_eval = app.clone();
+            let label_eval = label.clone();
+            let app_thread = app_eval.clone();
+            let _ = app_eval.run_on_main_thread(move || {
+                eval_force_link(&app_thread, &label_eval);
+            });
+            let app_check = app.clone();
+            let model_check = model_id.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            tauri::async_runtime::spawn(async move {
+                let linked = if let Some(store) = app_check.try_state::<SupabaseStore>() {
+                    store
+                        .get_model(&model_check)
+                        .await
+                        .map(|model| model.of_user_id.is_some())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let _ = tx.send(linked);
+            });
+            if rx.recv_timeout(Duration::from_secs(8)).unwrap_or(false) {
+                return;
+            }
+        }
+    });
+}
+
 fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     let model_id_json = serde_json::to_string(model_id).unwrap_or_else(|_| "\"\"".to_owned());
+    let dark = app_is_dark();
     format!(
         r##"
 (() => {{
   const modelId = {model_id_json};
   const stayInChats = {stay_in_chats};
+  let ofDark = {dark};
+  window.__CF_FORCE_LINK = (force) => {{
+    try {{
+      if (!force && window.__CF_CREATOR_ID) return true;
+      if (isLoginOrAuthSurface()) return false;
+      if (window.__CF_LINK_BUSY) return false;
+      const client = findSignedClient();
+      if (!client) return false;
+      window.__CF_LINK_BUSY = true;
+      client.get("https://onlyfans.com/api2/v2/users/me").then((response) => {{
+        window.__CF_LINK_BUSY = false;
+        const status = (response && response.status) || 200;
+        if (status >= 400) {{
+          window.__CF_PROFILE_HYDRATED = false;
+          return;
+        }}
+        const data = response && response.data;
+        const text = typeof data === "string" ? data : JSON.stringify(data || {{}});
+        window.__CF_PROFILE_HYDRATED = true;
+        deliver("https://onlyfans.com/api2/v2/users/me", status, text);
+      }}).catch(() => {{
+        window.__CF_LINK_BUSY = false;
+        window.__CF_PROFILE_HYDRATED = false;
+      }});
+      return true;
+    }} catch (error) {{
+      window.__CF_LINK_BUSY = false;
+      return false;
+    }}
+  }};
+  window.__CF_REPORT_VISIBLE = () => window.__CF_FORCE_LINK(true);
+  setTimeout(() => window.__CF_FORCE_LINK(), 900);
+  setInterval(() => {{
+    if (!window.__CF_CREATOR_ID && !isLoginOrAuthSurface()) window.__CF_FORCE_LINK();
+  }}, 2500);
+  window.__CF_APPLY_THEME = (next) => {{
+    ofDark = !!next;
+    try {{
+      const root = document.documentElement;
+      if (root) {{
+        root.style.colorScheme = ofDark ? "dark" : "light";
+        root.classList.toggle("m-mode-dark", ofDark);
+      }}
+      if (document.body) document.body.classList.toggle("m-mode-dark", ofDark);
+      localStorage.setItem("dark_mode", ofDark ? "true" : "false");
+      localStorage.setItem("theme", ofDark ? "dark" : "light");
+    }} catch (error) {{}}
+  }};
+  window.__CF_APPLY_THEME(ofDark);
+  try {{
+    document.addEventListener("DOMContentLoaded", () => window.__CF_APPLY_THEME(ofDark), {{ once: true }});
+  }} catch (error) {{}}
   const paths = new Set([
     "/api2/v2/users/me",
     "/api2/v2/payouts/balances",
@@ -1871,6 +2506,7 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       if (path === "/api2/v2/users/list") return true;
       if (path === "/api2/v2/users/notifications" || path.indexOf("/api2/v2/users/notifications/") === 0) return true;
       if (path.indexOf("/api2/v2/chats/") !== -1 && path.indexOf("/messages") !== -1) return true;
+      if (/^\/api2\/v2\/(chats|users)\/u?\d+\/(mute|unmute)\b/i.test(path)) return true;
       if (/^\/api2\/v2\/chats\/\d+$/.test(path)) return true;
       if (path.indexOf("/api2/v2/subscriptions") === 0) return true;
       if (path.indexOf("/api2/v2/vault/") === 0) return true;
@@ -1920,22 +2556,13 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     }} catch (error) {{}}
   }}
   function hydrateProfile() {{
-    if (window.__CF_PROFILE_HYDRATED) return;
+    if (window.__CF_CREATOR_ID) return;
     const attempt = (tries) => {{
-      if (window.__CF_PROFILE_HYDRATED) return;
-      const client = findSignedClient();
-      if (!client) {{
-        if (tries < 8) setTimeout(() => attempt(tries + 1), 650);
-        return;
-      }}
-      window.__CF_PROFILE_HYDRATED = true;
-      client.get("https://onlyfans.com/api2/v2/users/me").then((response) => {{
-        const data = response && response.data;
-        const text = typeof data === "string" ? data : JSON.stringify(data || {{}});
-        deliver("https://onlyfans.com/api2/v2/users/me", (response && response.status) || 200, text);
-      }}).catch(() => {{}});
+      if (window.__CF_CREATOR_ID) return;
+      if (window.__CF_FORCE_LINK && window.__CF_FORCE_LINK()) return;
+      if (tries < 24) setTimeout(() => attempt(tries + 1), tries < 10 ? 750 : 2200);
     }};
-    setTimeout(() => attempt(0), 400);
+    setTimeout(() => attempt(0), 500);
   }}
   const vaultItems = window.__CF_VAULT_ITEMS || (window.__CF_VAULT_ITEMS = {{}});
   function mediaUrl(value) {{
@@ -2239,7 +2866,9 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     let payload = {{ modelId: modelId, url: absolute(url), status: status, body: text }};
     try {{
       const p = new URL(url, location.href).pathname;
-      if (p === "/api2/v2/chats" && String(url).indexOf("_cf_backfill") === -1) {{
+      if (p === "/api2/v2/chats" && String(url).indexOf("_cf_muted_list=1") !== -1) {{
+        window.__CF_LAST_MUTED_CHATS_AT = Date.now();
+      }} else if (p === "/api2/v2/chats" && String(url).indexOf("_cf_backfill") === -1) {{
         window.__CF_LAST_INBOX_AT = Date.now();
       }} else if (p === "/api2/v2/payouts/transactions") {{
         window.__CF_LAST_TX_AT = Date.now();
@@ -2331,16 +2960,18 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     if (!client) return;
     const now = Date.now();
     const lastInbox = window.__CF_LAST_INBOX_AT || 0;
+    const lastMutedChats = window.__CF_LAST_MUTED_CHATS_AT || 0;
     const lastTx = window.__CF_LAST_TX_AT || 0;
     const lastSubs = window.__CF_LAST_SUBS_AT || 0;
     const lastSubNotifs = window.__CF_LAST_SUB_NOTIFS_AT || 0;
     const lastSaleNotifs = window.__CF_LAST_SALE_NOTIFS_AT || 0;
     const needInbox = forceInbox || (now - lastInbox >= 1500);
+    const needMutedChats = (now - lastMutedChats >= 90000);
     const needTx = (now - lastTx >= 14000);
     const needSubs = (now - lastSubs >= 30000);
     const needSubNotifs = forceSubNotifs || (now - lastSubNotifs >= 15000);
     const needSaleNotifs = (now - lastSaleNotifs >= 12000);
-    if (!needInbox && !needTx && !needSubs && !needSubNotifs && !needSaleNotifs) return;
+    if (!needInbox && !needMutedChats && !needTx && !needSubs && !needSubNotifs && !needSaleNotifs) return;
     bgPollBusy = true;
     try {{
       if (!window.__CF_CREATOR_ID) {{
@@ -2349,6 +2980,17 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
           if (meRes && meRes.data) {{
             const meText = typeof meRes.data === "string" ? meRes.data : JSON.stringify(meRes.data);
             deliver("https://onlyfans.com/api2/v2/users/me", meRes.status || 200, meText);
+          }}
+        }} catch (e) {{}}
+      }}
+      if (needMutedChats) {{
+        window.__CF_LAST_MUTED_CHATS_AT = Date.now();
+        try {{
+          const mutedUrl = "https://onlyfans.com/api2/v2/chats?limit=50&offset=0&filter=muted&_cf_muted_list=1";
+          const res = await client.get(mutedUrl);
+          if (res && res.data) {{
+            const text = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+            deliver(mutedUrl, res.status || 200, text);
           }}
         }} catch (e) {{}}
       }}
@@ -2519,6 +3161,21 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       }}, 4200);
     }} catch (e) {{}}
   }};
+  function isMuteToggle(url) {{
+    try {{
+      const parsed = new URL(url, location.href);
+      if (parsed.hostname !== "onlyfans.com" && !parsed.hostname.endsWith(".onlyfans.com")) return false;
+      const path = parsed.pathname.replace(/\/+$/, "");
+      return /^\/api2\/v2\/(chats|users)\/u?\d+\/(mute|unmute)$/i.test(path);
+    }} catch (error) {{
+      return false;
+    }}
+  }}
+  function muteToggleUrl(method, url) {{
+    const absoluteUrl = absolute(url);
+    const verb = encodeURIComponent(String(method || "POST").toUpperCase());
+    return absoluteUrl + (absoluteUrl.indexOf("?") === -1 ? "?" : "&") + "_cf_method=" + verb;
+  }}
   const originalFetch = window.fetch;
   if (typeof originalFetch === "function") {{
     window.fetch = function () {{
@@ -2528,11 +3185,12 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       const method = (init && init.method) || (input && input.method) || "GET";
       const pending = originalFetch.apply(this, arguments);
       const publish = isPublish(method, url);
-      if (!watched(url) && !publish) {{
+      const muteToggle = isMuteToggle(url);
+      if (!watched(url) && !publish && !muteToggle) {{
         return pending;
       }}
       return pending.then((response) => {{
-        const target = publish ? publishUrl(url) : url;
+        const target = publish ? publishUrl(url) : muteToggle ? muteToggleUrl(method, url) : url;
         response.clone().text().then((body) => deliver(target, response.status, body)).catch(() => {{}});
         return response;
       }});
@@ -2563,7 +3221,8 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     this.addEventListener("load", function () {{
       const url = this.__cfUrl || "";
       const publish = isPublish(this.__cfMethod, url);
-      if (!watched(url) && !publish) {{
+      const muteToggle = isMuteToggle(url);
+      if (!watched(url) && !publish && !muteToggle) {{
         return;
       }}
       let body = "";
@@ -2576,7 +3235,8 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
       }} catch (error) {{
         body = "";
       }}
-      deliver(publish ? publishUrl(url) : url, this.status, body);
+      const target = publish ? publishUrl(url) : muteToggle ? muteToggleUrl(this.__cfMethod, url) : url;
+      deliver(target, this.status, body);
     }});
     return originalSend.apply(this, arguments);
   }};
@@ -2839,6 +3499,7 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
 
   function isForbiddenComposerButton(node) {{
     if (!node || isHourglassButton(node)) return false;
+    if (node.closest && node.closest("#cf-emoji-dock")) return false;
     if (isChatPage()) return false;
     if (node.closest && node.closest(".b-chat, [class*='b-chat']")) return false;
     if (isQuizButton(node)) return true;
@@ -3192,10 +3853,98 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
     }}, 100);
   }}
 
+  const CHAT_EMOJIS = ["😀","😂","🥰","😍","😘","😉","😊","🔥","❤️","💋","👍","🙏","😭","🤔","😏","🎉","✨","💯","🌹","😈","😎","🤗"];
+  function findSendButton() {{
+    const buttons = document.querySelectorAll("button, [role='button']");
+    for (const btn of buttons) {{
+      if (btn.closest && btn.closest("#cf-emoji-dock")) continue;
+      const text = (btn.innerText || btn.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const label = ((btn.getAttribute && (btn.getAttribute("aria-label") || btn.getAttribute("title"))) || "").trim().toLowerCase();
+      if (text === "enviar" || text === "send" || label === "enviar" || label === "send") return btn;
+    }}
+    return null;
+  }}
+  function composerBar(send) {{
+    let node = send.parentElement;
+    for (let depth = 0; node && depth < 6; depth += 1) {{
+      if (node.querySelectorAll("button, [role='button']").length >= 3) return node;
+      node = node.parentElement;
+    }}
+    return send.parentElement;
+  }}
+  function composerInput(send) {{
+    let node = send;
+    for (let depth = 0; node && depth < 8; depth += 1) {{
+      const input = node.querySelector && node.querySelector("[contenteditable='true'], textarea");
+      if (input) return input;
+      node = node.parentElement;
+    }}
+    return document.querySelector(".b-chat [contenteditable='true'], .b-chat textarea, [contenteditable='true']");
+  }}
+  function insertChatEmoji(emoji) {{
+    const send = findSendButton();
+    const target = send ? composerInput(send) : document.querySelector("[contenteditable='true'], textarea");
+    if (!target) return;
+    target.focus();
+    try {{
+      document.execCommand("insertText", false, emoji);
+    }} catch (error) {{}}
+    target.dispatchEvent(new InputEvent("input", {{ bubbles: true, data: emoji, inputType: "insertText" }}));
+  }}
+  function mountChatEmoji() {{
+    const send = findSendButton();
+    const existing = document.getElementById("cf-emoji-dock");
+    if (!send) {{
+      if (existing) existing.remove();
+      return;
+    }}
+    const bar = composerBar(send);
+    if (!bar) return;
+    if (existing && existing.parentElement === bar) return;
+    if (existing) existing.remove();
+    const dock = document.createElement("span");
+    dock.id = "cf-emoji-dock";
+    dock.style.cssText = "position:relative;display:inline-flex;align-items:center;flex:0 0 auto;margin:0 4px 0 0;z-index:20;";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.textContent = "😀";
+    toggle.title = "Emojis";
+    toggle.setAttribute("aria-label", "Insertar emoji");
+    toggle.style.cssText = "width:32px;height:32px;border:1px solid #c5d4f5;border-radius:8px;background:#e8f0ff;font-size:18px;line-height:30px;cursor:pointer;padding:0;";
+    const panel = document.createElement("div");
+    panel.style.cssText = "display:none;position:absolute;bottom:38px;left:0;width:228px;padding:8px;border-radius:12px;background:#111827;box-shadow:0 10px 24px rgba(0,0,0,.32);";
+    for (const emoji of CHAT_EMOJIS) {{
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = emoji;
+      button.style.cssText = "width:32px;height:32px;border:0;border-radius:8px;background:transparent;font-size:18px;cursor:pointer;";
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", (event) => {{
+        event.preventDefault();
+        event.stopPropagation();
+        insertChatEmoji(emoji);
+      }});
+      panel.appendChild(button);
+    }}
+    toggle.addEventListener("mousedown", (event) => event.preventDefault());
+    toggle.addEventListener("click", (event) => {{
+      event.preventDefault();
+      event.stopPropagation();
+      panel.style.display = panel.style.display === "none" ? "grid" : "none";
+    }});
+    panel.style.gridTemplateColumns = "repeat(6, 32px)";
+    panel.style.gap = "4px";
+    dock.appendChild(panel);
+    dock.appendChild(toggle);
+    bar.insertBefore(dock, bar.firstChild);
+  }}
+
   let cleanQueued = false;
   const runComposerPass = () => {{
     if (isLoginOrAuthSurface()) return;
+    if (window.__CF_APPLY_THEME) window.__CF_APPLY_THEME(ofDark);
     cleanComposerButtons();
+    mountChatEmoji();
 
     const confirmDeleteBtn = findConfirmDeleteButton();
     if (confirmDeleteBtn && !confirmDeleteBtn.dataset.cfClicked) {{
@@ -3245,8 +3994,10 @@ fn capture_script(model_id: &str, stay_in_chats: bool) -> String {
   }};
   startObserver();
   setInterval(() => {{
-    if (!isLoginOrAuthSurface() && !isChatPage()) runComposerPass();
-  }}, 1200);
+    if (isLoginOrAuthSurface()) return;
+    mountChatEmoji();
+    if (!isChatPage()) runComposerPass();
+  }}, 800);
   setInterval(() => {{
     if (onVaultPage()) installVaultButton();
   }}, 1200);
@@ -3489,9 +4240,9 @@ mod tests {
         assert_eq!(top.chat_x, 0.0);
         assert_eq!(top.chat_y, 44.0);
         assert_eq!(top.chat_height, 756.0);
-        assert_eq!(top.chat_width, 920.0);
-        assert_eq!(top.insights_x, 920.0);
-        assert_eq!(top.insights_width, 360.0);
+        assert_eq!(top.chat_width, 980.0);
+        assert_eq!(top.insights_x, 980.0);
+        assert_eq!(top.insights_width, 300.0);
         let collapsed = message_panes(1280.0, 800.0, MessageBarPlacement::Top, false).unwrap();
         assert_eq!(collapsed.insights_width, 0.0);
         assert_eq!(collapsed.chat_width, 1280.0);
@@ -3499,9 +4250,9 @@ mod tests {
         let side = message_panes(1280.0, 800.0, MessageBarPlacement::Sidebar, true).unwrap();
         assert_eq!(side.tabs_x, 0.0);
         assert_eq!(side.tabs_y, 0.0);
-        assert_eq!(side.tabs_width, 72.0);
+        assert_eq!(side.tabs_width, 60.0);
         assert_eq!(side.tabs_height, 800.0);
-        assert_eq!(side.chat_x, 72.0);
+        assert_eq!(side.chat_x, 60.0);
         assert_eq!(side.chat_y, 0.0);
         assert_eq!(side.chat_height, 800.0);
         assert!(side.chat_width > 600.0);
@@ -3513,6 +4264,10 @@ mod tests {
     fn capture_script_includes_clean_composer_and_auto_expiry() {
         let script = super::capture_script("model-uuid-42", false);
         assert!(script.contains("cleanComposerButtons"));
+        assert!(script.contains("mountChatEmoji"));
+        assert!(script.contains("__CF_APPLY_THEME"));
+        assert!(script.contains("__CF_FORCE_LINK"));
+        assert!(script.contains("__CF_REPORT_VISIBLE"));
         assert!(!script.contains("mountChatComposer"));
         assert!(!script.contains("pullPurchases"));
         assert!(!script.contains("pullFanStats"));
@@ -3583,5 +4338,52 @@ mod tests {
         assert!(!script.contains("createChatTools"));
         assert!(!script.contains("cf-msg-tools"));
         assert!(!script.contains("cf-msg-strip"));
+    }
+
+    #[test]
+    fn capture_script_guards_null_document_element_at_document_start() {
+        let script = super::capture_script("model-uuid-42", false);
+        assert!(script.contains("const root = document.documentElement;\n      if (root) {"));
+        assert!(script.contains("DOMContentLoaded"));
+    }
+
+    #[test]
+    fn authenticated_cookies_require_both_auth_id_and_sess() {
+        let guest_only = vec![serde_json::json!({ "name": "sess", "value": "guest-token" })];
+        assert!(!super::has_authenticated_cookies(&guest_only));
+
+        let zero_auth_id = vec![
+            serde_json::json!({ "name": "sess", "value": "guest-token" }),
+            serde_json::json!({ "name": "auth_id", "value": "0" }),
+        ];
+        assert!(!super::has_authenticated_cookies(&zero_auth_id));
+
+        let real_session = vec![
+            serde_json::json!({ "name": "sess", "value": "real-sess-token" }),
+            serde_json::json!({ "name": "auth_id", "value": "412345678" }),
+        ];
+        assert!(super::has_authenticated_cookies(&real_session));
+    }
+
+    #[test]
+    fn cookie_from_stored_defaults_domain_and_preserves_max_age() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        let stored = serde_json::json!({
+            "name": "auth_id",
+            "value": "412345678",
+            "path": "/",
+            "secure": true,
+            "httpOnly": false,
+            "sameSite": "Lax",
+            "expires": future,
+        });
+        let cookie = super::cookie_from_stored(&stored).expect("valid cookie");
+        assert_eq!(cookie.name(), "auth_id");
+        assert_eq!(cookie.domain(), Some("onlyfans.com"));
+        assert!(cookie.max_age().is_some());
     }
 }

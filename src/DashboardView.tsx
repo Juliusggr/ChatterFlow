@@ -55,7 +55,7 @@ const CARD_RADIUS = 20;
 
 export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: boolean }) {
   const [range, setRange] = useState<TimeRange>("today");
-  const [basis, setBasis] = useState<EarningsBasis>("net");
+  const [basis, setBasis] = useState<EarningsBasis>("gross");
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [clockBusy, setClockBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -182,11 +182,11 @@ export function DashboardView({ canDeleteShifts = false }: { canDeleteShifts?: b
             role="group"
             aria-label="Earnings basis"
           >
-            <BasisButton active={basis === "net"} onClick={() => setBasis("net")}>
-              Neto
-            </BasisButton>
             <BasisButton active={basis === "gross"} onClick={() => setBasis("gross")}>
               Bruto
+            </BasisButton>
+            <BasisButton active={basis === "net"} onClick={() => setBasis("net")}>
+              Neto
             </BasisButton>
           </div>
           <div

@@ -123,11 +123,12 @@ export function FanInsightsPanel({ modelId }: { modelId: string }) {
             type="button"
             title="Ocultar Fan Insights"
             aria-label="Ocultar Fan Insights"
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg"
-            style={{ color: "var(--text-tertiary)", background: "var(--bg-subtle)" }}
+            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold"
+            style={{ background: "var(--brand-500)", color: "#fff" }}
             onClick={() => void setInsightsOpen(false)}
           >
-            <PanelRightClose size={14} strokeWidth={2} />
+            <PanelRightClose size={14} strokeWidth={2.25} />
+            Ocultar
           </button>
         </div>
       </header>

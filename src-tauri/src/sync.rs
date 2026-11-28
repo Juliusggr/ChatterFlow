@@ -15,6 +15,7 @@ pub enum CaptureKind {
     Balances,
     Transactions,
     Chat,
+    ChatMute,
     Subscriber,
     Notifications,
     LiveEvent,
@@ -71,6 +72,15 @@ pub fn classify_url(url: &str) -> Option<CaptureKind> {
         return Some(CaptureKind::Chat);
     }
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if segments.len() == 5
+        && segments[0] == "api2"
+        && segments[1] == "v2"
+        && (segments[2] == "chats" || segments[2] == "users")
+        && numeric_id(segments[3]).is_some()
+        && (segments[4].eq_ignore_ascii_case("mute") || segments[4].eq_ignore_ascii_case("unmute"))
+    {
+        return Some(CaptureKind::ChatMute);
+    }
     if segments.len() == 4
         && segments[0] == "api2"
         && segments[1] == "v2"
@@ -122,6 +132,28 @@ pub async fn ingest_body(
             unauthorized: kind == CaptureKind::Profile,
             earnings: None,
             fan_id: None,
+            notifications: NotificationBatch::empty(),
+            dropper_activity_changed: false,
+            model_data_changed: false,
+        }));
+    }
+    if kind == CaptureKind::ChatMute {
+        if !(200..300).contains(&status) {
+            return Ok(None);
+        }
+        let fan_id = mute_target_fan_id(url);
+        if let Some(ref fid) = fan_id {
+            let body_mute = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|v| v.as_object().and_then(extract_mute_flag));
+            let muted = body_mute.unwrap_or_else(|| infer_mute_from_url(url));
+            store.set_fan_muted_state(model_id, fid, muted).await;
+        }
+        return Ok(Some(IngestOutcome {
+            kind,
+            unauthorized: false,
+            earnings: None,
+            fan_id,
             notifications: NotificationBatch::empty(),
             dropper_activity_changed: false,
             model_data_changed: false,
@@ -304,11 +336,24 @@ pub async fn ingest_body(
             let fan_id = chat_fan_id(url);
             let mut fan_name = String::new();
             let mut arrival_added = false;
+            let chat_mute = value
+                .as_object()
+                .and_then(extract_mute_flag)
+                .or_else(|| {
+                    value
+                        .get("withUser")
+                        .and_then(Value::as_object)
+                        .and_then(extract_mute_flag)
+                });
+            if let (Some(fid), Some(muted)) = (fan_id.as_deref(), chat_mute) {
+                store.set_fan_muted_state(model_id, fid, muted).await;
+            }
             if let Some(user) = value.get("withUser") {
                 if let Some(obj) = user.as_object() {
                     fan_name = user_display_hint(obj);
                 }
-                let (_, added) = apply_subscribers_batch(store, model_id, &[user]).await?;
+                let (_, added) =
+                    apply_subscribers_batch(store, model_id, &[(user, chat_mute)]).await?;
                 arrival_added = added;
             }
             let notifications = if let Some(fan_id_str) = fan_id.as_deref() {
@@ -322,18 +367,25 @@ pub async fn ingest_body(
                 )
                 .await?;
                 if !is_backfill {
-                    let creator_of_id = store
-                        .get_model(model_id)
-                        .await
-                        .ok()
-                        .and_then(|model| model.of_user_id);
-                    let (max_msg_id, thread_msgs) = extract_thread_messages(
-                        creator_of_id.as_deref(),
-                        fan_id_str,
-                        &fan_name,
-                        &value,
-                    );
-                    candidates.extend(thread_msgs);
+                    let is_muted = chat_mute == Some(true)
+                        || store.is_fan_muted(model_id, fan_id_str).await;
+                    let max_msg_id = if is_muted {
+                        0
+                    } else {
+                        let creator_of_id = store
+                            .get_model(model_id)
+                            .await
+                            .ok()
+                            .and_then(|model| model.of_user_id);
+                        let (max_id, thread_msgs) = extract_thread_messages(
+                            creator_of_id.as_deref(),
+                            fan_id_str,
+                            &fan_name,
+                            &value,
+                        );
+                        candidates.extend(thread_msgs);
+                        max_id
+                    };
                     NotificationBatch {
                         source: BatchSource::ChatThread { max_msg_id },
                         candidates,
@@ -404,7 +456,10 @@ pub async fn ingest_body(
                 model_data_changed: false,
             }
         }
-        CaptureKind::Publication | CaptureKind::CreatorPosts | CaptureKind::LiveEvent => {
+        CaptureKind::Publication
+        | CaptureKind::CreatorPosts
+        | CaptureKind::LiveEvent
+        | CaptureKind::ChatMute => {
             unreachable!()
         }
     };
@@ -457,6 +512,7 @@ async fn apply_subscriber_payload(
     url: &str,
     value: &Value,
 ) -> Result<(Option<String>, bool), DbError> {
+    let from_muted_filter = url.contains("_cf_muted_list=1");
     if let Some(list) = value
         .get("list")
         .or_else(|| value.get("users"))
@@ -464,8 +520,12 @@ async fn apply_subscriber_payload(
         .and_then(Value::as_array)
         .or_else(|| value.as_array())
     {
-        let mut items: Vec<&Value> = Vec::with_capacity(list.len());
+        let mut items: Vec<(&Value, Option<bool>)> = Vec::with_capacity(list.len());
         for item in list {
+            let item_mute = item
+                .as_object()
+                .and_then(extract_mute_flag)
+                .or(if from_muted_filter { Some(true) } else { None });
             let fan = item
                 .get("withUser")
                 .filter(|user| user.is_object())
@@ -482,18 +542,20 @@ async fn apply_subscriber_payload(
                     }
                 });
             if let Some(fan) = fan {
-                items.push(fan);
+                items.push((fan, item_mute));
             }
         }
         return apply_subscribers_batch(store, model_id, &items).await;
     }
     if value.get("id").is_some() {
-        return apply_subscribers_batch(store, model_id, &[value]).await;
+        let mute = value.as_object().and_then(extract_mute_flag);
+        return apply_subscribers_batch(store, model_id, &[(value, mute)]).await;
     }
     if let Some(object) = value.as_object() {
-        let items: Vec<&Value> = object
+        let items: Vec<(&Value, Option<bool>)> = object
             .values()
             .filter(|item| item.get("id").is_some())
+            .map(|item| (item, item.as_object().and_then(extract_mute_flag)))
             .collect();
         if !items.is_empty() {
             let (last, added) = apply_subscribers_batch(store, model_id, &items).await?;
@@ -508,7 +570,7 @@ async fn apply_subscriber_payload(
 async fn apply_subscribers_batch(
     store: &SupabaseStore,
     model_id: &str,
-    values: &[&Value],
+    values: &[(&Value, Option<bool>)],
 ) -> Result<(Option<String>, bool), DbError> {
     let mut fans = Vec::with_capacity(values.len());
     let mut arrivals = Vec::new();
@@ -522,10 +584,13 @@ async fn apply_subscribers_batch(
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty());
 
-    for value in values {
-        let Some((fan, arrived)) = extract_subscriber_upsert(value) else {
+    for (value, outer_mute) in values {
+        let Some((mut fan, arrived)) = extract_subscriber_upsert(value) else {
             continue;
         };
+        if outer_mute.is_some() {
+            fan.is_muted = *outer_mute;
+        }
         if let Some(arrived_at) = arrived {
             if creator_of_id.as_deref() != Some(fan.of_fan_id.as_str()) {
                 arrivals.push((fan.of_fan_id.clone(), arrived_at));
@@ -641,9 +706,75 @@ fn extract_subscriber_upsert(value: &Value) -> Option<(FanUpsertOwned, Option<St
             highest_spend: data.and_then(|item| {
                 first_number(item, &["highestSumm", "maxSumm", "biggestSumm", "highestPurchase"])
             }),
+            is_muted: extract_mute_flag(object),
         },
         arrived,
     ))
+}
+
+pub(crate) fn extract_mute_flag(object: &serde_json::Map<String, Value>) -> Option<bool> {
+    for key in [
+        "isMutedNotifications",
+        "isMuted",
+        "is_muted",
+        "muteNotifications",
+        "notificationsMuted",
+        "isChatMuted",
+    ] {
+        if let Some(flag) = object.get(key).and_then(bool_value) {
+            return Some(flag);
+        }
+    }
+    if let Some(states) = object.get("listsStates").and_then(Value::as_array) {
+        for state in states {
+            let Some(name) = state.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let norm = name.trim().to_lowercase();
+            let is_mute_list = matches!(
+                norm.as_str(),
+                "muted"
+                    | "mute"
+                    | "silenciados"
+                    | "silenciado"
+                    | "silenciadas"
+                    | "muted notifications"
+            );
+            if is_mute_list && state.get("hasUser").and_then(bool_value) == Some(true) {
+                return Some(true);
+            }
+        }
+    }
+    None
+}
+
+fn mute_target_fan_id(url: &str) -> Option<String> {
+    let parsed = tauri::Url::parse(url).ok()?;
+    let segments: Vec<&str> = parsed.path().split('/').filter(|part| !part.is_empty()).collect();
+    if segments.len() >= 5
+        && segments[0] == "api2"
+        && segments[1] == "v2"
+        && (segments[2] == "chats" || segments[2] == "users")
+    {
+        return numeric_id(segments[3]);
+    }
+    None
+}
+
+fn infer_mute_from_url(url: &str) -> bool {
+    let Ok(parsed) = tauri::Url::parse(url) else {
+        return true;
+    };
+    let path_lower = parsed.path().to_ascii_lowercase();
+    if path_lower.ends_with("/unmute") {
+        return false;
+    }
+    if let Some(method) = query_value(url, "_cf_method") {
+        if method.eq_ignore_ascii_case("DELETE") {
+            return false;
+        }
+    }
+    true
 }
 
 async fn store_chat_ppvs(
@@ -800,6 +931,9 @@ async fn store_chat_ppvs(
 }
 
 fn is_chats_inbox_url(url: &str) -> bool {
+    if url.contains("_cf_muted_list=1") {
+        return false;
+    }
     tauri::Url::parse(url)
         .map(|parsed| parsed.path() == "/api2/v2/chats")
         .unwrap_or(false)
@@ -899,14 +1033,22 @@ fn extract_inbox_events(creator_of_id: Option<&str>, value: &Value) -> (u64, Vec
         };
         let (with_id, with_label) = extract_user_ref(chat_obj.get("withUser"));
         let fan_id = with_id.unwrap_or_default();
+        let chat_muted = extract_mute_flag(chat_obj) == Some(true)
+            || chat_obj
+                .get("withUser")
+                .and_then(Value::as_object)
+                .and_then(extract_mute_flag)
+                == Some(true);
         let Some(last_msg) = chat_obj.get("lastMessage").and_then(Value::as_object) else {
             continue;
         };
         let Some(of_message_id) = last_msg.get("id").and_then(value_id) else {
             continue;
         };
-        if let Some(n) = parse_numeric_id(&of_message_id) {
-            max_msg_id = max_msg_id.max(n);
+        if !chat_muted {
+            if let Some(n) = parse_numeric_id(&of_message_id) {
+                max_msg_id = max_msg_id.max(n);
+            }
         }
         let (from_id, from_label) = extract_user_ref(last_msg.get("fromUser"));
         let fan_name = if !with_label.is_empty() {
@@ -940,7 +1082,7 @@ fn extract_inbox_events(creator_of_id: Option<&str>, value: &Value) -> (u64, Vec
                 created_at,
                 live_transition: false,
             });
-        } else if from_id.is_some() {
+        } else if !chat_muted && from_id.is_some() {
             out.push(CandidateEvent::IncomingMessage {
                 of_message_id,
                 of_fan_id: fan_id,
@@ -1951,6 +2093,7 @@ pub async fn ingest_observation(
                     official_spend: official,
                     last_spend_at: profile.last_spend_at.clone(),
                     highest_spend: profile.highest_spend,
+                    is_muted: None,
                 }],
             )
             .await?;
@@ -2253,5 +2396,78 @@ mod tests {
             fan_arrived_at(fan.as_object().unwrap()).as_deref(),
             Some("2026-11-27T04:30:00+00:00")
         );
+    }
+
+    #[test]
+    fn suppresses_inbox_messages_for_muted_fans_and_classifies_mute_urls() {
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/chats/884422/mute?_cf_method=POST"),
+            Some(CaptureKind::ChatMute)
+        );
+        assert_eq!(
+            classify_url("https://onlyfans.com/api2/v2/chats/884422/unmute?_cf_method=POST"),
+            Some(CaptureKind::ChatMute)
+        );
+        assert!(infer_mute_from_url(
+            "https://onlyfans.com/api2/v2/chats/884422/mute?_cf_method=POST"
+        ));
+        assert!(!infer_mute_from_url(
+            "https://onlyfans.com/api2/v2/chats/884422/mute?_cf_method=DELETE"
+        ));
+        assert!(!infer_mute_from_url(
+            "https://onlyfans.com/api2/v2/chats/884422/unmute?_cf_method=POST"
+        ));
+
+        let inbox = json!({
+            "list": [
+                {
+                    "isMutedNotifications": true,
+                    "withUser": { "id": 884422, "name": "Muted Fan", "username": "mutedfan" },
+                    "lastMessage": {
+                        "id": 9001,
+                        "text": "hola",
+                        "createdAt": "2026-11-27T20:00:00+00:00",
+                        "fromUser": { "id": 884422, "username": "mutedfan" }
+                    }
+                },
+                {
+                    "isMutedNotifications": false,
+                    "withUser": {
+                        "id": 884423,
+                        "name": "Silenciado Lista",
+                        "username": "listmuted",
+                        "listsStates": [
+                            { "name": "Silenciados", "hasUser": true }
+                        ]
+                    },
+                    "lastMessage": {
+                        "id": 9002,
+                        "text": "mensaje silenciado por lista",
+                        "createdAt": "2026-11-27T20:01:00+00:00",
+                        "fromUser": { "id": 884423, "username": "listmuted" }
+                    }
+                },
+                {
+                    "isMutedNotifications": false,
+                    "withUser": { "id": 884424, "name": "Active Fan", "username": "activefan" },
+                    "lastMessage": {
+                        "id": 9003,
+                        "text": "hola activa",
+                        "createdAt": "2026-11-27T20:02:00+00:00",
+                        "fromUser": { "id": 884424, "username": "activefan" }
+                    }
+                }
+            ]
+        });
+        // Note: chat 2 has explicit isMutedNotifications=false on chat_obj, while withUser has listsStates Silenciados=true!
+        let (max_id, events) = extract_inbox_events(Some("100"), &inbox);
+        assert_eq!(max_id, 9003);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            CandidateEvent::IncomingMessage { of_fan_id, .. } => {
+                assert_eq!(of_fan_id, "884424");
+            }
+            _ => panic!("expected incoming message from active fan only"),
+        }
     }
 }

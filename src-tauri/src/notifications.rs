@@ -156,6 +156,7 @@ struct SaleFingerprint {
     sale_kind: SaleKind,
     of_fan_id: String,
     amount_cents: i64,
+    event_unix: i64,
     recorded_at: Instant,
 }
 
@@ -433,6 +434,11 @@ impl NotificationBus {
             }
         }
 
+        let external_key = if model.partition_id.trim().is_empty() {
+            String::new()
+        } else {
+            format!("partition:{}", model.partition_id.trim())
+        };
         let mut emitted = Vec::new();
         let mut history_rows = Vec::new();
         let mut unread_changed = false;
@@ -443,6 +449,7 @@ impl NotificationBus {
                     store,
                     &mut row,
                     model_id,
+                    &external_key,
                     &model_name,
                     &model_username,
                     &model_avatar,
@@ -491,11 +498,6 @@ impl NotificationBus {
         }
 
         if let Some(app) = app {
-            let external_key = if model.partition_id.trim().is_empty() {
-                String::new()
-            } else {
-                format!("partition:{}", model.partition_id.trim())
-            };
             for item in &emitted {
                 let _ = app.emit("cf-notification", item);
                 self.queue_os_toast(app, item);
@@ -548,6 +550,7 @@ impl NotificationBus {
         store: &SupabaseStore,
         row: &mut NotifyStateRow,
         model_id: &str,
+        external_key: &str,
         model_name: &str,
         model_username: &str,
         model_avatar: &Option<String>,
@@ -581,6 +584,10 @@ impl NotificationBus {
                     }
                 }
                 let fan_id = of_fan_id.trim().to_owned();
+                if !fan_id.is_empty() && store.is_fan_muted(model_id, &fan_id).await {
+                    let _ = store.claim_notified_event(model_id, &key, now_iso).await;
+                    return None;
+                }
                 let viewing_this = is_viewing(viewing, model_id, &fan_id);
                 if !store
                     .claim_notified_event(model_id, &key, now_iso)
@@ -629,8 +636,15 @@ impl NotificationBus {
                 if ev_id.is_empty() {
                     return None;
                 }
-                let key = format!("{}:{model_id}:{ev_id}", sale_kind.key());
-                let numeric_id = parse_numeric_id(ev_id);
+                let sale_ids: Vec<&str> = ev_id
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                if sale_ids.is_empty() {
+                    return None;
+                }
+                let numeric_id = sale_ids.iter().find_map(|id| parse_numeric_id(id));
                 let watermark = parse_numeric_id(&row.last_seen_message_id).unwrap_or(0);
                 let passes_watermark = if live_transition
                     || matches!(source, BatchSource::Transactions | BatchSource::WebSocket)
@@ -642,27 +656,75 @@ impl NotificationBus {
                     true
                 };
                 if !passes_watermark {
-                    let _ = store.claim_notified_event(model_id, &key, now_iso).await;
+                    for id in &sale_ids {
+                        let key = format!("{}:{model_id}:{id}", sale_kind.key());
+                        let _ = store.claim_notified_event(model_id, &key, now_iso).await;
+                    }
                     return None;
                 }
-                if !store
-                    .claim_notified_event(model_id, &key, now_iso)
-                    .await
-                    .unwrap_or(false)
-                {
+                let mut already_seen = false;
+                let mut claimed_new = false;
+                for id in &sale_ids {
+                    let key = format!("{}:{model_id}:{id}", sale_kind.key());
+                    match store.claim_notified_event(model_id, &key, now_iso).await {
+                        Ok(true) => claimed_new = true,
+                        Ok(false) => already_seen = true,
+                        Err(_) => return None,
+                    }
+                }
+                if already_seen || !claimed_new {
                     return None;
                 }
                 let fan_id = of_fan_id.trim().to_owned();
-                if self.is_duplicate_sale(model_id, sale_kind, &fan_id, gross_amount) {
+                let slot_unix = if live_transition {
+                    chrono::Utc::now().timestamp()
+                } else {
+                    sale_event_unix(&created_at).unwrap_or_else(|| chrono::Utc::now().timestamp())
+                };
+                if sale_kind == SaleKind::Ppv
+                    && ppv_amount_already_seen(
+                        store,
+                        model_id,
+                        &fan_id,
+                        gross_amount,
+                        slot_unix,
+                        now_iso,
+                    )
+                    .await
+                {
                     return None;
                 }
-                let resolved_fan = resolve_fan_label(store, model_id, &fan_id, &fan_name).await;
+                if self.is_duplicate_sale(model_id, sale_kind, &fan_id, gross_amount, &created_at) {
+                    return None;
+                }
                 let rounded_gross = (gross_amount * 100.0).round() / 100.0;
                 let rounded_net = if net_amount.is_finite() && net_amount > 0.0 {
                     (net_amount * 100.0).round() / 100.0
                 } else {
                     (rounded_gross * ONLYFANS_NET_RATIO * 100.0).round() / 100.0
                 };
+                let resolved_created_at = if live_transition || created_at.trim().is_empty() {
+                    now_iso.to_owned()
+                } else {
+                    created_at
+                };
+                if !fan_id.is_empty() && store.is_fan_muted(model_id, &fan_id).await {
+                    let silent_source_id = next_notification_id();
+                    let _ = store
+                        .record_employee_sale(
+                            external_key,
+                            &fan_id,
+                            rounded_gross,
+                            rounded_net,
+                            sale_kind.into_notification_kind().as_str(),
+                            &resolved_created_at,
+                            &silent_source_id,
+                            "America/Caracas",
+                        )
+                        .await;
+                    return None;
+                }
+                let resolved_fan = resolve_fan_label(store, model_id, &fan_id, &fan_name).await;
                 let clean_preview = {
                     let stripped = strip_html_preview(&preview);
                     if !stripped.is_empty() {
@@ -686,11 +748,7 @@ impl NotificationBus {
                     amount: Some(rounded_gross),
                     net_amount: Some(rounded_net),
                     preview: clean_preview,
-                    created_at: if live_transition || created_at.trim().is_empty() {
-                        now_iso.to_owned()
-                    } else {
-                        created_at
-                    },
+                    created_at: resolved_created_at,
                 })
             }
         }
@@ -702,6 +760,7 @@ impl NotificationBus {
         sale_kind: SaleKind,
         of_fan_id: &str,
         gross_amount: f64,
+        created_at: &str,
     ) -> bool {
         let mut recent = self
             .recent_sales
@@ -720,11 +779,15 @@ impl NotificationBus {
             return false;
         }
         let fan_norm = of_fan_id.trim();
+        let event_unix = sale_event_unix(created_at).unwrap_or(0);
         let duplicate = recent.iter().any(|entry| {
             entry.model_id == model_id
                 && entry.sale_kind == sale_kind
                 && entry.amount_cents == amount_cents
                 && (fan_norm.is_empty() || entry.of_fan_id.is_empty() || entry.of_fan_id == fan_norm)
+                && (event_unix == 0
+                    || entry.event_unix == 0
+                    || (event_unix - entry.event_unix).abs() <= 8)
         });
         if !duplicate {
             recent.push_back(SaleFingerprint {
@@ -732,6 +795,7 @@ impl NotificationBus {
                 sale_kind,
                 of_fan_id: fan_norm.to_owned(),
                 amount_cents,
+                event_unix,
                 recorded_at: now,
             });
         }
@@ -1211,6 +1275,7 @@ pub fn parse_live_ws_payload(creator_of_id: Option<&str>, body: &str) -> Vec<Can
             let is_tip = msg.get("isTip").and_then(json_bool) == Some(true) || tip_amount.is_some();
             let price = msg.get("price").and_then(json_num).filter(|v| *v > 0.0);
             let is_opened = msg.get("isOpened").and_then(json_bool) == Some(true);
+            let ws_muted = ws_payload_is_muted(root, msg);
 
             if is_tip && !from_is_creator {
                 if let Some(amount) = tip_amount.or_else(|| money_from_text(text)) {
@@ -1240,7 +1305,7 @@ pub fn parse_live_ws_payload(creator_of_id: Option<&str>, body: &str) -> Vec<Can
                         live_transition: true,
                     });
                 }
-            } else if !from_is_creator && from_id.is_some() {
+            } else if !ws_muted && !from_is_creator && from_id.is_some() {
                 out.push(CandidateEvent::IncomingMessage {
                     of_message_id: msg_id,
                     of_fan_id: fan_id,
@@ -1294,10 +1359,31 @@ pub fn parse_live_ws_payload(creator_of_id: Option<&str>, body: &str) -> Vec<Can
     out
 }
 
+fn ws_payload_is_muted(
+    root: &serde_json::Map<String, Value>,
+    msg: &serde_json::Map<String, Value>,
+) -> bool {
+    let checks = [
+        Some(msg),
+        Some(root),
+        msg.get("chat").and_then(Value::as_object),
+        root.get("chat").and_then(Value::as_object),
+        msg.get("fromUser").and_then(Value::as_object),
+        msg.get("withUser").and_then(Value::as_object),
+    ];
+    for candidate in checks.into_iter().flatten() {
+        if crate::sync::extract_mute_flag(candidate) == Some(true) {
+            return true;
+        }
+    }
+    false
+}
+
 fn sale_from_ws_object(obj: &serde_json::Map<String, Value>, sale_kind: SaleKind) -> Option<CandidateEvent> {
-    let ev_id = json_id(obj.get("id"))
+    let raw_id = json_id(obj.get("id"))
         .or_else(|| json_id(obj.get("messageId")))
         .or_else(|| json_id(obj.get("transactionId")))?;
+    let ev_id = join_event_ids(message_id_from_notification(obj), Some(raw_id))?;
     let text = obj
         .get("text")
         .or_else(|| obj.get("description"))
@@ -1310,6 +1396,7 @@ fn sale_from_ws_object(obj: &serde_json::Map<String, Value>, sale_kind: SaleKind
         .or_else(|| obj.get("gross"))
         .and_then(json_num)
         .filter(|v| *v > 0.0)
+        .or_else(|| amount_from_replace_pairs(obj))
         .or_else(|| money_from_text(text))?;
     let (user_id, fan_name) = extract_user_ref(
         obj.get("user")
@@ -1358,6 +1445,115 @@ fn user_label(user: &serde_json::Map<String, Value>) -> String {
         return format!("@{username}");
     }
     String::new()
+}
+
+fn sale_event_unix(created_at: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(created_at.trim())
+        .ok()
+        .map(|stamp| stamp.timestamp())
+}
+
+async fn ppv_amount_already_seen(
+    store: &SupabaseStore,
+    model_id: &str,
+    fan_id: &str,
+    gross_amount: f64,
+    event_unix: i64,
+    now_iso: &str,
+) -> bool {
+    let fan = fan_id.trim();
+    if fan.is_empty() {
+        return false;
+    }
+    let cents = (gross_amount * 100.0).round() as i64;
+    if cents <= 0 {
+        return false;
+    }
+    let bucket = event_unix.div_euclid(60);
+    for offset in -1i64..=1 {
+        let key = format!("ppvamt:{fan}:{cents}:{}", bucket + offset);
+        if store
+            .notified_event_exists(model_id, &key)
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    let key = format!("ppvamt:{fan}:{cents}:{bucket}");
+    let _ = store.claim_notified_event(model_id, &key, now_iso).await;
+    false
+}
+
+fn join_event_ids(message_id: Option<String>, raw_id: Option<String>) -> Option<String> {
+    let message_id = message_id.filter(|id| !id.is_empty());
+    let raw_id = raw_id.filter(|id| !id.is_empty());
+    match (message_id, raw_id) {
+        (Some(message_id), Some(raw_id)) if message_id != raw_id => {
+            Some(format!("{message_id}|{raw_id}"))
+        }
+        (Some(message_id), _) => Some(message_id),
+        (None, Some(raw_id)) => Some(raw_id),
+        (None, None) => None,
+    }
+}
+
+fn message_id_from_notification(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    json_id(obj.get("messageId"))
+        .or_else(|| json_id(obj.get("entityId")))
+        .or_else(|| first_id_in_value(obj.get("replacePairs")))
+        .or_else(|| first_id_in_value(obj.get("replace_pairs")))
+        .or_else(|| {
+            obj.get("text")
+                .or_else(|| obj.get("description"))
+                .and_then(Value::as_str)
+                .and_then(first_id_in_text)
+        })
+}
+
+fn first_id_in_value(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => first_id_in_text(text),
+        Value::Object(map) => map.values().find_map(|item| first_id_in_value(Some(item))),
+        Value::Array(items) => items.iter().find_map(|item| first_id_in_value(Some(item))),
+        _ => None,
+    }
+}
+
+fn first_id_in_text(text: &str) -> Option<String> {
+    let marker = "firstId=";
+    let start = text.find(marker)? + marker.len();
+    let digits: String = text[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() { None } else { Some(digits) }
+}
+
+fn amount_from_replace_pairs(obj: &serde_json::Map<String, Value>) -> Option<f64> {
+    let pairs = obj
+        .get("replacePairs")
+        .or_else(|| obj.get("replace_pairs"))
+        .and_then(Value::as_object)?;
+    for (key, value) in pairs {
+        let label = key.to_ascii_uppercase();
+        if !label.contains("AMOUNT") && !label.contains("PRICE") {
+            continue;
+        }
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        if let Some(amount) = money_from_text(text) {
+            return Some(amount);
+        }
+        let cleaned = text.trim().trim_start_matches('$').replace(',', "");
+        if let Ok(amount) = cleaned.parse::<f64>() {
+            if amount.is_finite() && amount > 0.0 {
+                return Some(amount);
+            }
+        }
+    }
+    None
 }
 
 fn json_id(value: Option<&Value>) -> Option<String> {
@@ -1439,6 +1635,16 @@ mod tests {
         });
         let sale_events = parse_live_ws_payload(Some("100"), &ppv.to_string());
         assert_eq!(sale_events.len(), 1);
+
+        let muted_msg = json!({
+            "api2_chat_message": {
+                "id": 9003,
+                "isMutedNotifications": true,
+                "text": "no deberia notificar",
+                "fromUser": { "id": 88, "username": "muted88" }
+            }
+        });
+        assert!(parse_live_ws_payload(Some("100"), &muted_msg.to_string()).is_empty());
     }
 
     #[test]
@@ -1471,6 +1677,38 @@ mod tests {
             } => {
                 assert!((*gross_amount - 21.99).abs() < 0.01);
                 assert_eq!(created_at.as_str(), "2026-11-27T12:48:00+00:00");
+            }
+            _ => panic!("expected ppv"),
+        }
+    }
+
+    #[test]
+    fn purchase_notification_reuses_message_id_from_the_chat_link() {
+        let payload = json!({
+            "list": [{
+                "id": "9010",
+                "type": "paided_message",
+                "text": "{NAME} ha comprado su {MESSAGE_LINK} para {AMOUNT}!",
+                "replacePairs": {
+                    "{NAME}": "Dan",
+                    "{MESSAGE_LINK}": "<a href='https://onlyfans.com/my/chats/chat/69342824?firstId=555'>message</a>",
+                    "{AMOUNT}": "$21.99"
+                },
+                "createdAt": "2026-11-27T16:03:00+00:00",
+                "user": { "id": 69342824, "username": "u69342824" }
+            }]
+        });
+        let sales = extract_sales_from_notifications_payload(&payload);
+        assert_eq!(sales.len(), 1);
+        match &sales[0] {
+            CandidateEvent::Sale {
+                sale_kind: SaleKind::Ppv,
+                of_event_id,
+                gross_amount,
+                ..
+            } => {
+                assert_eq!(of_event_id, "555|9010");
+                assert!((*gross_amount - 21.99).abs() < 0.01);
             }
             _ => panic!("expected ppv"),
         }

@@ -1,5 +1,11 @@
 import type { EarningsBasis } from "../api";
-import { isManager, loadMyProfile } from "../agency";
+import {
+  deleteShift,
+  isManager,
+  loadMyProfile,
+  readLocalDismissedShifts,
+  type LocalDismissedShift,
+} from "../agency";
 import { shiftLabel } from "../shifts";
 import { supabase } from "../supabase";
 import { roundMoney } from "./format";
@@ -18,7 +24,7 @@ export const REPORT_RANGES: { id: ReportRangeId; label: string }[] = [
 export type EmployeeReport = {
   labels: string[];
   series: { id: string; name: string; values: number[] }[];
-  ranking: { id: string; name: string }[];
+  ranking: { id: string; name: string; amount: number }[];
   totalSales: number;
   unlockRate: null;
   averageReplySeconds: null;
@@ -169,7 +175,7 @@ export function buildEmployeeReport(input: {
   return {
     labels: buckets.map((bucket) => bucket.label),
     series,
-    ranking: series.map((item) => ({ id: item.id, name: item.name })),
+    ranking: ranked.slice(0, 3).map(([id, row]) => ({ id, name: row.name, amount: row.total })),
     totalSales: roundMoney(rows.reduce((sum, row) => sum + row.sales, 0)),
     unlockRate: null,
     averageReplySeconds: null,
@@ -627,12 +633,13 @@ export async function loadDropperReport(range: ReportRangeId, timeZone: string):
     });
   }
 
-  const [slotsByPerson, accountsByPerson, shifts, activity, storedRemote] = await Promise.all([
+  const [slotsByPerson, accountsByPerson, shifts, activity, storedRemote, dismissedShifts] = await Promise.all([
     listScheduleSlots(ids),
     listAssignedAccounts(ids),
     listDropperShifts(ids, range, timeZone),
     listDropperActivity(range, timeZone),
     listRemoteDropperShiftRecords(ids, range, timeZone),
+    listDismissedDropperShifts(ids),
   ]);
   const report = buildDropperReport({
     range,
@@ -642,10 +649,25 @@ export async function loadDropperReport(range: ReportRangeId, timeZone: string):
     accountsByPerson,
     shifts,
     storedRecords: storedRemote,
+    dismissedShifts,
     activity,
   });
   void persistDropperShiftEntriesIfChanged(report.shiftRecords, storedRemote);
   return report;
+}
+
+export async function deleteDropperShiftGroup(group: DropperShiftGroup): Promise<void> {
+  await deleteShift(group.shiftId, {
+    dropperUserId: group.dropperUserId,
+    shiftStart: group.shiftStart,
+    shiftEnd: group.shiftEnd,
+  });
+  const prefix = `${group.shiftId}:`;
+  for (const key of [...lastSavedShiftFingerprints.keys()]) {
+    if (key.startsWith(prefix)) {
+      lastSavedShiftFingerprints.delete(key);
+    }
+  }
 }
 
 export async function syncDropperShiftRecords(
@@ -666,6 +688,7 @@ export function buildDropperReport(input: {
   accountsByPerson: Map<string, AssignedAccount[]>;
   shifts?: DropperShiftRow[];
   storedRecords?: DropperShiftRecord[];
+  dismissedShifts?: LocalDismissedShift[];
   activity: ActivityEvent[];
   now?: Date;
 }): DropperReport {
@@ -675,6 +698,33 @@ export function buildDropperReport(input: {
   const rangeStartMs = from ? new Date(from).getTime() : null;
   const rangeEndMs = new Date(to).getTime();
   const inRange = (ms: number) => (rangeStartMs === null || ms >= rangeStartMs) && ms < rangeEndMs;
+
+  const dismissedKeySet = new Set<string>();
+  const dismissedWindowsByUser = new Map<string, { startMs: number; endMs: number }[]>();
+  for (const dismissed of input.dismissedShifts ?? []) {
+    if (!dismissed.dropperUserId || !dismissed.shiftKey) continue;
+    dismissedKeySet.add(`${dismissed.dropperUserId}:${dismissed.shiftKey}`);
+    const wStart = dismissed.windowStart ? new Date(dismissed.windowStart).getTime() : Number.NaN;
+    const wEnd = dismissed.windowEnd ? new Date(dismissed.windowEnd).getTime() : wStart + 3_600_000;
+    if (Number.isFinite(wStart) && Number.isFinite(wEnd)) {
+      const list = dismissedWindowsByUser.get(dismissed.dropperUserId) ?? [];
+      list.push({ startMs: wStart, endMs: Math.max(wEnd, wStart + 60_000) });
+      dismissedWindowsByUser.set(dismissed.dropperUserId, list);
+    }
+  }
+  const isShiftDismissed = (
+    dropperUserId: string,
+    shiftId: string,
+    startMs: number,
+    endMs: number,
+    synthetic: boolean,
+  ): boolean => {
+    if (dismissedKeySet.has(`${dropperUserId}:${shiftId}`)) return true;
+    if (!synthetic) return false;
+    const windows = dismissedWindowsByUser.get(dropperUserId);
+    if (!windows || windows.length === 0) return false;
+    return windows.some((win) => startMs < win.endMs && endMs > win.startMs);
+  };
 
   const peopleById = new Map(input.people.map((person) => [person.id, person]));
   const counted = input.activity.filter((event) => Number.isFinite(new Date(event.at).getTime()));
@@ -775,6 +825,7 @@ export function buildDropperReport(input: {
     if (!Number.isFinite(startMs)) continue;
     const rawEndMs = shift.clockOut ? new Date(shift.clockOut).getTime() : null;
     const endMs = rawEndMs && Number.isFinite(rawEndMs) ? rawEndMs : Math.max(nowMs, startMs);
+    if (isShiftDismissed(person.id, shift.id, startMs, endMs, false)) continue;
     const slots = input.slotsByPerson.get(person.id) ?? [];
     const slotMatch = findShiftScheduleWindow(startMs, endMs, slots, input.timeZone);
     const scheduleLabel = slotMatch?.label || summarizeSlots(slots);
@@ -866,6 +917,9 @@ export function buildDropperReport(input: {
       const startIso = new Date(window.start).toISOString();
       const endIso = new Date(window.end).toISOString();
       const shiftId = `sched:${person.id}:${startIso}`;
+      if (isShiftDismissed(person.id, shiftId, window.start, window.end, true)) {
+        return null;
+      }
       const id = `${shiftId}:${account.modelId || "unassigned"}`;
       return registerShiftEntry({
         id,
@@ -896,6 +950,9 @@ export function buildDropperReport(input: {
     const dayEnd = addZonedDays(parts, 1, input.timeZone);
     const dayKey = dayKeyFromParts(parts);
     const shiftId = `day:${person.id}:${dayKey}`;
+    if (isShiftDismissed(person.id, shiftId, dayStart.getTime(), dayEnd.getTime(), true)) {
+      return null;
+    }
     const id = `${shiftId}:${account.modelId || "unassigned"}`;
     return registerShiftEntry({
       id,
@@ -1003,6 +1060,11 @@ export function buildDropperReport(input: {
     const startMs = new Date(stored.shiftStart).getTime();
     if (!Number.isFinite(startMs)) continue;
     const endMs = stored.shiftEnd ? new Date(stored.shiftEnd).getTime() : Math.max(nowMs, startMs);
+    const isSyntheticStored =
+      stored.shiftId.startsWith("sched:") || stored.shiftId.startsWith("day:");
+    if (isShiftDismissed(person.id, stored.shiftId, startMs, endMs, isSyntheticStored)) {
+      continue;
+    }
     const overlapsRange =
       rangeStartMs === null
         ? startMs < rangeEndMs
@@ -1521,6 +1583,36 @@ async function listRemoteDropperShiftRecords(
   }
 }
 
+async function listDismissedDropperShifts(ids: string[]): Promise<LocalDismissedShift[]> {
+  const local = readLocalDismissedShifts().filter((item) => ids.includes(item.dropperUserId));
+  if (ids.length === 0) return local;
+  try {
+    const { data, error } = await supabase
+      .from("dismissed_dropper_shifts")
+      .select("dropper_user_id,shift_key,window_start,window_end")
+      .in("dropper_user_id", ids);
+    if (error || !data) return local;
+    const byKey = new Map<string, LocalDismissedShift>();
+    for (const item of local) {
+      byKey.set(`${item.dropperUserId}:${item.shiftKey}`, item);
+    }
+    for (const row of data) {
+      const dropperUserId = String(row.dropper_user_id ?? "");
+      const shiftKey = String(row.shift_key ?? "");
+      if (!dropperUserId || !shiftKey) continue;
+      byKey.set(`${dropperUserId}:${shiftKey}`, {
+        dropperUserId,
+        shiftKey,
+        windowStart: (row.window_start as string | null) ?? null,
+        windowEnd: (row.window_end as string | null) ?? null,
+      });
+    }
+    return [...byKey.values()];
+  } catch {
+    return local;
+  }
+}
+
 function shiftFingerprint(item: {
   status: string;
   publicationsCount: number;
@@ -1675,6 +1767,7 @@ async function listChatterSales(
     if (error) throw error;
     const batch = data ?? [];
     for (const row of batch) {
+      if (!row.employee_id) continue;
       const profile = relation(row.profiles);
       rows.push({
         employeeId: row.employee_id as string,

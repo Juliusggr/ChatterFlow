@@ -1,11 +1,13 @@
-import { UserPlus } from "lucide-react";
+import { Trash2, UserPlus } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { errorMessage } from "./api";
 import {
   deactivateEmployee,
+  deleteEmployee,
   listEmployees,
   roleLabel,
   saveEmployee,
+  setEmployeeActive,
   type AgencyEmployee,
   type AgencyRole,
 } from "./agency";
@@ -14,29 +16,55 @@ import { blankSchedule, modelLabel, summarizeSchedule, WEEKDAYS, type Model, typ
 
 const ROLES: AgencyRole[] = ["owner", "admin", "chatter", "dropper"];
 
+type StatusFilter = "all" | "active" | "inactive";
+
 type Draft = {
   username: string;
   password: string;
   name: string;
   role: AgencyRole | "";
+  isActive: boolean;
   days: ScheduleDay[];
   modelIds: string[];
 };
 
 function emptyDraft(): Draft {
-  return { username: "", password: "", name: "", role: "", days: blankSchedule(), modelIds: [] };
+  return {
+    username: "",
+    password: "",
+    name: "",
+    role: "",
+    isActive: true,
+    days: blankSchedule(),
+    modelIds: [],
+  };
 }
 
-export function TeamsView({ models }: { models: Model[] }) {
+export function TeamsView({
+  models,
+  currentUserId,
+  currentUserRole = "owner",
+}: {
+  models: Model[];
+  currentUserId?: string;
+  currentUserRole?: AgencyRole;
+}) {
   const [employees, setEmployees] = useState<AgencyEmployee[]>([]);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [draft, setDraft] = useState<Draft>(emptyDraft());
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<{ id: string; kind: "deactivate" | "delete" } | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   async function reload() {
-    setEmployees((await listEmployees()).filter((employee) => employee.is_active));
+    const all = await listEmployees();
+    all.sort(
+      (a, b) =>
+        Number(b.is_active) - Number(a.is_active) ||
+        a.name.localeCompare(b.name, "es"),
+    );
+    setEmployees(all);
   }
 
   useEffect(() => {
@@ -60,13 +88,14 @@ export function TeamsView({ models }: { models: Model[] }) {
 
   function beginEdit(employee: AgencyEmployee) {
     setEditingId(employee.id);
-    setPendingDeleteId(null);
+    setPendingAction(null);
     setFormError(null);
     setDraft({
       username: employee.username,
       password: "",
       name: employee.name,
       role: employee.role,
+      isActive: employee.is_active,
       days: employee.days,
       modelIds: employee.modelIds,
     });
@@ -94,7 +123,7 @@ export function TeamsView({ models }: { models: Model[] }) {
         password: draft.password,
         fullName: draft.name,
         role: draft.role,
-        isActive: true,
+        isActive: editingId == null ? true : draft.isActive,
         days: draft.days,
         modelIds: draft.modelIds,
       });
@@ -108,13 +137,42 @@ export function TeamsView({ models }: { models: Model[] }) {
     }
   }
 
-  async function remove(id: string) {
-    setBusy(`delete:${id}`);
+  async function deactivate(id: string) {
+    setBusy(`deactivate:${id}`);
     setFormError(null);
     try {
       await deactivateEmployee(id);
       if (editingId === id) cancelEdit();
-      setPendingDeleteId(null);
+      setPendingAction(null);
+      await reload();
+    } catch (caught) {
+      setFormError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reactivate(id: string) {
+    setBusy(`reactivate:${id}`);
+    setFormError(null);
+    try {
+      await setEmployeeActive(id, true);
+      setPendingAction(null);
+      await reload();
+    } catch (caught) {
+      setFormError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function permanentlyDelete(id: string) {
+    setBusy(`delete:${id}`);
+    setFormError(null);
+    try {
+      await deleteEmployee(id);
+      if (editingId === id) cancelEdit();
+      setPendingAction(null);
       await reload();
     } catch (caught) {
       setFormError(errorMessage(caught));
@@ -125,6 +183,13 @@ export function TeamsView({ models }: { models: Model[] }) {
 
   const saving = busy === "save" || (editingId != null && busy === `save:${editingId}`);
   const assignable = draft.role === "chatter" || draft.role === "dropper";
+  const activeCount = employees.filter((e) => e.is_active).length;
+  const inactiveCount = employees.length - activeCount;
+  const visibleEmployees = employees.filter((employee) => {
+    if (statusFilter === "active") return employee.is_active;
+    if (statusFilter === "inactive") return !employee.is_active;
+    return true;
+  });
 
   return (
     <section className="flex flex-col gap-6">
@@ -334,8 +399,47 @@ export function TeamsView({ models }: { models: Model[] }) {
       </form>
 
       <div className="cf-card overflow-hidden">
+        <div
+          className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5"
+          style={{ borderBottom: "1px solid var(--border)" }}
+        >
+          <span className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>
+            Cuentas registradas
+          </span>
+          <div
+            className="inline-flex rounded-lg p-0.5"
+            style={{ background: "var(--bg-subtle)", border: "1px solid var(--border)" }}
+            role="group"
+            aria-label="Filtrar empleados por estado"
+          >
+            {(
+              [
+                { id: "all", label: `Todos (${employees.length})` },
+                { id: "active", label: `Activos (${activeCount})` },
+                { id: "inactive", label: `Desactivados (${inactiveCount})` },
+              ] as const
+            ).map((tab) => {
+              const selected = statusFilter === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  aria-pressed={selected}
+                  className="rounded-md px-2.5 py-1 text-xs font-medium transition-colors"
+                  style={{
+                    background: selected ? "var(--bg-elevated)" : "transparent",
+                    color: selected ? "var(--text-primary)" : "var(--text-secondary)",
+                  }}
+                  onClick={() => setStatusFilter(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[40rem] text-left text-sm">
+          <table className="w-full min-w-[44rem] text-left text-sm">
             <caption className="sr-only">Empleados registrados</caption>
             <thead style={{ borderBottom: "1px solid var(--border)" }}>
               <tr>
@@ -347,46 +451,167 @@ export function TeamsView({ models }: { models: Model[] }) {
               </tr>
             </thead>
             <tbody>
-              {employees.length === 0 ? (
+              {visibleEmployees.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-5 py-10 text-center text-sm" style={{ color: "var(--text-tertiary)" }}>
-                    No hay empleados registrados.
+                    {statusFilter === "inactive"
+                      ? "No hay usuarios desactivados."
+                      : "No hay empleados registrados."}
                   </td>
                 </tr>
               ) : (
-                employees.map((employee) => (
-                  <tr key={employee.id} style={{ borderBottom: "1px solid var(--border-muted)" }}>
-                    <th scope="row" className="px-5 py-4 text-left font-semibold" style={{ color: "var(--text-primary)" }}>
-                      {employee.name}
-                    </th>
-                    <td className="px-5 py-4" style={{ color: "var(--text-secondary)" }}>{employee.username}</td>
-                    <td className="px-5 py-4">
-                      <span className="cf-badge cf-badge-brand">{roleLabel(employee.role)}</span>
-                    </td>
-                    <td className="px-5 py-4 text-xs" style={{ color: "var(--text-secondary)" }}>
-                      {summarizeSchedule(employee.days)}
-                    </td>
-                    <td className="px-5 py-4 text-sm" style={{ color: employee.is_clocked_in ? "var(--live)" : "var(--text-disabled)" }}>
-                      {employee.is_clocked_in ? "En turno" : "Fuera"}
-                    </td>
-                    <td className="px-5 py-4">
-                      <div className="flex flex-wrap gap-2">
-                        <button type="button" className="cf-btn-secondary" style={{ padding: "0.375rem 0.75rem" }} onClick={() => beginEdit(employee)}>
-                          Editar
-                        </button>
-                        {pendingDeleteId === employee.id ? (
-                          <button type="button" className="cf-btn-danger" style={{ padding: "0.375rem 0.75rem" }} onClick={() => void remove(employee.id)}>
-                            Confirmar baja
+                visibleEmployees.map((employee) => {
+                  const isSelf = currentUserId != null && employee.id === currentUserId;
+                  const protectedOwner = employee.role === "owner" && currentUserRole !== "owner";
+                  const rowBusy =
+                    busy === `deactivate:${employee.id}` ||
+                    busy === `reactivate:${employee.id}` ||
+                    busy === `delete:${employee.id}`;
+                  const confirmingDeactivate =
+                    pendingAction?.id === employee.id && pendingAction.kind === "deactivate";
+                  const confirmingDelete =
+                    pendingAction?.id === employee.id && pendingAction.kind === "delete";
+                  return (
+                    <tr
+                      key={employee.id}
+                      style={{
+                        borderBottom: "1px solid var(--border-muted)",
+                        opacity: employee.is_active ? 1 : 0.72,
+                      }}
+                    >
+                      <th scope="row" className="px-5 py-4 text-left font-semibold" style={{ color: "var(--text-primary)" }}>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span>{employee.name}</span>
+                          {!employee.is_active ? (
+                            <span
+                              className="rounded-md px-2 py-0.5 text-[11px] font-medium"
+                              style={{
+                                background: "var(--danger-bg)",
+                                color: "var(--danger)",
+                                border: "1px solid var(--danger-border)",
+                              }}
+                            >
+                              Desactivado
+                            </span>
+                          ) : null}
+                        </div>
+                      </th>
+                      <td className="px-5 py-4" style={{ color: "var(--text-secondary)" }}>{employee.username}</td>
+                      <td className="px-5 py-4">
+                        <span className="cf-badge cf-badge-brand">{roleLabel(employee.role)}</span>
+                      </td>
+                      <td className="px-5 py-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+                        {summarizeSchedule(employee.days)}
+                      </td>
+                      <td
+                        className="px-5 py-4 text-sm"
+                        style={{
+                          color: !employee.is_active
+                            ? "var(--text-disabled)"
+                            : employee.is_clocked_in
+                              ? "var(--live)"
+                              : "var(--text-disabled)",
+                        }}
+                      >
+                        {!employee.is_active ? "Inactivo" : employee.is_clocked_in ? "En turno" : "Fuera"}
+                      </td>
+                      <td className="px-5 py-4">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={rowBusy || protectedOwner}
+                            className="cf-btn-secondary"
+                            style={{ padding: "0.375rem 0.75rem" }}
+                            onClick={() => beginEdit(employee)}
+                          >
+                            Editar
                           </button>
-                        ) : (
-                          <button type="button" className="cf-btn-secondary" style={{ padding: "0.375rem 0.75rem" }} onClick={() => setPendingDeleteId(employee.id)}>
-                            Desactivar
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                          {employee.is_active ? (
+                            confirmingDeactivate ? (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={rowBusy}
+                                  className="cf-btn-danger"
+                                  style={{ padding: "0.375rem 0.75rem" }}
+                                  onClick={() => void deactivate(employee.id)}
+                                >
+                                  Confirmar baja
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={rowBusy}
+                                  className="cf-btn-secondary"
+                                  style={{ padding: "0.375rem 0.75rem" }}
+                                  onClick={() => setPendingAction(null)}
+                                >
+                                  Cancelar
+                                </button>
+                              </>
+                            ) : !isSelf && !protectedOwner ? (
+                              <button
+                                type="button"
+                                disabled={rowBusy}
+                                className="cf-btn-secondary"
+                                style={{ padding: "0.375rem 0.75rem" }}
+                                onClick={() => setPendingAction({ id: employee.id, kind: "deactivate" })}
+                              >
+                                Desactivar
+                              </button>
+                            ) : null
+                          ) : !protectedOwner ? (
+                            <button
+                              type="button"
+                              disabled={rowBusy}
+                              className="cf-btn-primary"
+                              style={{ padding: "0.375rem 0.75rem" }}
+                              onClick={() => void reactivate(employee.id)}
+                            >
+                              Reactivar
+                            </button>
+                          ) : null}
+
+                          {!isSelf && !protectedOwner ? (
+                            confirmingDelete ? (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={rowBusy}
+                                  className="cf-btn-danger"
+                                  style={{ padding: "0.375rem 0.75rem" }}
+                                  onClick={() => void permanentlyDelete(employee.id)}
+                                >
+                                  Confirmar eliminar
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={rowBusy}
+                                  className="cf-btn-secondary"
+                                  style={{ padding: "0.375rem 0.75rem" }}
+                                  onClick={() => setPendingAction(null)}
+                                >
+                                  Cancelar
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={rowBusy}
+                                className="cf-btn-danger inline-flex items-center gap-1"
+                                style={{ padding: "0.375rem 0.75rem" }}
+                                title={`Eliminar cuenta de ${employee.name}`}
+                                onClick={() => setPendingAction({ id: employee.id, kind: "delete" })}
+                              >
+                                <Trash2 size={14} strokeWidth={1.9} />
+                                Eliminar
+                              </button>
+                            )
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

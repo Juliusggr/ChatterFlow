@@ -8,6 +8,8 @@
     "core:event:default",
     "allow-set-supabase-session",
     "allow-get-models",
+    "allow-refresh-models",
+    "allow-set-app-theme",
     "allow-open-model-session",
     "allow-open-messages",
     "allow-get-message-tabs",

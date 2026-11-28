@@ -9,7 +9,7 @@ const cors = {
 const ROLES = new Set(["owner", "admin", "chatter", "dropper"]);
 
 type Body = {
-  action?: "create" | "update";
+  action?: "create" | "update" | "delete";
   userId?: string;
   username?: string;
   password?: string;
@@ -112,6 +112,43 @@ Deno.serve(async (req) => {
         .eq("id", body.userId);
       if (profileError) {
         return json({ error: profileError.message }, 400);
+      }
+      if (body.isActive === false) {
+        const nowIso = new Date().toISOString();
+        await admin
+          .from("shifts")
+          .update({ clock_out: nowIso, status: "completed", total_minutes: 0 })
+          .eq("user_id", body.userId)
+          .eq("status", "active");
+      }
+      return json({ id: body.userId }, 200);
+    }
+
+    if (body.action === "delete") {
+      if (!body.userId) {
+        return json({ error: "Falta el empleado" }, 400);
+      }
+      if (body.userId === userData.user.id) {
+        return json({ error: "No puedes eliminar tu propia cuenta activa" }, 400);
+      }
+      const { data: targetProfile } = await admin
+        .from("profiles")
+        .select("role,is_active")
+        .eq("id", body.userId)
+        .maybeSingle();
+      if (targetProfile?.role === "owner" && manager.role !== "owner") {
+        return json({ error: "Solo un owner puede eliminar a otro owner" }, 403);
+      }
+      const { error: deleteProfileError } = await admin
+        .from("profiles")
+        .delete()
+        .eq("id", body.userId);
+      if (deleteProfileError) {
+        return json({ error: deleteProfileError.message }, 400);
+      }
+      const { error: deleteAuthError } = await admin.auth.admin.deleteUser(body.userId);
+      if (deleteAuthError && !/not found/i.test(deleteAuthError.message)) {
+        return json({ error: deleteAuthError.message }, 400);
       }
       return json({ id: body.userId }, 200);
     }

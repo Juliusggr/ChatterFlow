@@ -48,6 +48,14 @@ export function getModels(): Promise<Model[]> {
   return invoke("get_models");
 }
 
+export function refreshModels(): Promise<Model[]> {
+  return invoke("refresh_models");
+}
+
+export function setAppTheme(dark: boolean): Promise<void> {
+  return invoke("set_app_theme", { dark });
+}
+
 export function openModelSession(modelId: string | null): Promise<Model> {
   return invoke("open_model_session", { modelId });
 }

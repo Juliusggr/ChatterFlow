@@ -14,11 +14,11 @@ const PAGES: { id: ReportPage; label: string; title: string }[] = [
   { id: "creators", label: "Creators", title: "Creator reports" },
 ];
 
-export function AnalyticsView() {
+export function AnalyticsView({ canDeleteShifts = false }: { canDeleteShifts?: boolean }) {
   const [page, setPage] = useState<ReportPage>("chatters");
   const [range, setRange] = useState<ReportRangeId>("today");
   const [timeZone, setTimeZone] = useState(() => localStorage.getItem("cf-report-tz") || DEFAULT_TIME_ZONE);
-  const [basis, setBasis] = useState<EarningsBasis>("net");
+  const [basis, setBasis] = useState<EarningsBasis>("gross");
   const title = PAGES.find((item) => item.id === page)?.title ?? "Employee reports";
 
   return (
@@ -73,7 +73,7 @@ export function AnalyticsView() {
             </select>
             {page === "droppers" ? null : (
             <div className="flex rounded-lg p-0.5" style={{ background: "var(--report-pill)" }} role="group" aria-label="Earnings basis">
-              {(["net", "gross"] as const).map((item) => {
+              {(["gross", "net"] as const).map((item) => {
                 const active = basis === item;
                 return (
                   <button
@@ -84,7 +84,7 @@ export function AnalyticsView() {
                     style={{ background: active ? "var(--report-card)" : "transparent", color: "var(--report-ink)" }}
                     onClick={() => setBasis(item)}
                   >
-                    {item === "net" ? "Net" : "Gross"}
+                    {item === "gross" ? "Bruto" : "Neto"}
                   </button>
                 );
               })}
@@ -93,7 +93,7 @@ export function AnalyticsView() {
           </div>
         </header>
         {page === "chatters" ? <EmployeeReports range={range} basis={basis} timeZone={timeZone} /> : null}
-        {page === "droppers" ? <DropperReports range={range} timeZone={timeZone} /> : null}
+        {page === "droppers" ? <DropperReports range={range} timeZone={timeZone} canDeleteShifts={canDeleteShifts} /> : null}
         {page === "creators" ? <CreatorReports range={range} basis={basis} timeZone={timeZone} /> : null}
       </div>
     </div>

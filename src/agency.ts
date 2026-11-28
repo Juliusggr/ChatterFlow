@@ -304,7 +304,18 @@ async function replaceAssignments(userId: string, modelIds: string[]): Promise<v
   if (insertError) throw insertError;
 }
 
-export async function deactivateEmployee(id: string): Promise<void> {
+export async function setEmployeeActive(id: string, isActive: boolean): Promise<void> {
+  const { error } = await supabase.rpc("set_employee_active", {
+    p_user_id: id,
+    p_is_active: isActive,
+  });
+  if (!error) {
+    if (id === cachedProfileUserId) cachedProfileAt = 0;
+    return;
+  }
+  if (!isMissingRpcError(error.message)) {
+    throw new Error(error.message);
+  }
   const current = await listEmployees();
   const employee = current.find((item) => item.id === id);
   if (!employee) return;
@@ -313,10 +324,92 @@ export async function deactivateEmployee(id: string): Promise<void> {
     username: employee.username,
     fullName: employee.name,
     role: employee.role,
-    isActive: false,
+    isActive,
     days: employee.days,
     modelIds: employee.modelIds,
   });
+}
+
+export async function deactivateEmployee(id: string): Promise<void> {
+  await setEmployeeActive(id, false);
+}
+
+export async function deleteEmployee(id: string): Promise<void> {
+  const { error } = await supabase.rpc("delete_employee_account", {
+    p_user_id: id,
+  });
+  if (!error) {
+    if (id === cachedProfileUserId) cachedProfileAt = 0;
+    return;
+  }
+  if (!isMissingRpcError(error.message)) {
+    throw new Error(error.message);
+  }
+  const { data, error: fnErr } = await supabase.functions.invoke("manage-employees", {
+    body: { action: "delete", userId: id },
+  });
+  if (!fnErr) {
+    const payload = data as { error?: string } | null;
+    if (!payload?.error) return;
+    if (!/acción desconocida/i.test(payload.error)) {
+      throw new Error(payload.error);
+    }
+  } else {
+    const msg = await functionError(fnErr, data);
+    if (!/acción desconocida/i.test(msg)) {
+      throw new Error(msg);
+    }
+  }
+  const { error: delProfileErr } = await supabase.from("profiles").delete().eq("id", id);
+  if (delProfileErr) throw new Error(delProfileErr.message);
+}
+
+function isMissingRpcError(message: string): boolean {
+  return /could not find the function|pgrst202|404/i.test(message);
+}
+
+function isUuidString(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+export type LocalDismissedShift = {
+  dropperUserId: string;
+  shiftKey: string;
+  windowStart: string | null;
+  windowEnd: string | null;
+};
+
+const DISMISSED_SHIFTS_STORAGE_KEY = "cf-dismissed-shifts-v1";
+
+export function readLocalDismissedShifts(): LocalDismissedShift[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(DISMISSED_SHIFTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is LocalDismissedShift =>
+        Boolean(item) &&
+        typeof (item as LocalDismissedShift).dropperUserId === "string" &&
+        typeof (item as LocalDismissedShift).shiftKey === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function rememberLocalDismissedShift(entry: LocalDismissedShift): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    const current = readLocalDismissedShifts().filter(
+      (item) => !(item.dropperUserId === entry.dropperUserId && item.shiftKey === entry.shiftKey),
+    );
+    current.push(entry);
+    localStorage.setItem(DISMISSED_SHIFTS_STORAGE_KEY, JSON.stringify(current.slice(-500)));
+  } catch {
+    // Ignore storage quota errors.
+  }
 }
 
 export async function clockIn(): Promise<void> {
@@ -329,10 +422,59 @@ export async function clockOut(): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
-export async function deleteShift(id: string): Promise<void> {
-  const { data, error } = await supabase.from("shifts").delete().eq("id", id).select("id");
-  if (error) throw new Error(error.message);
-  if (!data?.length) throw new Error("No se pudo eliminar el turno");
+export async function deleteShift(
+  id: string,
+  opts?: {
+    dropperUserId?: string;
+    shiftStart?: string;
+    shiftEnd?: string | null;
+  },
+): Promise<void> {
+  const cleanId = id.trim();
+  if (!cleanId) throw new Error("Falta el turno a eliminar");
+
+  const { error: rpcError } = await supabase.rpc("owner_delete_shift", {
+    p_shift_id: cleanId,
+    p_dropper_user_id: opts?.dropperUserId ?? null,
+    p_shift_start: opts?.shiftStart ?? null,
+    p_shift_end: opts?.shiftEnd ?? null,
+  });
+
+  if (!rpcError) {
+    if (opts?.dropperUserId) {
+      rememberLocalDismissedShift({
+        dropperUserId: opts.dropperUserId,
+        shiftKey: cleanId,
+        windowStart: opts.shiftStart ?? null,
+        windowEnd: opts.shiftEnd ?? new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
+  if (!isMissingRpcError(rpcError.message)) {
+    throw new Error(rpcError.message);
+  }
+
+  if (isUuidString(cleanId)) {
+    await supabase.from("dropper_shift_reports").delete().eq("shift_id", cleanId);
+    const { data, error } = await supabase.from("shifts").delete().eq("id", cleanId).select("id");
+    if (error) throw new Error(error.message);
+    if (!data?.length && !opts?.dropperUserId) {
+      throw new Error("No se pudo eliminar el turno");
+    }
+  } else if (!opts?.dropperUserId) {
+    throw new Error("No se pudo eliminar el turno");
+  }
+
+  if (opts?.dropperUserId) {
+    rememberLocalDismissedShift({
+      dropperUserId: opts.dropperUserId,
+      shiftKey: cleanId,
+      windowStart: opts.shiftStart ?? null,
+      windowEnd: opts.shiftEnd ?? new Date().toISOString(),
+    });
+  }
 }
 
 export async function listActiveShifts(): Promise<ActiveShift[]> {
@@ -354,6 +496,20 @@ export async function listActiveShifts(): Promise<ActiveShift[]> {
   });
 }
 
+export function subscribeMyAssignments(onChange: () => void): () => void {
+  const channel = supabase
+    .channel(`assignments-live-${Math.random().toString(36).slice(2, 8)}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "model_assignments" },
+      () => onChange(),
+    )
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
 export function subscribeActiveShifts(onChange: () => void): () => void {
   const channel = supabase
     .channel(`shifts-live-${Math.random().toString(36).slice(2, 8)}`)
@@ -371,6 +527,7 @@ export function subscribeDropperTables(onChange: () => void): () => void {
     .on("postgres_changes", { event: "*", schema: "public", table: "publications" }, () => onChange())
     .on("postgres_changes", { event: "*", schema: "public", table: "fan_arrivals" }, () => onChange())
     .on("postgres_changes", { event: "*", schema: "public", table: "dropper_shift_reports" }, () => onChange())
+    .on("postgres_changes", { event: "*", schema: "public", table: "dismissed_dropper_shifts" }, () => onChange())
     .subscribe();
   return () => {
     void supabase.removeChannel(channel);
@@ -403,21 +560,30 @@ async function listMyShiftsForProfile(profile: AgencyProfile | null, from: strin
   }));
 }
 
-type SaleRow = { employeeId: string; name: string; role: string | null; gross: number; net: number; at: number };
+type SaleRow = {
+  employeeId: string;
+  name: string;
+  role: string | null;
+  category: string;
+  gross: number;
+  net: number;
+  at: number;
+};
 
 async function listSales(from: string, to: string): Promise<SaleRow[]> {
   const { data, error } = await supabase
     .from("sales")
-    .select("employee_id,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
+    .select("employee_id,category,amount_gross,amount_net,recorded_at,profiles(full_name,username,role)")
     .gte("recorded_at", from)
     .lt("recorded_at", to);
   if (error) throw error;
   return (data ?? []).map((row) => {
     const profile = firstRelation(row.profiles);
     return {
-      employeeId: row.employee_id as string,
+      employeeId: (row.employee_id as string | null) ?? "",
       name: profile?.full_name || profile?.username || "Empleado",
       role: typeof profile?.role === "string" ? profile.role : null,
+      category: typeof row.category === "string" ? row.category : "",
       gross: Number(row.amount_gross),
       net: Number(row.amount_net),
       at: new Date(row.recorded_at as string).getTime(),
@@ -463,7 +629,7 @@ function computeSalesMetrics(
       bucket.gross += saleGross;
       bucket.net += saleNet;
     }
-    if (sale.role === "chatter") {
+    if (sale.role === "chatter" && sale.employeeId) {
       const emp = totalsByEmployee.get(sale.employeeId) ?? { name: sale.name, gross: 0, net: 0 };
       emp.gross += saleGross;
       emp.net += saleNet;
@@ -517,11 +683,13 @@ export async function getFanCounts(): Promise<FanCounts> {
   return { total, accounts };
 }
 
+type AgencyDay = { gross: number; net: number; messageTipGross: number };
+
 async function dashboardChannelsBoth(
   from: string,
   to: string,
   hourly: boolean,
-): Promise<Record<EarningsBasis, DashboardChannelPoint[]>> {
+): Promise<{ channels: Record<EarningsBasis, DashboardChannelPoint[]>; daily: Map<string, AgencyDay> }> {
   const slots = hourly ? eachLocalHour(from) : eachLocalDay(from, to);
   const netMap = new Map<string, DashboardChannelPoint>(
     slots.map((slot) => [slot.key, { label: slot.label, subs: 0, tips: 0, posts: 0, ppv: 0 }]),
@@ -529,6 +697,7 @@ async function dashboardChannelsBoth(
   const grossMap = new Map<string, DashboardChannelPoint>(
     slots.map((slot) => [slot.key, { label: slot.label, subs: 0, tips: 0, posts: 0, ppv: 0 }]),
   );
+  const daily = new Map<string, AgencyDay>();
 
   const { data, error } = await supabase
     .from("model_earnings")
@@ -543,11 +712,17 @@ async function dashboardChannelsBoth(
     const key = hourly ? localHourKey(ms) : localDayKey(ms);
     const netBucket = netMap.get(key);
     const grossBucket = grossMap.get(key);
-    if (!netBucket || !grossBucket) continue;
     const g = Number(row.gross_amount);
     const n = Number(row.net_amount);
     const gClean = Number.isFinite(g) ? g : 0;
     const nClean = Number.isFinite(n) ? n : 0;
+    const dayKey = localDayKey(ms);
+    const day = daily.get(dayKey) ?? { gross: 0, net: 0, messageTipGross: 0 };
+    day.gross += gClean;
+    day.net += nClean;
+    if (row.type === "message" || row.type === "tip") day.messageTipGross += gClean;
+    daily.set(dayKey, day);
+    if (!netBucket || !grossBucket) continue;
     switch (row.type) {
       case "sub":
         netBucket.subs += nClean;
@@ -571,9 +746,79 @@ async function dashboardChannelsBoth(
   }
 
   return {
-    net: slots.map((slot) => netMap.get(slot.key)!),
-    gross: slots.map((slot) => grossMap.get(slot.key)!),
+    channels: {
+      net: slots.map((slot) => netMap.get(slot.key)!),
+      gross: slots.map((slot) => grossMap.get(slot.key)!),
+    },
+    daily,
   };
+}
+
+function agencyRevenue(
+  daily: Map<string, AgencyDay>,
+  sales: SaleRow[],
+  from: string,
+  to: string,
+): PeriodRevenue {
+  const days = eachLocalDay(from, to);
+  const buckets = new Map(
+    days.map((day) => {
+      const earned = daily.get(day.key) ?? { gross: 0, net: 0, messageTipGross: 0 };
+      return [day.key, { ...earned }];
+    }),
+  );
+  for (const sale of sales) {
+    const bucket = buckets.get(localDayKey(sale.at));
+    if (!bucket || bucket.messageTipGross > 0) continue;
+    const saleGross = Number.isFinite(sale.gross) ? sale.gross : 0;
+    const saleNet = Number.isFinite(sale.net) ? sale.net : 0;
+    bucket.gross += saleGross;
+    bucket.net += saleNet;
+  }
+  let gross = 0;
+  let net = 0;
+  const bars = days.map((day) => {
+    const bucket = buckets.get(day.key) ?? { gross: 0, net: 0, messageTipGross: 0 };
+    gross += bucket.gross;
+    net += bucket.net;
+    return { label: day.label, gross: bucket.gross, net: bucket.net };
+  });
+  const dayCount = Math.max(days.length, 1);
+  return { gross, net, dayCount, averageDaily: gross / dayCount, bars };
+}
+
+function blankChannels(slots: { label: string }[]): DashboardChannelPoint[] {
+  return slots.map((slot) => ({ label: slot.label, subs: 0, tips: 0, posts: 0, ppv: 0 }));
+}
+
+function foldRecordedSalesIntoChannels(
+  channels: Record<EarningsBasis, DashboardChannelPoint[]>,
+  sales: SaleRow[],
+  daily: Map<string, AgencyDay>,
+  from: string,
+  to: string,
+  hourly: boolean,
+): Record<EarningsBasis, DashboardChannelPoint[]> {
+  const slots = hourly ? eachLocalHour(from) : eachLocalDay(from, to);
+  const next =
+    channels.gross.length === slots.length && channels.net.length === slots.length
+      ? channels
+      : { net: blankChannels(slots), gross: blankChannels(slots) };
+  const index = new Map(slots.map((slot, position) => [slot.key, position]));
+  for (const sale of sales) {
+    const field = sale.category === "tip" ? "tips" : sale.category === "ppv" ? "ppv" : null;
+    if (!field) continue;
+    const dayKey = localDayKey(sale.at);
+    if ((daily.get(dayKey)?.messageTipGross ?? 0) > 0) continue;
+    const key = hourly ? localHourKey(sale.at) : dayKey;
+    const position = index.get(key);
+    if (position == null) continue;
+    const gross = Number.isFinite(sale.gross) ? sale.gross : 0;
+    const net = Number.isFinite(sale.net) ? sale.net : 0;
+    next.gross[position][field] += gross;
+    next.net[position][field] += net;
+  }
+  return next;
 }
 
 /**
@@ -585,17 +830,20 @@ export async function loadDashboardSnapshot(range: DashboardRange): Promise<Dash
   const { from, to } = rangeBounds(range);
   const hourly = range === "today" || range === "yesterday";
 
-  const [sales, shifts, activeShifts, channelsByBasis, fans] = await Promise.all([
+  const [sales, shifts, activeShifts, agency, fans] = await Promise.all([
     listSales(from, to),
     listMyShiftsForProfile(profile, from, to),
     listActiveShifts(),
-    dashboardChannelsBoth(from, to, hourly).catch(
-      (): Record<EarningsBasis, DashboardChannelPoint[]> => ({ net: [], gross: [] }),
-    ),
+    dashboardChannelsBoth(from, to, hourly).catch(() => ({
+      channels: { net: [], gross: [] } as Record<EarningsBasis, DashboardChannelPoint[]>,
+      daily: new Map<string, AgencyDay>(),
+    })),
     getFanCounts().catch(() => null),
   ]);
 
-  const { revenue, salesByBasis } = computeSalesMetrics(sales, from, to);
+  const { salesByBasis } = computeSalesMetrics(sales, from, to);
+  const revenue = agencyRevenue(agency.daily, sales, from, to);
+  const channels = foldRecordedSalesIntoChannels(agency.channels, sales, agency.daily, from, to, hourly);
   const onShift = Boolean(profile && activeShifts.some((item) => item.userId === profile.id));
 
   return {
@@ -604,7 +852,7 @@ export async function loadDashboardSnapshot(range: DashboardRange): Promise<Dash
     clockedIn: activeShifts,
     onShift,
     salesByBasis,
-    channelsByBasis,
+    channelsByBasis: channels,
     fans,
   };
 }

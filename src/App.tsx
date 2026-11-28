@@ -17,6 +17,8 @@ import {
   errorMessage,
   getMessageTabs,
   getModels,
+  refreshModels,
+  setAppTheme,
   openIncomingChat,
   openMessages,
   openModelSession,
@@ -24,7 +26,7 @@ import {
   type MessageBarPlacement,
   type MessageTabsState,
 } from "./api";
-import { isManager, signOut, type AgencyProfile } from "./agency";
+import { isManager, signOut, subscribeMyAssignments, type AgencyProfile } from "./agency";
 import { startSaleRecording } from "./saleRecording";
 import { AuthGate } from "./AuthGate";
 import { AnalyticsView } from "./AnalyticsView";
@@ -64,11 +66,34 @@ function useDarkMode(): [boolean, () => void] {
     localStorage.setItem("cf-theme", dark ? "dark" : "light");
   }, [dark]);
 
+  useEffect(() => {
+    let alive = true;
+    let stop = () => {};
+    void listen<boolean>("theme-changed", (event) => {
+      setDark((current) => (current === event.payload ? current : Boolean(event.payload)));
+    }).then((unlisten) => {
+      if (alive) stop = unlisten;
+      else unlisten();
+    });
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== "cf-theme" || !event.newValue) return;
+      const next = event.newValue === "dark";
+      setDark((current) => (current === next ? current : next));
+    };
+    window.addEventListener("storage", onStorage);
+    return () => {
+      alive = false;
+      stop();
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
   return [dark, () => setDark((d) => !d)];
 }
 
 /* ── Entry point ──────────────────────────────────────────────────── */
 export function App() {
+  const [dark, toggleDark] = useDarkMode();
   return (
     <AuthGate>
       {(profile) => {
@@ -79,7 +104,7 @@ export function App() {
         if (embeddedModelId) {
           return <FanInsightsPanel modelId={embeddedModelId} />;
         }
-        return <AppShell profile={profile} />;
+        return <AppShell profile={profile} dark={dark} toggleDark={toggleDark} />;
       }}
     </AuthGate>
   );
@@ -94,7 +119,15 @@ declare global {
 }
 
 /* ── AppShell ─────────────────────────────────────────────────────── */
-function AppShell({ profile }: { profile: AgencyProfile }) {
+function AppShell({
+  profile,
+  dark,
+  toggleDark,
+}: {
+  profile: AgencyProfile;
+  dark: boolean;
+  toggleDark: () => void;
+}) {
   const canManage = isManager(profile.role);
   const canOpenMessages = profile.role !== "dropper";
   const [section, setSection] = useState<Section>("dashboard");
@@ -103,7 +136,6 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [dark, toggleDark] = useDarkMode();
   const [barPlacement, setBarPlacement] = useState<MessageBarPlacement>("top");
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [loginBanners, setLoginBanners] = useState<ToastBanner[]>([]);
@@ -171,6 +203,22 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
       stop();
     };
   }, [profile.role]);
+
+  useEffect(() => {
+    void setAppTheme(dark);
+  }, [dark]);
+
+  useEffect(() => {
+    const pull = () => {
+      void refreshModels().catch(() => undefined);
+    };
+    const stop = subscribeMyAssignments(pull);
+    const timer = window.setInterval(pull, 15000);
+    return () => {
+      stop();
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -461,7 +509,7 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
         style={section === "analytics" ? { background: "var(--report-canvas)" } : undefined}
       >
         {loaded && section === "analytics" ? (
-          <AnalyticsView />
+          <AnalyticsView canDeleteShifts={profile.role === "owner"} />
         ) : (
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
           {error ? (
@@ -497,7 +545,9 @@ function AppShell({ profile }: { profile: AgencyProfile }) {
           ) : null}
 
           {loaded && section === "dashboard" ? <DashboardView canDeleteShifts={profile.role === "owner"} /> : null}
-          {loaded && section === "teams" && canManage ? <TeamsView models={models} /> : null}
+          {loaded && section === "teams" && canManage ? (
+            <TeamsView models={models} currentUserId={profile.id} currentUserRole={profile.role} />
+          ) : null}
           {loaded && section === "models" ? (
             <ModelsView
               models={models}

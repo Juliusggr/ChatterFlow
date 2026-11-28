@@ -74,6 +74,14 @@ impl TransactionType {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RemoteSession {
+    pub cookies: Vec<Value>,
+    pub fingerprint: String,
+    pub local_storage: HashMap<String, String>,
+    pub user_agent: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -134,6 +142,7 @@ pub struct FanUpsertOwned {
     pub official_spend: bool,
     pub last_spend_at: Option<String>,
     pub highest_spend: Option<f64>,
+    pub is_muted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -292,6 +301,8 @@ pub struct SupabaseStore {
     seen_publications: Mutex<HashSet<(String, String, bool)>>,
     seen_arrivals: Mutex<HashSet<(String, String)>>,
     fan_labels: RwLock<HashMap<(String, String), (String, String)>>,
+    muted_fans: RwLock<HashMap<String, HashSet<String>>>,
+    muted_loaded: Mutex<HashSet<String>>,
     last_prune_epoch: AtomicU64,
 }
 
@@ -313,6 +324,8 @@ impl SupabaseStore {
             seen_publications: Mutex::new(HashSet::new()),
             seen_arrivals: Mutex::new(HashSet::new()),
             fan_labels: RwLock::new(HashMap::new()),
+            muted_fans: RwLock::new(HashMap::new()),
+            muted_loaded: Mutex::new(HashSet::new()),
             last_prune_epoch: AtomicU64::new(0),
         }
     }
@@ -373,6 +386,14 @@ impl SupabaseStore {
             .clear();
         self.fan_labels
             .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        self.muted_fans
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        self.muted_loaded
+            .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clear();
     }
@@ -535,6 +556,79 @@ impl SupabaseStore {
             .ok_or_else(|| DbError::NotFound(format!("no existe la modelo {id}")))?;
         self.cache_put_model(model.clone(), false);
         Ok(model)
+    }
+
+    pub fn cached_model_ids(&self) -> Vec<String> {
+        self.models_cache
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .ordered_ids
+            .clone()
+    }
+
+    pub fn invalidate_model_list(&self) {
+        self.models_cache
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .list_fetched_at = None;
+    }
+
+    pub async fn fetch_model_session(&self, id: &str) -> Result<RemoteSession, DbError> {
+        let req = self
+            .request(Method::POST, "rpc/get_model_session")?
+            .json(&json!({ "p_model_id": id }));
+        let session: Value = self.send_json(req).await?;
+        let cookies = session
+            .get("cookies")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let fingerprint = session
+            .get("cookies_fp")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let local_storage = session
+            .get("local_storage")
+            .and_then(|value| value.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let user_agent = session
+            .get("user_agent")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        Ok(RemoteSession {
+            cookies,
+            fingerprint,
+            local_storage,
+            user_agent,
+        })
+    }
+
+    pub async fn save_model_cookies(
+        &self,
+        id: &str,
+        cookies: &[Value],
+        fingerprint: &str,
+        local_storage: &HashMap<String, String>,
+        user_agent: &str,
+    ) -> Result<(), DbError> {
+        let req = self
+            .request(Method::POST, "rpc/save_model_cookies")?
+            .json(&json!({
+                "p_model_id": id,
+                "p_cookies": cookies,
+                "p_fingerprint": fingerprint,
+                "p_local_storage": local_storage,
+                "p_user_agent": user_agent,
+            }));
+        self.send_empty(req).await
     }
 
     pub async fn create_model_partition(&self) -> Result<Model, DbError> {
@@ -1003,7 +1097,7 @@ impl SupabaseStore {
             return Ok(());
         }
 
-        // Update in-memory fan username cache so notifications resolve usernames in 0ms.
+        // Update in-memory fan username & muted caches so notifications resolve in 0ms.
         {
             let mut labels = self
                 .fan_labels
@@ -1017,6 +1111,11 @@ impl SupabaseStore {
                         .or_insert_with(|| (String::new(), String::new()));
                     entry.1 = uname.to_owned();
                 }
+            }
+        }
+        for (fan_id, fan) in &by_id {
+            if let Some(muted) = fan.is_muted {
+                self.apply_muted_fan_in_memory(model_id, fan_id, muted);
             }
         }
 
@@ -1045,6 +1144,7 @@ impl SupabaseStore {
                     "last_spend_at": fan.last_spend_at.as_deref().and_then(normalize_timestamp_rfc3339),
                     "highest_spend": fan.highest_spend.filter(|v| v.is_finite()).map(round2),
                     "lists_json": lists_json,
+                    "is_muted": fan.is_muted,
                 })
             })
             .collect();
@@ -1276,6 +1376,98 @@ impl SupabaseStore {
         Ok(found)
     }
 
+    pub fn apply_muted_fan_in_memory(&self, model_id: &str, of_fan_id: &str, muted: bool) {
+        let clean = of_fan_id.trim().trim_start_matches(['u', 'U']);
+        if model_id.trim().is_empty() || clean.is_empty() {
+            return;
+        }
+        let mut map = self
+            .muted_fans
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if muted {
+            map.entry(model_id.to_owned())
+                .or_default()
+                .insert(clean.to_owned());
+        } else if let Some(set) = map.get_mut(model_id) {
+            set.remove(clean);
+        }
+    }
+
+    pub async fn set_fan_muted_state(&self, model_id: &str, of_fan_id: &str, muted: bool) {
+        let clean = of_fan_id.trim().trim_start_matches(['u', 'U']).to_owned();
+        if model_id.trim().is_empty() || clean.is_empty() {
+            return;
+        }
+        self.apply_muted_fan_in_memory(model_id, &clean, muted);
+        if let Ok(req) = self.request(Method::POST, "rpc/set_fan_muted") {
+            let req = req.json(&json!({
+                "p_model_id": model_id,
+                "p_of_fan_id": clean,
+                "p_muted": muted,
+            }));
+            let _ = self.send_empty(req).await;
+        }
+    }
+
+    async fn ensure_muted_fans_loaded(&self, model_id: &str) {
+        if model_id.trim().is_empty() {
+            return;
+        }
+        {
+            let loaded = self
+                .muted_loaded
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if loaded.contains(model_id) {
+                return;
+            }
+        }
+        if !self.has_session() {
+            return;
+        }
+        let model_eq = format!("eq.{model_id}");
+        if let Ok(req) = self.request(Method::GET, "fans") {
+            let req = req.query(&[
+                ("select", "of_fan_id"),
+                ("model_id", model_eq.as_str()),
+                ("is_muted", "eq.true"),
+            ]);
+            if let Ok(rows) = self.send_json::<Vec<Value>>(req).await {
+                let mut map = self
+                    .muted_fans
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let set = map.entry(model_id.to_owned()).or_default();
+                for row in rows {
+                    if let Some(id) = row.get("of_fan_id").and_then(Value::as_str) {
+                        let clean = id.trim().trim_start_matches(['u', 'U']);
+                        if !clean.is_empty() {
+                            set.insert(clean.to_owned());
+                        }
+                    }
+                }
+            }
+            self.muted_loaded
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(model_id.to_owned());
+        }
+    }
+
+    pub async fn is_fan_muted(&self, model_id: &str, of_fan_id: &str) -> bool {
+        let clean = of_fan_id.trim().trim_start_matches(['u', 'U']);
+        if model_id.trim().is_empty() || clean.is_empty() {
+            return false;
+        }
+        self.ensure_muted_fans_loaded(model_id).await;
+        self.muted_fans
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(model_id)
+            .is_some_and(|set| set.contains(clean))
+    }
+
     pub async fn insert_chat_tips_batch(
         &self,
         model_id: &str,
@@ -1468,6 +1660,21 @@ impl SupabaseStore {
                 "event_key": event_key,
                 "notified_at": now_iso,
             }));
+        let rows: Vec<Value> = self.send_json(req).await?;
+        Ok(!rows.is_empty())
+    }
+
+    pub async fn notified_event_exists(&self, model_id: &str, event_key: &str) -> Result<bool, DbError> {
+        let key = event_key.trim();
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let req = self.request(Method::GET, "notified_events")?.query(&[
+            ("select", "event_key"),
+            ("model_id", &format!("eq.{model_id}")),
+            ("event_key", &format!("eq.{key}")),
+            ("limit", "1"),
+        ]);
         let rows: Vec<Value> = self.send_json(req).await?;
         Ok(!rows.is_empty())
     }

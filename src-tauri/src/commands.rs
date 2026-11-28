@@ -36,6 +36,29 @@ pub async fn get_models(
 }
 
 #[tauri::command]
+pub async fn refresh_models(
+    app: AppHandle,
+    store: State<'_, SupabaseStore>,
+) -> Result<Vec<ModelAccount>, String> {
+    let previous = store.cached_model_ids();
+    store.invalidate_model_list();
+    let accounts = sessions::list_accounts(&app, &store).await?;
+    let next: Vec<String> = accounts.iter().map(|account| account.model.id.clone()).collect();
+    for removed in previous.iter().filter(|id| !next.contains(id)) {
+        sessions::revoke_model_access(&app, removed).await;
+    }
+    if previous != next {
+        let _ = app.emit("models-changed", ());
+    }
+    Ok(accounts)
+}
+
+#[tauri::command]
+pub fn set_app_theme(app: AppHandle, dark: bool) {
+    sessions::apply_app_theme(&app, dark);
+}
+
+#[tauri::command]
 pub async fn open_model_session(
     app: AppHandle,
     store: State<'_, SupabaseStore>,
